@@ -3205,6 +3205,52 @@ def TEMP_SENSOR__SHT4X_MODE_validator(form, field):
         raise ValidationError('Invalid mode selection')
 
 
+def TEMP_SENSOR__SHT4X_HEATER_MODE_validator(form, field):
+    if field.data not in list(zip(*form.TEMP_SENSOR__SHT4X_HEATER_MODE_choices))[0]:
+        raise ValidationError('Invalid heater mode selection')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_COMMAND_validator(form, field):
+    if field.data not in list(zip(*form.TEMP_SENSOR__SHT4X_HEATER_COMMAND_choices))[0]:
+        raise ValidationError('Invalid heater command selection')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    if field.data < 10 or field.data > 3600:
+        raise ValidationError('Interval must be between 10 and 3600 seconds')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    if field.data < 1 or field.data > 600:
+        raise ValidationError('Equilibration must be between 1 and 600 seconds')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_PULSES_validator(form, field):
+    if not isinstance(field.data, int):
+        raise ValidationError('Please enter a valid integer')
+    if field.data < 1 or field.data > 60:
+        raise ValidationError('Pulses must be between 1 and 60')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    # SHT4x datasheet hard limit is 5% duty cycle
+    if field.data <= 0.0 or field.data > 0.05:
+        raise ValidationError('Max duty cycle must be > 0 and <= 0.05 (5%)')
+
+
+def TEMP_SENSOR__SHT4X_HEATER_RH_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    if field.data < 0 or field.data > 100:
+        raise ValidationError('RH must be between 0 and 100')
+
+
 def TEMP_SENSOR__HDC302X_HEATER_validator(form, field):
     if field.data not in list(zip(*form.TEMP_SENSOR__HDC302X_HEATER_choices))[0]:
         raise ValidationError('Invalid heater selection')
@@ -4237,6 +4283,22 @@ class IndiAllskyConfigForm(FlaskForm):
         ('LOWHEAT_100MS', '[0x15] Low Heat - 0.1s'),
     )
 
+    TEMP_SENSOR__SHT4X_HEATER_MODE_choices = (
+        ('OFF', 'Off'),
+        ('CONTINUOUS', 'Continuous (always-humid enclosure)'),
+        ('SINGLE_SHOT', 'Single-Shot (intermittent exposure)'),
+        ('THRESHOLD', 'Threshold (RH hysteresis)'),
+    )
+
+    TEMP_SENSOR__SHT4X_HEATER_COMMAND_choices = (
+        ('LOWHEAT_100MS', '[0x15] Low 20mW / 0.1s (~3C)'),
+        ('LOWHEAT_1S', '[0x1E] Low 20mW / 1.0s (~6C)'),
+        ('MEDHEAT_100MS', '[0x24] Medium 110mW / 0.1s (~16C)'),
+        ('MEDHEAT_1S', '[0x2F] Medium 110mW / 1.0s (~31C)'),
+        ('HIGHHEAT_100MS', '[0x32] High 200mW / 0.1s (~29C)'),
+        ('HIGHHEAT_1S', '[0x39] High 200mW / 1.0s (~50C)'),
+    )
+
     TEMP_SENSOR__SI7021_HEATER_LEVEL_choices = (
         ('-1', 'Off'),
         ('0', '0 - 3 mA'),
@@ -4973,6 +5035,15 @@ class IndiAllskyConfigForm(FlaskForm):
     TEMP_SENSOR__SHT3X_HEATER_DAY    = BooleanField('SHT3x Heater (Day)')
     TEMP_SENSOR__SHT4X_MODE_NIGHT    = SelectField('SHT4x Mode (Night)', choices=TEMP_SENSOR__SHT4X_MODE_choices, validators=[TEMP_SENSOR__SHT4X_MODE_validator])
     TEMP_SENSOR__SHT4X_MODE_DAY      = SelectField('SHT4x Mode (Day)', choices=TEMP_SENSOR__SHT4X_MODE_choices, validators=[TEMP_SENSOR__SHT4X_MODE_validator])
+    TEMP_SENSOR__SHT4X_HEATER_ENABLE = BooleanField('SHT4x Heater Enable')
+    TEMP_SENSOR__SHT4X_HEATER_MODE   = SelectField('SHT4x Heater Mode', choices=TEMP_SENSOR__SHT4X_HEATER_MODE_choices, validators=[TEMP_SENSOR__SHT4X_HEATER_MODE_validator])
+    TEMP_SENSOR__SHT4X_HEATER_COMMAND = SelectField('SHT4x Heater Power/Duration', choices=TEMP_SENSOR__SHT4X_HEATER_COMMAND_choices, validators=[TEMP_SENSOR__SHT4X_HEATER_COMMAND_validator])
+    TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S = FloatField('SHT4x Heater Interval (s)', validators=[TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S_validator])
+    TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S = FloatField('SHT4x Heater Equilibration (s)', validators=[TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S_validator])
+    TEMP_SENSOR__SHT4X_HEATER_PULSES = IntegerField('SHT4x Heater Pulses (single-shot)', validators=[TEMP_SENSOR__SHT4X_HEATER_PULSES_validator])
+    TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY = FloatField('SHT4x Heater Max Duty Cycle', validators=[TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY_validator])
+    TEMP_SENSOR__SHT4X_HEATER_RH_ON  = FloatField('SHT4x Heater RH On %', validators=[TEMP_SENSOR__SHT4X_HEATER_RH_validator])
+    TEMP_SENSOR__SHT4X_HEATER_RH_OFF = FloatField('SHT4x Heater RH Off %', validators=[TEMP_SENSOR__SHT4X_HEATER_RH_validator])
     TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT = SelectField('SI7021 Heater Level (Night)', choices=TEMP_SENSOR__SI7021_HEATER_LEVEL_choices, validators=[TEMP_SENSOR__SI7021_HEATER_LEVEL_validator])
     TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY   = SelectField('SI7021 Heater Level (Day)', choices=TEMP_SENSOR__SI7021_HEATER_LEVEL_choices, validators=[TEMP_SENSOR__SI7021_HEATER_LEVEL_validator])
     TEMP_SENSOR__HTU31D_HEATER_NIGHT = BooleanField('HTU31D Heater (Night)')
