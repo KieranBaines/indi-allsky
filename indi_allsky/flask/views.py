@@ -3204,7 +3204,47 @@ class ConfigView(FormView):
 
         context['form_config'] = IndiAllskyConfigForm(data=form_data)
 
+        # --- SHT4x last-regen timestamp (read-only display) ---
+        # Reads the same state file the sensor driver writes. The web process
+        # and sensor process share the disk, so this works when both run on the
+        # same host. Best-effort: any failure just shows "never / unknown".
+        context['sht4x_regen_last'] = self._get_sht4x_regen_last()
+
         return context
+
+
+    def _get_sht4x_regen_last(self):
+        import os
+        import datetime
+
+        temp_sensor_config = self.indi_allsky_config.get('TEMP_SENSOR', {})
+
+        # the driver keys the state file by the sensor's i2c address. check the
+        # configured SHT4x slots (A..) for an i2c address to build the path.
+        state_dir = self.indi_allsky_config.get('IMAGE_FOLDER', '/var/tmp')
+
+        candidates = []
+        for slot in ('A', 'B', 'C', 'D', 'E'):
+            classname = temp_sensor_config.get('{0:s}_CLASSNAME'.format(slot), '')
+            if 'Sht4x' in classname or 'SHT4X' in classname.upper():
+                addr = temp_sensor_config.get('{0:s}_I2C_ADDRESS'.format(slot), '')
+                if addr:
+                    candidates.append(
+                        os.path.join(state_dir, '.sht4x_regen_{0:s}.ts'.format(addr.replace('0x', ''))))
+
+        # also try a default address file in case the slot lookup misses
+        candidates.append(os.path.join(state_dir, '.sht4x_regen_44.ts'))
+
+        for path in candidates:
+            try:
+                with open(path, 'r') as f:
+                    ts = float(f.read().strip())
+                dt = datetime.datetime.fromtimestamp(ts)
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+
+        return 'never / unknown'
 
 
 class AjaxConfigView(BaseView):

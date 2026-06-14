@@ -4298,15 +4298,9 @@ class IndiAllskyConfigForm(FlaskForm):
 
 
     TEMP_SENSOR__SHT4X_MODE_choices = (
-        ('NOHEAT_HIGHPRECISION', '[0xFD] No Heater - High Precision'),
-        ('NOHEAT_MEDPRECISION', '[0xF6] No Heater - Medium Precision'),
-        ('NOHEAT_LOWPRECISION', '[0xE0] No Heater - Low Precision'),
-        ('HIGHHEAT_1S', '[0x39] High Heat - 1s'),
-        ('HIGHHEAT_100MS', '[0x32] High Heat - 0.1s'),
-        ('MEDHEAT_1S', '[0x2F] Medium Heat - 1s'),
-        ('MEDHEAT_100MS', '[0x24] Medium Heat - 0.1s'),
-        ('LOWHEAT_1S', '[0x1E] Low Heat - 1s'),
-        ('LOWHEAT_100MS', '[0x15] Low Heat - 0.1s'),
+        ('NOHEAT_HIGHPRECISION', '[0xFD] High Precision'),
+        ('NOHEAT_MEDPRECISION', '[0xF6] Medium Precision'),
+        ('NOHEAT_LOWPRECISION', '[0xE0] Low Precision'),
     )
 
     TEMP_SENSOR__SHT4X_HEATER_MODE_choices = (
