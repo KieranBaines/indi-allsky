@@ -2886,6 +2886,11 @@ class ConfigView(FormView):
             'TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_MAX_DUTY', 0.05),
             'TEMP_SENSOR__SHT4X_HEATER_RH_ON' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_RH_ON', 80.0),
             'TEMP_SENSOR__SHT4X_HEATER_RH_OFF' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_RH_OFF', 75.0),
+            'TEMP_SENSOR__SHT4X_REGEN_ENABLE' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_ENABLE', False),
+            'TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_INTERVAL_DAYS', 7.0),
+            'TEMP_SENSOR__SHT4X_REGEN_COMMAND' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_COMMAND', 'HIGHHEAT_1S'),
+            'TEMP_SENSOR__SHT4X_REGEN_PULSES' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_PULSES', 5),
+            'TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_EQUILIBRATION_S', 120.0),
             'TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT' : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI7021_HEATER_LEVEL_NIGHT', -1)),  # string in form, int in config
             'TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY' : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI7021_HEATER_LEVEL_DAY', -1)),  # string in form, int in config
             'TEMP_SENSOR__HTU31D_HEATER_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('HTU31D_HEATER_NIGHT', False),
@@ -3928,6 +3933,11 @@ class AjaxConfigView(BaseView):
         self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_MAX_DUTY'] = float(request.json['TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY'])
         self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_RH_ON']    = float(request.json['TEMP_SENSOR__SHT4X_HEATER_RH_ON'])
         self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_RH_OFF']   = float(request.json['TEMP_SENSOR__SHT4X_HEATER_RH_OFF'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_ENABLE']    = bool(request.json['TEMP_SENSOR__SHT4X_REGEN_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_INTERVAL_DAYS'] = float(request.json['TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_COMMAND']   = str(request.json['TEMP_SENSOR__SHT4X_REGEN_COMMAND'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_PULSES']    = int(request.json['TEMP_SENSOR__SHT4X_REGEN_PULSES'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_EQUILIBRATION_S'] = float(request.json['TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S'])
         self.indi_allsky_config['TEMP_SENSOR']['SI7021_HEATER_LEVEL_NIGHT'] = int(request.json['TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT'])
         self.indi_allsky_config['TEMP_SENSOR']['SI7021_HEATER_LEVEL_DAY'] = int(request.json['TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY'])
         self.indi_allsky_config['TEMP_SENSOR']['HTU31D_HEATER_NIGHT']   = bool(request.json['TEMP_SENSOR__HTU31D_HEATER_NIGHT'])

@@ -8304,6 +8304,65 @@ var camera_id = {{ camera_id }};
 
     <div class="form-group row">
         <div class="col-sm-2">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_ENABLE.label(class='col-form-label') }}
+        </div>
+        <div class="col-sm-4">
+            <div class="form-check form-switch">
+                {{ form_config.TEMP_SENSOR__SHT4X_REGEN_ENABLE(class='form-check-input') }}
+            </div>
+            <div id="TEMP_SENSOR__SHT4X_REGEN_ENABLE-error" class="invalid-feedback text-danger" style="display: none;"></div>
+        </div>
+        <div class="col-sm-6"><div>Periodic high-power decontamination burn, independent of heater mode (runs even when mode is OFF)</div></div>
+    </div>
+
+    <div class="form-group row">
+        <div class="col-sm-2">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS.label(class='col-form-label') }}
+        </div>
+        <div class="col-sm-4">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS(class='form-control bg-secondary', type='number', step='any') }}
+            <div id="TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS-error" class="invalid-feedback text-danger" style="display: none;"></div>
+        </div>
+        <div class="col-sm-6"><div>Days between regen burns (e.g. 7 for weekly). Timer persists across reboots.</div></div>
+    </div>
+
+    <div class="form-group row">
+        <div class="col-sm-2">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_COMMAND.label(class='col-form-label') }}
+        </div>
+        <div class="col-sm-4">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_COMMAND(class='form-select bg-secondary') }}
+            <div id="TEMP_SENSOR__SHT4X_REGEN_COMMAND-error" class="invalid-feedback text-danger" style="display: none;"></div>
+        </div>
+        <div class="col-sm-6"><div>Power/duration for the regen burn. Stronger than maintenance heating (e.g. High 200mW / 1s).</div></div>
+    </div>
+
+    <div class="form-group row">
+        <div class="col-sm-2">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_PULSES.label(class='col-form-label') }}
+        </div>
+        <div class="col-sm-4">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_PULSES(class='form-control bg-secondary', type='number', step='any') }}
+            <div id="TEMP_SENSOR__SHT4X_REGEN_PULSES-error" class="invalid-feedback text-danger" style="display: none;"></div>
+        </div>
+        <div class="col-sm-6"><div>Consecutive pulses per regen burn (Sensirion decontamination example: ~5)</div></div>
+    </div>
+
+    <div class="form-group row">
+        <div class="col-sm-2">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S.label(class='col-form-label') }}
+        </div>
+        <div class="col-sm-4">
+            {{ form_config.TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S(class='form-control bg-secondary', type='number', step='any') }}
+            <div id="TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S-error" class="invalid-feedback text-danger" style="display: none;"></div>
+        </div>
+        <div class="col-sm-6"><div>Cooling/equilibration wait after the burn before RH is trusted (e.g. 120s)</div></div>
+    </div>
+
+    <hr>
+
+    <div class="form-group row">
+        <div class="col-sm-2">
             {{ form_config.TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT.label(class='col-form-label') }}
         </div>
         <div class="col-sm-4">
@@ -10466,6 +10525,11 @@ const field_names = [
     'TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY',
     'TEMP_SENSOR__SHT4X_HEATER_RH_ON',
     'TEMP_SENSOR__SHT4X_HEATER_RH_OFF',
+    'TEMP_SENSOR__SHT4X_REGEN_ENABLE',
+    'TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS',
+    'TEMP_SENSOR__SHT4X_REGEN_COMMAND',
+    'TEMP_SENSOR__SHT4X_REGEN_PULSES',
+    'TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S',
     'TEMP_SENSOR__HDC302X_HEATER_NIGHT',
     'TEMP_SENSOR__HDC302X_HEATER_DAY',
     'TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT',

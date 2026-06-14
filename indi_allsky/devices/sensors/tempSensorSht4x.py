@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 
@@ -135,6 +136,13 @@ class TempSensorSht4x(SensorBase):
             self._equilibrate_until = 0.0
             self.heater_on = False
 
+        # --- periodic regeneration burn (independent of heater mode) ---
+        # A stronger, scheduled decontamination/decreep cycle that runs every
+        # N days regardless of the normal heating mode. Checked before the mode
+        # gate so it fires even when SHT4X_HEATER_MODE is OFF.
+        if self._regen_due(now):
+            return self._do_regen(now)
+
         # --- decide whether a new heat cycle is due ---
         if self.heater_mode == 'OFF':
             return True
@@ -169,6 +177,91 @@ class TempSensorSht4x(SensorBase):
 
         # --- perform the heat pulse(s) ---
         return self._do_heat_pulse(now)
+
+
+    def _regen_due(self, now):
+        if not self.regen_enable:
+            return False
+
+        interval_s = self.regen_interval_days * 86400.0
+
+        if self._last_regen == 0.0:
+            # no record yet (first run, or state file absent). Seed the clock
+            # to now and persist, so the first regen happens one interval from
+            # first boot rather than immediately.
+            self._last_regen = now
+            self._save_regen_state(now)
+            return False
+
+        return (now - self._last_regen) >= interval_s
+
+
+    def _do_regen(self, now):
+        import adafruit_sht4x
+
+        power_mw, duration_s, _ = SHT4X_HEATER_COMMANDS.get(
+            self.regen_command, SHT4X_HEATER_COMMANDS['HIGHHEAT_1S'])
+
+        pulses = self.regen_pulses
+
+        logger.warning('[%s] SHT4x REGEN burn: cmd=%s %dmW %0.1fs x%d (every %0.1f days)',
+                       self.name, self.regen_command, power_mw, duration_s,
+                       pulses, self.regen_interval_days)
+
+        try:
+            heat_mode = getattr(adafruit_sht4x.Mode, self.regen_command)
+            self.sht4x.mode = heat_mode
+
+            for _ in range(pulses):
+                self.sht4x.measurements
+                time.sleep(duration_s + 0.05)
+
+            self.sht4x.mode = getattr(adafruit_sht4x.Mode, NOHEAT_MODE)
+        except Exception as e:
+            logger.error('[%s] SHT4x regen error: %s', self.name, str(e))
+            self.heater_on = False
+            return True
+
+        # record completion time (persisted) and start equilibration. a regen
+        # burn is hotter than a maintenance pulse, so give it the larger of the
+        # configured equilibration and a regen-specific minimum.
+        self._last_regen = now
+        self._save_regen_state(now)
+
+        total_heat_s = duration_s * pulses
+        equilibration_s = max(self.heater_equilibration_s, self.regen_equilibration_s)
+
+        # still honor the duty-cycle cap for the regen burn itself
+        min_cycle_for_duty = total_heat_s / max(self.heater_max_duty, 0.001)
+
+        self._equilibrate_until = now + equilibration_s
+        # block normal heating until at least the duty-cycle window has passed
+        self._next_heat_allowed = max(self._next_heat_allowed, now + min_cycle_for_duty)
+        self.heater_on = True
+
+        logger.info('[%s] SHT4x regen complete: equilibrating %0.0fs, next regen in %0.1f days',
+                    self.name, equilibration_s, self.regen_interval_days)
+
+        return False
+
+
+    def _load_regen_state(self):
+        try:
+            with open(self._regen_state_file, 'r') as f:
+                ts = float(f.read().strip())
+            logger.info('[%s] SHT4x loaded last-regen timestamp: %0.0f', self.name, ts)
+            return ts
+        except (FileNotFoundError, ValueError, OSError):
+            return 0.0
+
+
+    def _save_regen_state(self, ts):
+        try:
+            with open(self._regen_state_file, 'w') as f:
+                f.write('{0:f}'.format(ts))
+        except OSError as e:
+            logger.error('[%s] SHT4x could not persist regen state to %s: %s',
+                         self.name, self._regen_state_file, str(e))
 
 
     def _do_heat_pulse(self, now):
@@ -309,14 +402,47 @@ class TempSensorSht4x_I2C(TempSensorSht4x):
         self.rh_heater_on_level = float(temp_sensor_config.get('SHT4X_HEATER_RH_ON', self.rh_heater_on_level))
         self.rh_heater_off_level = float(temp_sensor_config.get('SHT4X_HEATER_RH_OFF', self.rh_heater_off_level))
 
+        # --- periodic regeneration burn configuration ---
+        # Independent of the heater mode above. Runs a stronger decontamination
+        # cycle every N days. Last-run time is persisted to disk so the schedule
+        # survives reboots.
+        self.regen_enable = bool(temp_sensor_config.get('SHT4X_REGEN_ENABLE', False))
+        self.regen_interval_days = float(temp_sensor_config.get('SHT4X_REGEN_INTERVAL_DAYS', 7.0))
+
+        self.regen_command = temp_sensor_config.get('SHT4X_REGEN_COMMAND', 'HIGHHEAT_1S')
+        if self.regen_command not in SHT4X_HEATER_COMMANDS:
+            logger.error('[%s] Unknown SHT4x regen command %s, using HIGHHEAT_1S',
+                         self.name, self.regen_command)
+            self.regen_command = 'HIGHHEAT_1S'
+
+        self.regen_pulses = int(temp_sensor_config.get('SHT4X_REGEN_PULSES', 5))
+        self.regen_equilibration_s = float(temp_sensor_config.get('SHT4X_REGEN_EQUILIBRATION_S', 120.0))
+
+        # persisted last-regen timestamp. stored under the indi-allsky data dir
+        # if available, else /var/tmp. keyed by i2c address to keep multiple
+        # sensors separate.
+        state_dir = self.config.get('IMAGE_FOLDER', '/var/tmp')
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+        except OSError:
+            state_dir = '/var/tmp'
+        self._regen_state_file = os.path.join(
+            state_dir, '.sht4x_regen_{0}.ts'.format(i2c_address_str.replace('0x', '')))
+
         # state machine internals
         self._next_heat_allowed = 0.0
         self._equilibrate_until = 0.0
         self._last_good_rh = None
         self.heater_engaged = False  # for THRESHOLD hysteresis
+        self._last_regen = self._load_regen_state()
 
         if heater_enable:
             logger.warning('[%s] SHT4x heater enabled: mode=%s cmd=%s interval=%0.0fs equil=%0.0fs maxduty=%0.1f%%',
                            self.name, self.heater_mode, self.heater_command,
                            self.heater_interval_s, self.heater_equilibration_s,
                            self.heater_max_duty * 100)
+
+        if self.regen_enable:
+            logger.warning('[%s] SHT4x regen enabled: cmd=%s pulses=%d every %0.1f days (state: %s)',
+                           self.name, self.regen_command, self.regen_pulses,
+                           self.regen_interval_days, self._regen_state_file)

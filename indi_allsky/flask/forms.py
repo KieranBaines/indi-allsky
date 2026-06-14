@@ -3251,6 +3251,32 @@ def TEMP_SENSOR__SHT4X_HEATER_RH_validator(form, field):
         raise ValidationError('RH must be between 0 and 100')
 
 
+def TEMP_SENSOR__SHT4X_REGEN_COMMAND_validator(form, field):
+    if field.data not in list(zip(*form.TEMP_SENSOR__SHT4X_HEATER_COMMAND_choices))[0]:
+        raise ValidationError('Invalid regen command selection')
+
+
+def TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    if field.data < 0.5 or field.data > 365:
+        raise ValidationError('Regen interval must be between 0.5 and 365 days')
+
+
+def TEMP_SENSOR__SHT4X_REGEN_PULSES_validator(form, field):
+    if not isinstance(field.data, int):
+        raise ValidationError('Please enter a valid integer')
+    if field.data < 1 or field.data > 60:
+        raise ValidationError('Regen pulses must be between 1 and 60')
+
+
+def TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter a valid number')
+    if field.data < 1 or field.data > 600:
+        raise ValidationError('Regen equilibration must be between 1 and 600 seconds')
+
+
 def TEMP_SENSOR__HDC302X_HEATER_validator(form, field):
     if field.data not in list(zip(*form.TEMP_SENSOR__HDC302X_HEATER_choices))[0]:
         raise ValidationError('Invalid heater selection')
@@ -5044,6 +5070,11 @@ class IndiAllskyConfigForm(FlaskForm):
     TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY = FloatField('SHT4x Heater Max Duty Cycle', validators=[TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY_validator])
     TEMP_SENSOR__SHT4X_HEATER_RH_ON  = FloatField('SHT4x Heater RH On %', validators=[TEMP_SENSOR__SHT4X_HEATER_RH_validator])
     TEMP_SENSOR__SHT4X_HEATER_RH_OFF = FloatField('SHT4x Heater RH Off %', validators=[TEMP_SENSOR__SHT4X_HEATER_RH_validator])
+    TEMP_SENSOR__SHT4X_REGEN_ENABLE  = BooleanField('SHT4x Periodic Regen Enable')
+    TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS = FloatField('SHT4x Regen Interval (days)', validators=[TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS_validator])
+    TEMP_SENSOR__SHT4X_REGEN_COMMAND = SelectField('SHT4x Regen Power/Duration', choices=TEMP_SENSOR__SHT4X_HEATER_COMMAND_choices, validators=[TEMP_SENSOR__SHT4X_REGEN_COMMAND_validator])
+    TEMP_SENSOR__SHT4X_REGEN_PULSES  = IntegerField('SHT4x Regen Pulses', validators=[TEMP_SENSOR__SHT4X_REGEN_PULSES_validator])
+    TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S = FloatField('SHT4x Regen Equilibration (s)', validators=[TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S_validator])
     TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT = SelectField('SI7021 Heater Level (Night)', choices=TEMP_SENSOR__SI7021_HEATER_LEVEL_choices, validators=[TEMP_SENSOR__SI7021_HEATER_LEVEL_validator])
     TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY   = SelectField('SI7021 Heater Level (Day)', choices=TEMP_SENSOR__SI7021_HEATER_LEVEL_choices, validators=[TEMP_SENSOR__SI7021_HEATER_LEVEL_validator])
     TEMP_SENSOR__HTU31D_HEATER_NIGHT = BooleanField('HTU31D Heater (Night)')
