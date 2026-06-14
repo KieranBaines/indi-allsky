@@ -1833,6 +1833,40 @@ class JsonChartView(JsonView):
         #app.logger.info('Image read in %0.4f s', image_elapsed_s)
 
 
+        # The detection mask is rotated/flipped/cropped/scaled in _load_detection_mask()
+        # to match post-processed images. The saved image read above is the raw, full-size
+        # frame, so apply the same transform chain here or the mask and image shapes will
+        # not match (numpy.ma.masked_array raises MaskError when IMAGE_CROP_ROI + DETECT_MASK
+        # are both set). Reuses MaskProcessor (plain numpy/cv2 ops, works on 3-channel BGR).
+        from ..maskProcessing import MaskProcessor
+
+        _img_processor = MaskProcessor(
+            self.indi_allsky_config,
+            latest_image.binmode,
+        )
+        _img_processor.image = image_data
+
+        if self.indi_allsky_config.get('IMAGE_ROTATE'):
+            _img_processor.rotate_90()
+
+        if self.indi_allsky_config.get('IMAGE_ROTATE_ANGLE'):
+            _img_processor.rotate_angle()
+
+        if self.indi_allsky_config.get('IMAGE_FLIP_V'):
+            _img_processor.flip_v()
+
+        if self.indi_allsky_config.get('IMAGE_FLIP_H'):
+            _img_processor.flip_h()
+
+        if self.indi_allsky_config.get('IMAGE_CROP_ROI'):
+            _img_processor.crop_image()
+
+        if self.indi_allsky_config['IMAGE_SCALE'] and self.indi_allsky_config['IMAGE_SCALE'] != 100:
+            _img_processor.scale_image()
+
+        image_data = _img_processor.image
+
+
         image_height, image_width = image_data.shape[:2]
         app.logger.info('Calculating histogram from RoI')
 
