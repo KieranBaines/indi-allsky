@@ -2278,11 +2278,11 @@ class ConfigView(FormView):
             'LENS_OFFSET_Y'                  : self.indi_allsky_config.get('LENS_OFFSET_Y', 0),
             'LENS_ALTITUDE'                  : self.indi_allsky_config.get('LENS_ALTITUDE', 90.0),
             'LENS_AZIMUTH'                   : self.indi_allsky_config.get('LENS_AZIMUTH', 0.0),
-            'CCD_CONFIG__NIGHT__GAIN'        : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('NIGHT', {}).get('GAIN', 100.0), 2),  # limit to 2 decimals
+            'CCD_CONFIG__NIGHT__GAIN'        : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('NIGHT', {}).get('GAIN', 100.0), 3),  # limit to 3 decimals
             'CCD_CONFIG__NIGHT__BINNING'     : self.indi_allsky_config.get('CCD_CONFIG', {}).get('NIGHT', {}).get('BINNING', 1),
-            'CCD_CONFIG__MOONMODE__GAIN'     : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('MOONMODE', {}).get('GAIN', 75.0), 2),  # limit to 2 decimals
+            'CCD_CONFIG__MOONMODE__GAIN'     : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('MOONMODE', {}).get('GAIN', 75.0), 3),  # limit to 3 decimals
             'CCD_CONFIG__MOONMODE__BINNING'  : self.indi_allsky_config.get('CCD_CONFIG', {}).get('MOONMODE', {}).get('BINNING', 1),
-            'CCD_CONFIG__DAY__GAIN'          : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('DAY', {}).get('GAIN', 0.0), 2),  # limit to 2 decimals
+            'CCD_CONFIG__DAY__GAIN'          : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('DAY', {}).get('GAIN', 0.0), 3),  # limit to 3 decimals
             'CCD_CONFIG__DAY__BINNING'       : self.indi_allsky_config.get('CCD_CONFIG', {}).get('DAY', {}).get('BINNING', 1),
             'CCD_CONFIG__EXPOSURE_CLASSNAME' : self.indi_allsky_config.get('CCD_CONFIG', {}).get('EXPOSURE_CLASSNAME', 'exposure_basic'),
             'CCD_CONFIG__AUTO_GAIN_LEVELS'   : str(self.indi_allsky_config.get('CCD_CONFIG', {}).get('AUTO_GAIN_LEVELS', 8)),  # string in form, int in config
@@ -2296,8 +2296,8 @@ class ConfigView(FormView):
             'EXPOSURE_PERIOD_DAY'            : self.indi_allsky_config.get('EXPOSURE_PERIOD_DAY', 15.0),
             'CAMERA_SQM__ENABLE'             : self.indi_allsky_config.get('CAMERA_SQM', {}).get('ENABLE', False),
             'CAMERA_SQM__ENABLE_DAY'         : self.indi_allsky_config.get('CAMERA_SQM', {}).get('ENABLE_DAY', False),
-            'CAMERA_SQM__EXPOSURE'           : '{0:.6f}'.format(self.indi_allsky_config.get('CAMERA_SQM', {}).get('EXPOSURE', 10.0)),  # force 6 digits of precision
-            'CAMERA_SQM__GAIN'               : round(self.indi_allsky_config.get('CAMERA_SQM', {}).get('GAIN', 10.0), 2),  # limit to 2 decimals
+            'CAMERA_SQM__EXPOSURE'           : self.indi_allsky_config.get('CAMERA_SQM', {}).get('EXPOSURE', 10.0),
+            'CAMERA_SQM__GAIN'               : round(self.indi_allsky_config.get('CAMERA_SQM', {}).get('GAIN', 10.0), 3),  # limit to 3 decimals
             'CAMERA_SQM__BINNING'            : self.indi_allsky_config.get('CAMERA_SQM', {}).get('BINNING', 1),
             'CAMERA_SQM__EXPOSURE_PERIOD'    : self.indi_allsky_config.get('CAMERA_SQM', {}).get('EXPOSURE_PERIOD', 900),
             'CAMERA_SQM__MAGNITUDE_OFFSET'   : self.indi_allsky_config.get('CAMERA_SQM', {}).get('MAGNITUDE_OFFSET', 25.0),
@@ -3357,11 +3357,11 @@ class AjaxConfigView(BaseView):
         self.indi_allsky_config['LENS_OFFSET_Y']                        = int(request.json['LENS_OFFSET_Y'])
         self.indi_allsky_config['LENS_ALTITUDE']                        = float(request.json['LENS_ALTITUDE'])
         self.indi_allsky_config['LENS_AZIMUTH']                         = float(request.json['LENS_AZIMUTH'])
-        self.indi_allsky_config['CCD_CONFIG']['NIGHT']['GAIN']          = float(round(float(request.json['CCD_CONFIG__NIGHT__GAIN']), 2))  # limit to 2 decimals
+        self.indi_allsky_config['CCD_CONFIG']['NIGHT']['GAIN']          = float(round(float(request.json['CCD_CONFIG__NIGHT__GAIN']), 3))  # limit to 3 decimals
         self.indi_allsky_config['CCD_CONFIG']['NIGHT']['BINNING']       = int(request.json['CCD_CONFIG__NIGHT__BINNING'])
-        self.indi_allsky_config['CCD_CONFIG']['MOONMODE']['GAIN']       = float(round(float(request.json['CCD_CONFIG__MOONMODE__GAIN']), 2))  # limit to 2 decimals
+        self.indi_allsky_config['CCD_CONFIG']['MOONMODE']['GAIN']       = float(round(float(request.json['CCD_CONFIG__MOONMODE__GAIN']), 3))  # limit to 3 decimals
         self.indi_allsky_config['CCD_CONFIG']['MOONMODE']['BINNING']    = int(request.json['CCD_CONFIG__MOONMODE__BINNING'])
-        self.indi_allsky_config['CCD_CONFIG']['DAY']['GAIN']            = float(round(float(request.json['CCD_CONFIG__DAY__GAIN']), 2))  # limit to 2 decimals
+        self.indi_allsky_config['CCD_CONFIG']['DAY']['GAIN']            = float(round(float(request.json['CCD_CONFIG__DAY__GAIN']), 3))  # limit to 3 decimals
         self.indi_allsky_config['CCD_CONFIG']['DAY']['BINNING']         = int(request.json['CCD_CONFIG__DAY__BINNING'])
         self.indi_allsky_config['CCD_CONFIG']['EXPOSURE_CLASSNAME']     = str(request.json['CCD_CONFIG__EXPOSURE_CLASSNAME'])
         self.indi_allsky_config['CCD_CONFIG']['AUTO_GAIN_LEVELS']       = int(request.json['CCD_CONFIG__AUTO_GAIN_LEVELS'])
@@ -3376,7 +3376,7 @@ class AjaxConfigView(BaseView):
         self.indi_allsky_config['CAMERA_SQM']['ENABLE']                 = bool(request.json['CAMERA_SQM__ENABLE'])
         self.indi_allsky_config['CAMERA_SQM']['ENABLE_DAY']             = bool(request.json['CAMERA_SQM__ENABLE_DAY'])
         self.indi_allsky_config['CAMERA_SQM']['EXPOSURE']               = float(round(float(request.json['CAMERA_SQM__EXPOSURE']), 6))
-        self.indi_allsky_config['CAMERA_SQM']['GAIN']                   = float(round(float(request.json['CAMERA_SQM__GAIN']), 2))  # limit to 2 decimals
+        self.indi_allsky_config['CAMERA_SQM']['GAIN']                   = float(round(float(request.json['CAMERA_SQM__GAIN']), 3))  # limit to 3 decimals
         self.indi_allsky_config['CAMERA_SQM']['BINNING']                = int(request.json['CAMERA_SQM__BINNING'])
         self.indi_allsky_config['CAMERA_SQM']['EXPOSURE_PERIOD']        = int(request.json['CAMERA_SQM__EXPOSURE_PERIOD'])
         self.indi_allsky_config['CAMERA_SQM']['MAGNITUDE_OFFSET']       = float(request.json['CAMERA_SQM__MAGNITUDE_OFFSET'])
@@ -4665,6 +4665,7 @@ class Fits2JpegView(BaseView):
 
 
     def dispatch_request(self):
+        import ctypes
         import cv2
         from astropy.io import fits
         #from PIL import Image
@@ -4695,8 +4696,9 @@ class Fits2JpegView(BaseView):
         hdulist = fits.open(filename_p)
 
         exposure = float(hdulist[0].header.get('EXPTIME', 0))
+        exposure_av = Array(ctypes.c_int32, [int(exposure * 1000000)])
         gain = float(hdulist[0].header.get('GAIN', 0))
-        gain_av = Array('f', [gain])
+        gain_av = Array(ctypes.c_int32, [int(gain * 1000)])
         position_av = Array('f', [self.camera.latitude, self.camera.longitude, self.camera.elevation])
         binning = int(hdulist[0].header.get('XBINNING', 1))
         binning_av = Array('i', [binning])
@@ -4710,6 +4712,7 @@ class Fits2JpegView(BaseView):
         image_processor = ImageProcessor(
             p_config,
             position_av,
+            exposure_av,
             gain_av,
             binning_av,
             sensors_temp_av,
@@ -7838,6 +7841,7 @@ class JsonImageProcessingView(JsonView):
 
 
     def dispatch_request(self):
+        import ctypes
         import cv2
         from astropy.io import fits
         #from PIL import Image
@@ -8082,8 +8086,9 @@ class JsonImageProcessingView(JsonView):
         hdulist = fits.open(filename_p)
 
         exposure = float(hdulist[0].header.get('EXPTIME', 0))
+        exposure_av = Array(ctypes.c_int32, [int(exposure * 1000000)])
         gain = float(hdulist[0].header.get('GAIN', 0))
-        gain_av = Array('f', [gain])
+        gain_av = Array(ctypes.c_int32, [int(gain * 1000)])
         binning = int(hdulist[0].header.get('XBINNING', 1))
         binning_av = Array('i', [binning])
         position_av = Array('f', [self.camera.latitude, self.camera.longitude, self.camera.elevation])
@@ -8099,6 +8104,7 @@ class JsonImageProcessingView(JsonView):
         image_processor = ImageProcessor(
             p_config,
             position_av,
+            exposure_av,
             gain_av,
             binning_av,
             sensors_temp_av,
