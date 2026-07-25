@@ -12,7 +12,7 @@ ccdproc >= 2.4.2
 # https://www.wheelodex.org/projects/scikit-image/
 scikit-image >= 0.25.0
 # https://www.wheelodex.org/projects/Pillow/
-Pillow >= 12.2.0
+Pillow >= 12.3.0
 simplejpeg
 bottleneck >= 1.4.0
 ephem
@@ -29,6 +29,7 @@ Flask-WTF >= 1.2.1
 Flask-Login >= 0.6.2
 Authlib >= 1.7.2
 werkzeug >= 3.1.6
+simple-websocket >= 1.0.0
 is-safe-url
 certifi >= 2023.7.22
 # https://www.wheelodex.org/projects/cryptography/
