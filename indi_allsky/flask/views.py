@@ -1842,8 +1842,8 @@ class JsonChartView(JsonView):
 
         _img_processor = MaskProcessor(
             self.indi_allsky_config,
-            latest_image.binmode,
         )
+        _img_processor.binning = latest_image.binmode
         _img_processor.image = image_data
 
         if self.indi_allsky_config.get('IMAGE_ROTATE'):
