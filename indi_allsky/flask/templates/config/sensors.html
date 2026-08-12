@@ -432,11 +432,91 @@
 
                 <div class="tw:grid tw:grid-cols-1 sm:tw:grid-cols-3 tw:gap-4 tw:pt-2">
                     <div class="tw:flex tw:flex-col tw:gap-1">
-                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">SHT4x Heater Mode (Night / Day)</span>
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">SHT4x Precision (Night / Day)</span>
                         {{ form_config.TEMP_SENSOR__SHT4X_MODE_NIGHT(class='tw:select tw:select-bordered tw:select-sm tw:h-9 tw:bg-base-100 tw:text-base-content', placeholder='Night') }}
                         <div id="TEMP_SENSOR__SHT4X_MODE_NIGHT-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
                         {{ form_config.TEMP_SENSOR__SHT4X_MODE_DAY(class='tw:select tw:select-bordered tw:select-sm tw:h-9 tw:bg-base-100 tw:text-base-content tw:mt-1', placeholder='Day') }}
                         <div id="TEMP_SENSOR__SHT4X_MODE_DAY-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:col-span-full tw:mt-2 tw:pt-2 tw:border-t tw:border-base-300">
+                        <span class="tw:text-[0.7rem] tw:font-bold tw:uppercase tw:text-base-content/80">SHT4x Heater</span>
+                    </div>
+                    <div class="tw:flex tw:items-center tw:justify-between tw:p-3 tw:bg-base-100 tw:rounded-[var(--radius-box)] tw:border tw:border-base-300">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_ENABLE.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_ENABLE(class='tw:toggle tw:toggle-primary tw:toggle-sm') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_ENABLE-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_MODE.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_MODE(class='tw:select tw:select-bordered tw:select-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_MODE-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_COMMAND.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_COMMAND(class='tw:select tw:select-bordered tw:select-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_COMMAND-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_PULSES.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_PULSES(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_PULSES-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_RH_ON.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_RH_ON(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_RH_ON-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_HEATER_RH_OFF.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_HEATER_RH_OFF(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_HEATER_RH_OFF-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:col-span-full tw:mt-2 tw:pt-2 tw:border-t tw:border-base-300">
+                        <span class="tw:text-[0.7rem] tw:font-bold tw:uppercase tw:text-base-content/80">SHT4x Periodic Regeneration</span>
+                    </div>
+                    <div class="tw:flex tw:items-center tw:justify-between tw:p-3 tw:bg-base-100 tw:rounded-[var(--radius-box)] tw:border tw:border-base-300">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_REGEN_ENABLE.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_REGEN_ENABLE(class='tw:toggle tw:toggle-primary tw:toggle-sm') }}
+                        <div id="TEMP_SENSOR__SHT4X_REGEN_ENABLE-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_REGEN_COMMAND.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_REGEN_COMMAND(class='tw:select tw:select-bordered tw:select-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_REGEN_COMMAND-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_REGEN_PULSES.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_REGEN_PULSES(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_REGEN_PULSES-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">{{ form_config.TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S.label.text }}</span>
+                        {{ form_config.TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S(class='tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-100 tw:text-base-content') }}
+                        <div id="TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S-error" class="tw:text-error tw:text-xs tw:mt-1" style="display: none;"></div>
+                    </div>
+                    <div class="tw:flex tw:flex-col tw:gap-1">
+                        <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">SHT4x Last Regen</span>
+                        <input class="tw:input tw:input-bordered tw:input-sm tw:h-9 tw:bg-base-200 tw:text-base-content" type="text" value="{{ sht4x_regen_last }}" readonly>
                     </div>
                     <div class="tw:flex tw:flex-col tw:gap-1">
                         <span class="tw:text-[0.625rem] tw:font-bold tw:uppercase tw:text-base-content/80">Si7021 Heater Level (Night / Day)</span>
