@@ -115,6 +115,7 @@ class IndiAllSky(object):
         self.smoke_tasks_time = now_time     # run asap
         self.sat_data_tasks_time = now_time  # run asap
         self.backup_tasks_time = now_time    # run asap
+        self.allskymap_tasks_time = now_time  # run asap
 
 
         self.position_av = Array('f', [
@@ -916,6 +917,12 @@ class IndiAllSky(object):
             db.session.commit()
 
             logger.warning('*** Timelapse videos inserted: %d ***', len(video_entries))
+            try:
+                from .events import event_manager
+                for ventry in video_entries:
+                    event_manager.broadcast('timelapse_complete', ventry)
+            except Exception as ev_err:
+                logger.error('Error broadcasting timelapse_complete event: %s', str(ev_err))
         except IntegrityError as e:
             logger.warning('Integrity error: %s', str(e))
             db.session.rollback()
@@ -973,6 +980,12 @@ class IndiAllSky(object):
             db.session.commit()
 
             logger.warning('*** Keograms inserted: %d ***', len(keogram_entries))
+            try:
+                from .events import event_manager
+                for kentry in keogram_entries:
+                    event_manager.broadcast('keogram_complete', kentry)
+            except Exception as ev_err:
+                logger.error('Error broadcasting keogram_complete event: %s', str(ev_err))
         except IntegrityError as e:
             logger.warning('Integrity error: %s', str(e))
             db.session.rollback()
@@ -1024,6 +1037,12 @@ class IndiAllSky(object):
             db.session.commit()
 
             logger.warning('*** Star trails inserted: %d ***', len(startrail_entries))
+            try:
+                from .events import event_manager
+                for stentry in startrail_entries:
+                    event_manager.broadcast('startrail_complete', stentry)
+            except Exception as ev_err:
+                logger.error('Error broadcasting startrail_complete event: %s', str(ev_err))
         except IntegrityError as e:
             logger.warning('Integrity error: %s', str(e))
             db.session.rollback()
@@ -1198,6 +1217,12 @@ class IndiAllSky(object):
             db.session.commit()
 
             logger.warning('*** Images inserted: %d ***', len(image_entries))
+            try:
+                from .events import event_manager
+                for img_entry in image_entries:
+                    event_manager.broadcast('exposure_complete', img_entry)
+            except Exception as ev_err:
+                logger.error('Error broadcasting exposure_complete event: %s', str(ev_err))
         except IntegrityError as e:
             logger.warning('Integrity error: %s', str(e))
             db.session.rollback()
@@ -1469,6 +1494,18 @@ class IndiAllSky(object):
                     self._backupDatabase()
 
 
+        # Allsky Map Ping integration
+        if self.config.get('ALLSKYMAP', {}).get('ENABLE'):
+            if self.allskymap_tasks_time < now_time:
+                interval_mins = self.config['ALLSKYMAP'].get('INTERVAL', 10)
+                if not isinstance(interval_mins, int) or interval_mins < 1:
+                    interval_mins = 10
+                self.allskymap_tasks_time = now_time + (interval_mins * 60)
+
+                logger.info('Triggering Allsky Map Ping thread')
+                self._triggerAllskyMapPing()
+
+
     def _updateAuroraData(self, task_state=TaskQueueState.QUEUED):
 
         active_cameras = IndiAllSkyDbCameraTable.query\
@@ -1601,4 +1638,21 @@ class IndiAllSky(object):
             logger.info('Wrote new config')
         except ConfigSaveException:
             return
+
+
+    def _triggerAllskyMapPing(self, task_state=TaskQueueState.QUEUED):
+        jobdata = {
+            'action' : 'sendAllskyMapPing',
+            'kwargs' : {},
+        }
+
+        task = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.VIDEO,
+            state=task_state,
+            data=jobdata,
+        )
+        db.session.add(task)
+        db.session.commit()
+
+        self.video_q.put({'task_id' : task.id})
 

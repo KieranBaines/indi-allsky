@@ -29,6 +29,7 @@ var camera_id = {{ camera_id }};
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-youtube-tab" data-tab-target="nav-youtube" type="button" role="tab"><i class="tw:icon-[lucide--youtube] tw:w-3.5 tw:h-3.5"></i> YouTube</button>
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-s3-tab" data-tab-target="nav-s3" type="button" role="tab"><i class="tw:icon-[lucide--database] tw:w-3.5 tw:h-3.5"></i> Object Storage</button>
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-syncapi-tab" data-tab-target="nav-syncapi" type="button" role="tab"><i class="tw:icon-[lucide--refresh-cw] tw:w-3.5 tw:h-3.5"></i> SyncAPI</button>
+    <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-allskymap-tab" data-tab-target="nav-allskymap" type="button" role="tab"><i class="tw:icon-[lucide--map] tw:w-3.5 tw:h-3.5"></i> Allsky Map</button>
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-sensors-tab" data-tab-target="nav-sensors" type="button" role="tab"><i class="tw:icon-[lucide--cpu] tw:w-3.5 tw:h-3.5"></i> Sensors</button>
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-devices-tab" data-tab-target="nav-devices" type="button" role="tab"><i class="tw:icon-[lucide--plug] tw:w-3.5 tw:h-3.5"></i> Devices</button>
     <button class="tab-btn tw:btn tw:btn-sm tw:btn-ghost tw:font-bold tw:uppercase tw:tracking-wider tw:text-base-content/60 hover:tw:text-base-content tw:gap-1.5 active:tw:scale-95 tw:transition-all" id="nav-adsb-tab" data-tab-target="nav-adsb" type="button" role="tab"><i class="tw:icon-[lucide--plane] tw:w-3.5 tw:h-3.5"></i> ADS-B</button>
@@ -64,7 +65,7 @@ var camera_id = {{ camera_id }};
 </div>
 
 <!-- Save & Note Footer Bar -->
-<div class="tw:card tw:bg-base-200 tw:border tw:border-base-300 hover:tw:border-base-content/25 tw:transition-all tw:rounded-[var(--radius-box)] shadow-md tw:mt-4 tw:mb-8">
+<div class="tw:card tw:bg-base-200 tw:border tw:border-base-300 hover:tw:border-base-content/25 tw:transition-all tw:rounded-[var(--radius-box)] shadow-md tw:mt-4 tw:mb-8 sticky-desktop-header">
     <div class="tw:card-body tw:p-4 sm:tw:p-5 tw:flex tw:flex-row tw:flex-wrap sm:tw:flex-nowrap tw:items-center tw:gap-4">
         <button id="save-button" class="tw:btn tw:btn-primary tw:btn-md tw:gap-2 tw:font-bold tw:uppercase tw:tracking-wider tw:flex-shrink-0 tw:shadow-[0_0_15px_rgba(59,130,246,0.3)] hover:tw:shadow-[0_0_25px_rgba(59,130,246,0.5)] active:tw:scale-95 tw:transition-all">
             <i class="tw:icon-[lucide--save] tw:w-4 tw:h-4"></i>
@@ -98,14 +99,12 @@ var camera_id = {{ camera_id }};
     {% include 'config/youtube.html' %}
     {% include 'config/s3.html' %}
     {% include 'config/syncapi.html' %}
+    {% include 'config/allskymap.html' %}
     {% include 'config/sensors.html' %}
     {% include 'config/devices.html' %}
     {% include 'config/adsb.html' %}
     {% include 'config/sat_track.html' %}
 </div>
-
-
-
 
 </form>
 </div>
@@ -219,6 +218,7 @@ const field_names = [
     'NIGHT_MOONMODE_PHASE',
     'WEB_STATUS_TEMPLATE',
     'WEB_EXTRA_TEXT',
+    'WEBSOCKET_API_KEY',
     'CHARTS__CUSTOM_SLOT_1',
     'CHARTS__CUSTOM_SLOT_1_MIN',
     'CHARTS__CUSTOM_SLOT_2',
@@ -354,6 +354,20 @@ const field_names = [
     'CAPTURE_HOOK_PRE',
     'CAPTURE_HOOK_TIMEOUT',
     'IMAGE_SAVE_FITS_PERIOD',
+    // ASI676MC numeric controls remain in the central save list even though
+    // their UI now lives in the section-based Image component.
+    'IMAGE_ASI676MC_REPAIR__PURPLE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__RED_SIDE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__BLUE_SIDE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__SAMPLE_STEP',
+    'IMAGE_ASI676MC_REPAIR__SOURCE_SATURATION_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__GAIN_R',
+    'IMAGE_ASI676MC_REPAIR__GAIN_G1',
+    'IMAGE_ASI676MC_REPAIR__GAIN_G2',
+    'IMAGE_ASI676MC_REPAIR__GAIN_B',
+    'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_START_RATIO',
+    'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_END_RATIO',
+    'IMAGE_ASI676MC_REPAIR__CHUNK_ROWS',
     'TIMELAPSE_EXPIRE_DAYS',
     'FFMPEG_FRAMERATE',
     'FFMPEG_FRAMERATE_DAY',
@@ -692,6 +706,12 @@ const field_names = [
     'INDI_CONFIG_DEFAULTS',
     'INDI_CONFIG_DAY',
     'CONFIG_NOTE',
+    'ALLSKYMAP__API_URL',
+    'ALLSKYMAP__API_KEY',
+    'ALLSKYMAP__CAMERA_NAME',
+    'ALLSKYMAP__CAMERA_OWNER',
+    'ALLSKYMAP__WEBSITE_URL',
+    'ALLSKYMAP__INTERVAL',
 ];
 
 const checkbox_field_names = [
@@ -745,6 +765,12 @@ const checkbox_field_names = [
     'IMAGE_EXPORT_FLIP_H',
     'IMAGE_SAVE_FITS',
     'IMAGE_SAVE_FITS_COMPRESSED',
+    'IMAGE_ASI676MC_REPAIR__ENABLE',
+    'IMAGE_ASI676MC_REPAIR__EXCLUDE_ONLY',
+    'IMAGE_ASI676MC_REPAIR__LOG_EVERY_FRAME',
+    'IMAGE_ASI676MC_REPAIR__GALLERY_ENABLE',
+    'IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS',
+    'IMAGE_ASI676MC_REPAIR__SAVE_PRECEDING_FITS',
     'IMAGE_STACK_ALIGN',
     'IMAGE_STACK_SPLIT',
     'IMAGE_STACK_MOONMODE',
@@ -860,6 +886,8 @@ const checkbox_field_names = [
     'WEB_NONLOCAL_IMAGES',
     'WEB_LOCAL_IMAGES_ADMIN',
     'RELOAD_ON_SAVE',
+    'ALLSKYMAP__ENABLE',
+    'ALLSKYMAP__UPLOAD_IMAGE',
 ];
 
 var fields = {};
@@ -1478,6 +1506,84 @@ $('#FAN__THOLD_ENABLE').on('change', function() {
 });
 
 
+// The section-based UI keeps all model-specific controls together, while the
+// existing dependency helper preserves their disabled state and saved values.
+var group_fields_asi676mc_repair = [
+    'IMAGE_ASI676MC_REPAIR__PURPLE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__RED_SIDE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__BLUE_SIDE_RATIO_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__SAMPLE_STEP',
+    'IMAGE_ASI676MC_REPAIR__SOURCE_SATURATION_THRESHOLD',
+    'IMAGE_ASI676MC_REPAIR__GAIN_R',
+    'IMAGE_ASI676MC_REPAIR__GAIN_G1',
+    'IMAGE_ASI676MC_REPAIR__GAIN_G2',
+    'IMAGE_ASI676MC_REPAIR__GAIN_B',
+    'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_START_RATIO',
+    'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_END_RATIO',
+    'IMAGE_ASI676MC_REPAIR__CHUNK_ROWS',
+];
+
+var group_checkbox_fields_asi676mc_repair = [
+    'IMAGE_ASI676MC_REPAIR__EXCLUDE_ONLY',
+    'IMAGE_ASI676MC_REPAIR__LOG_EVERY_FRAME',
+    'IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS',
+    'IMAGE_ASI676MC_REPAIR__SAVE_PRECEDING_FITS',
+];
+
+group_on_change(
+    'IMAGE_ASI676MC_REPAIR__ENABLE',
+    group_fields_asi676mc_repair,
+    group_checkbox_fields_asi676mc_repair
+);
+
+// The preceding-frame cache is meaningful only while diagnostic FITS saving
+// is active. Its checked value is retained while the control is disabled.
+function update_asi676mc_preceding_fits_state() {
+    var enable_preceding = (
+        $('#IMAGE_ASI676MC_REPAIR__ENABLE').prop('checked')
+        && $('#IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS').prop('checked')
+    );
+    $('#IMAGE_ASI676MC_REPAIR__SAVE_PRECEDING_FITS').prop(
+        'disabled',
+        !enable_preceding
+    );
+}
+
+$('#IMAGE_ASI676MC_REPAIR__ENABLE, #IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS').on(
+    'change',
+    update_asi676mc_preceding_fits_state
+);
+
+// Gallery decoration is part of the feature, not an independent preference.
+// Turning the master switch off clears the saved gallery option as well as
+// disabling its control. The gallery view and its data endpoint repeat this
+// master-switch check before showing badges or accepting filters.
+function update_asi676mc_gallery_state() {
+    var repair_enabled = $('#IMAGE_ASI676MC_REPAIR__ENABLE').prop('checked');
+    var gallery_toggle = $('#IMAGE_ASI676MC_REPAIR__GALLERY_ENABLE');
+    if (!repair_enabled) {
+        gallery_toggle.prop('checked', false);
+    }
+    gallery_toggle.prop('disabled', !repair_enabled);
+}
+
+$('#IMAGE_ASI676MC_REPAIR__ENABLE').on(
+    'change',
+    update_asi676mc_gallery_state
+);
+
+// A newly enabled installation starts in detection-only mode. Existing
+// enabled configurations retain the mode the user already selected.
+var asi676mc_repair_was_enabled = $('#IMAGE_ASI676MC_REPAIR__ENABLE').prop('checked');
+$('#IMAGE_ASI676MC_REPAIR__ENABLE').on('change', function() {
+    var repair_enabled = $(this).prop('checked');
+    if (repair_enabled && !asi676mc_repair_was_enabled) {
+        $('#IMAGE_ASI676MC_REPAIR__EXCLUDE_ONLY').prop('checked', true);
+    }
+    asi676mc_repair_was_enabled = repair_enabled;
+});
+
+
 var group_fields_fits = [
     'IMAGE_SAVE_FITS_PERIOD',
     'FITSHEADERS__0__KEY',
@@ -1808,6 +1914,13 @@ $( document ).ready(function() {
     }
 
 
+    group_on_ready(
+        'IMAGE_ASI676MC_REPAIR__ENABLE',
+        group_fields_asi676mc_repair,
+        group_checkbox_fields_asi676mc_repair
+    );
+    update_asi676mc_gallery_state();
+    update_asi676mc_preceding_fits_state();
     group_on_ready('IMAGE_SAVE_FITS', group_fields_fits, group_checkbox_fields_fits);
     group_on_ready('IMAGE_CIRCLE_MASK__ENABLE', group_fields_image_circle_mask, group_checkbox_fields_image_circle_mask);
     group_on_ready('CAMERA_SQM__ENABLE', group_fields_camera_sqm, group_checkbox_fields_camera_sqm);

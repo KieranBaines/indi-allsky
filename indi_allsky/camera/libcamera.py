@@ -558,6 +558,8 @@ class IndiClientLibCameraGeneric(IndiClient):
             'exp_time'    : datetime.timestamp(exp_date),  # datetime objects are not json serializable
             'exp_elapsed' : exposure_elapsed_s,
             'camera_id'   : self.camera_id,
+            # Preserve the capture-time device identity for model-specific gates.
+            'camera_name' : self.ccd_device_name,
             'filename_t'  : self._filename_t,
             'libcamera_black_level' : self._black_level,
             'libcamera_awb_gains'   : self._awb_gains,
@@ -971,7 +973,9 @@ class IndiClientLibCameraImx296(IndiClientLibCameraGeneric):
             'height'        : 1088,
             'pixel'         : 3.45,
             'min_gain'      : 1.0,
-            'max_gain'      : 251.188644,
+            # libcamera reports max analog gain of 251.188644, however this is 48dB of gain which
+            # is the maximum analog + digital gain supported by the sensor
+            'max_gain'      : 16.0,
             'min_binning'   : 1,
             'max_binning'   : 1,
             'min_exposure'  : 0.016562,

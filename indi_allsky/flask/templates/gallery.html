@@ -16,6 +16,7 @@
     gap: 1rem !important;
 }
 #allsky-gallery a {
+    position: relative !important;
     display: block !important;
     width: 100% !important;
     height: 180px !important;
@@ -35,19 +36,53 @@
     object-fit: cover !important;
     display: block !important;
 }
+
+/* Purple-frame audit styling uses stored server status only; the gallery
+ * never reclassifies or mutates a frame. */
+#allsky-gallery a.asi676mc-repaired-thumbnail,
+#allsky-gallery a.asi676mc-excluded-thumbnail {
+    box-shadow: inset 0 0 0 4px var(--color-warning, #f59e0b) !important;
+}
+
+#allsky-gallery a.asi676mc-validation-failed-thumbnail {
+    box-shadow: inset 0 0 0 4px var(--color-error, #ef4444) !important;
+}
+
+.asi676mc-repair-badge {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    z-index: 1;
+    max-width: calc(100% - 0.8rem);
+    padding: 0.2rem 0.45rem;
+    border-radius: 9999px;
+    color: var(--color-warning-content, #111827);
+    background: var(--color-warning, #f59e0b);
+    font-size: 0.625rem;
+    font-weight: 700;
+    line-height: 1.2;
+    text-align: center;
+    pointer-events: none;
+}
+
+.asi676mc-repair-badge.validation-failed {
+    color: var(--color-error-content, #ffffff);
+    background: var(--color-error, #ef4444);
+}
 </style>
 
 <script type="text/javascript">
 var camera_id = {{ camera_id }};
+var asi676mc_repair_gallery_enabled = Boolean({{ asi676mc_repair_gallery_enabled }});
 var lightbox = null;
 var newest_entry_default = true;
 </script>
 {% endblock %}
 
 {% block content %}
-<div class="tw:container tw:h-full tw:mx-auto tw:flex tw:flex-col tw:gap-4">
+<div class="tw:container tw:mx-auto tw:flex tw:flex-col tw:gap-4">
 
-    <form id="form_viewer" onsubmit="return false;" class="tw:w-full tw:bg-base-200 tw:p-4 tw:rounded-[var(--radius-box)]">
+    <form id="form_viewer" onsubmit="return false;" class="tw:w-full tw:bg-base-200 tw:p-4 tw:rounded-[var(--radius-box)] sticky-desktop-header tw:shadow-md">
         {{ form_viewer.csrf_token }}
         <div class="tw:text-error tw:text-xs tw:font-semibold tw:mb-2" id="csrf_token-error" style="display: none;"></div>
 
@@ -85,6 +120,26 @@ var newest_entry_default = true;
                 <div class="tw:flex tw:items-center">
                     {{ form_viewer.FILTER_DETECTIONS(class='tw:toggle tw:toggle-primary tw:toggle-sm') }}
                     <div id="FILTER_DETECTIONS-error" class="tw:text-error tw:text-xs tw:ml-2" style="display: none;"></div>
+                </div>
+            </div>
+
+            <!-- These selectors cover only ASI676MC audit statuses. The
+                 excluded selector intentionally ignores manual exclusions. -->
+            <div id="asi676mc-gallery-filters" class="tw:flex tw:flex-wrap tw:items-center tw:justify-center tw:gap-4{% if not asi676mc_repair_gallery_enabled %} tw:hidden{% endif %}">
+                <div class="tw:flex tw:items-center tw:gap-2">
+                    {{ form_viewer.FILTER_ASI676MC_REPAIRED.label(class='tw:label-text tw:text-xs tw:font-semibold') }}
+                    {{ form_viewer.FILTER_ASI676MC_REPAIRED(class='tw:toggle tw:toggle-warning tw:toggle-sm') }}
+                    <div id="FILTER_ASI676MC_REPAIRED-error" class="tw:text-error tw:text-xs" style="display: none;"></div>
+                </div>
+                <div class="tw:flex tw:items-center tw:gap-2" title="Only frames excluded automatically by ASI676MC purple-frame handling">
+                    {{ form_viewer.FILTER_ASI676MC_EXCLUDED.label(class='tw:label-text tw:text-xs tw:font-semibold') }}
+                    {{ form_viewer.FILTER_ASI676MC_EXCLUDED(class='tw:toggle tw:toggle-warning tw:toggle-sm') }}
+                    <div id="FILTER_ASI676MC_EXCLUDED-error" class="tw:text-error tw:text-xs" style="display: none;"></div>
+                </div>
+                <div class="tw:flex tw:items-center tw:gap-2">
+                    {{ form_viewer.FILTER_ASI676MC_FAILED.label(class='tw:label-text tw:text-xs tw:font-semibold') }}
+                    {{ form_viewer.FILTER_ASI676MC_FAILED(class='tw:toggle tw:toggle-error tw:toggle-sm') }}
+                    <div id="FILTER_ASI676MC_FAILED-error" class="tw:text-error tw:text-xs" style="display: none;"></div>
                 </div>
             </div>
 
@@ -126,10 +181,12 @@ const field_names = [
 
 const checkbox_field_names = [
     'FILTER_DETECTIONS',
+    'FILTER_ASI676MC_REPAIRED',
+    'FILTER_ASI676MC_EXCLUDED',
+    'FILTER_ASI676MC_FAILED',
 ];
 
 var fields = {};
-// Populate fields object
 field_names.forEach(item => {
     fields[item] = {
         'input' : $('#' + item),
@@ -137,7 +194,6 @@ field_names.forEach(item => {
     };
 });
 
-// Checkboxes
 checkbox_field_names.forEach(item => {
     fields[item] = {
         'input' : $('#' + item),
@@ -149,6 +205,24 @@ fields['form_global'] = {
     'input' : failureMessage,
     'error' : failureMessage,
 };
+
+// Keep every calendar and filter request consistent without duplicating the
+// model-specific flags at each navigation level.
+function with_asi676mc_gallery_filters(json_data) {
+    json_data.FILTER_ASI676MC_REPAIRED = Boolean(
+        asi676mc_repair_gallery_enabled
+        && fields.FILTER_ASI676MC_REPAIRED.input.prop('checked')
+    );
+    json_data.FILTER_ASI676MC_EXCLUDED = Boolean(
+        asi676mc_repair_gallery_enabled
+        && fields.FILTER_ASI676MC_EXCLUDED.input.prop('checked')
+    );
+    json_data.FILTER_ASI676MC_FAILED = Boolean(
+        asi676mc_repair_gallery_enabled
+        && fields.FILTER_ASI676MC_FAILED.input.prop('checked')
+    );
+    return json_data;
+}
 
 
 function exclude_image(el, pswp, image_id, exclude) {
@@ -180,26 +254,70 @@ function exclude_image(el, pswp, image_id, exclude) {
 }
 
 
+function scrollToTop() {
+    const mainScroll = document.querySelector('main .tw\\:overflow-y-auto') || document.documentElement || window;
+    if (mainScroll && 'scrollTop' in mainScroll) {
+        mainScroll.scrollTop = 0;
+    }
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+}
+
+
 function populate_gallery(gallery_data) {
     if (lightbox) {
         lightbox.destroy();
         lightbox = null;
     }
 
+    scrollToTop();
 
     $('#allsky-gallery').empty();
 
     gallery_data.forEach(item => {
+        const repair_status = (
+            asi676mc_repair_gallery_enabled
+            ? item['asi676mc_repair_status']
+            : null
+        );
+        const repair_applied = repair_status === 'repaired';
+        const repair_validation_failed = repair_status === 'validation_failed';
+        const repair_excluded = repair_status === 'excluded';
+        var repair_title = '';
+        if (repair_applied) {
+            repair_title = 'Purple frame repaired';
+        } else if (repair_validation_failed) {
+            repair_title = 'Purple-frame repair failed; original frame retained and excluded from standard timelapses';
+        } else if (repair_excluded) {
+            repair_title = 'Purple frame detected; original frame retained and excluded from standard timelapses';
+        }
+
         var a_tag = $('<a />', {
             'href'        : item['url'],
             'data-pswp-width'  : item['width'],
             'data-pswp-height' : item['height'],
             'target'      : "_blank",
             'rel'         : "noopener noreferrer",
-            'class'       : "tw:no-underline",
+            'class'       : (
+                'tw:no-underline '
+                + (
+                    repair_applied
+                    ? 'asi676mc-repaired-thumbnail'
+                    : (
+                        repair_excluded
+                        ? 'asi676mc-excluded-thumbnail'
+                        : (
+                            repair_validation_failed
+                            ? 'asi676mc-validation-failed-thumbnail'
+                            : ''
+                        )
+                    )
+                )
+            ),
             'data-exclude' : item['exclude'],
             'data-image_id' : item['id'],
             'data-ts'     : item['ts'],
+            'data-asi676mc-repair-status' : repair_status || '',
+            'title'       : repair_title,
         });
         a_tag.appendTo($('#allsky-gallery'));
 
@@ -209,6 +327,21 @@ function populate_gallery(gallery_data) {
             'alt'       : item['date'],
         });
         img_tag.appendTo(a_tag);
+
+        if (repair_applied || repair_validation_failed || repair_excluded) {
+            $('<span />', {
+                'class' : (
+                    repair_validation_failed
+                    ? 'asi676mc-repair-badge validation-failed'
+                    : 'asi676mc-repair-badge'
+                ),
+                'text' : (
+                    repair_validation_failed
+                    ? 'Purple-frame repair failed'
+                    : (repair_excluded ? 'Purple frame excluded' : 'Purple frame repaired')
+                ),
+            }).appendTo(a_tag);
+        }
 
     });
 
@@ -462,6 +595,7 @@ function populate_gallery(gallery_data) {
 
 
 function hour_change(json_data) {
+    json_data = with_asi676mc_gallery_filters(json_data);
     $.ajax({
         type: "POST",
         url: "{{ url_for('indi_allsky.ajax_gallery_view') }}",
@@ -576,6 +710,7 @@ function syncCalendarFromSelects() {
 }
 
 function day_change(json_data, targetSelect) {
+    json_data = with_asi676mc_gallery_filters(json_data);
     $.ajax({
         type: "POST",
         url: "{{ url_for('indi_allsky.ajax_gallery_view') }}",
@@ -644,6 +779,7 @@ $("#DAY_SELECT").on("change", function() {
 
 
 function month_change(json_data, targetSelect) {
+    json_data = with_asi676mc_gallery_filters(json_data);
     $.ajax({
         type: "POST",
         url: "{{ url_for('indi_allsky.ajax_gallery_view') }}",
@@ -715,6 +851,7 @@ $("#MONTH_SELECT").on("change", function() {
 
 
 function year_change(json_data, targetSelect) {
+    json_data = with_asi676mc_gallery_filters(json_data);
     $.ajax({
         type: "POST",
         url: "{{ url_for('indi_allsky.ajax_gallery_view') }}",
@@ -790,7 +927,7 @@ $("#YEAR_SELECT").on("change", function() {
 });
 
 
-$("#FILTER_DETECTIONS").on("change", function() {
+$("#FILTER_DETECTIONS, #FILTER_ASI676MC_REPAIRED, #FILTER_ASI676MC_EXCLUDED, #FILTER_ASI676MC_FAILED").on("change", function() {
     // hide all errors
     successMessage.hide();
     Object.keys(fields).forEach((key) => {
@@ -803,6 +940,7 @@ $("#FILTER_DETECTIONS").on("change", function() {
         'CAMERA_ID'          : fields["CAMERA_ID"].input.val(),
         'FILTER_DETECTIONS'  : fields["FILTER_DETECTIONS"].input.prop("checked"),
     };
+    json_data = with_asi676mc_gallery_filters(json_data);
 
     $.ajax({
         type: "POST",
@@ -1076,6 +1214,7 @@ function previousDay() {
 
 
 function nextHour() {
+    scrollToTop();
     var hour_select_val = $("#HOUR_SELECT").val();
 
     newest_entry_default = false;
@@ -1095,6 +1234,7 @@ function nextHour() {
 
 
 function previousHour() {
+    scrollToTop();
     var hour_select_val = $("#HOUR_SELECT").val();
 
     newest_entry_default = true;
@@ -1116,6 +1256,9 @@ function previousHour() {
 $( document ).ready(function() {
     // Uncheck checkboxes
     $("#FILTER_DETECTIONS").prop('checked', false);
+    $("#FILTER_ASI676MC_REPAIRED, #FILTER_ASI676MC_EXCLUDED, #FILTER_ASI676MC_FAILED")
+        .prop('checked', false)
+        .prop('disabled', !asi676mc_repair_gallery_enabled);
 
     init();
 

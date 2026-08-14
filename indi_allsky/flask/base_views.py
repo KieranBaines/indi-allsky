@@ -14,6 +14,7 @@ from pprint import pformat  # noqa: F401
 import ephem
 
 from .. import constants
+from .. import asi676mc
 
 from flask import request
 from flask import session
@@ -26,7 +27,7 @@ from flask import current_app as app
 from flask_login import current_user
 
 from sqlalchemy.orm.exc import NoResultFound
-#from sqlalchemy.sql.expression import true as sa_true
+from sqlalchemy.sql.expression import true as sa_true
 from sqlalchemy.sql.expression import false as sa_false
 #from sqlalchemy.sql.expression import null as sa_null
 
@@ -133,6 +134,14 @@ class BaseView(View):
             return FakeCamera()
 
         return camera
+
+
+    def getCameraPrivacyLatLong(self, camera):
+        # reduce precision for privacy
+        if self.indi_allsky_config.get('PRIVACY_MODE'):
+            return float(round(camera.latitude)), float(round(camera.longitude))
+
+        return camera.latitude, camera.longitude
 
 
     def verify_admin_network(self):
@@ -974,35 +983,29 @@ class BaseView(View):
         mask_processor.image = mask_data
 
 
-        if self.indi_allsky_config.get('IMAGE_ROTATE'):
-            mask_processor.rotate_90()
-
-
         # rotation
-        if self.indi_allsky_config.get('IMAGE_ROTATE_ANGLE'):
-            mask_processor.rotate_angle()
+        mask_processor.rotate_90()
+        mask_processor.rotate_angle()
 
 
         # verticle flip
-        if self.indi_allsky_config.get('IMAGE_FLIP_V'):
-            mask_processor.flip_v()
+        mask_processor.flip_v()
 
 
         # horizontal flip
-        if self.indi_allsky_config.get('IMAGE_FLIP_H'):
-            mask_processor.flip_h()
+        mask_processor.flip_h()
 
 
         # crop
-        if self.indi_allsky_config.get('IMAGE_CROP_IMAGE_CIRCLE'):
-            mask_processor.crop_image()
-        elif self.indi_allsky_config.get('IMAGE_CROP_ROI'):
-            mask_processor.crop_image()
+        mask_processor.crop_image()
 
 
         # scale
-        if self.indi_allsky_config['IMAGE_SCALE'] and self.indi_allsky_config['IMAGE_SCALE'] != 100:
-            mask_processor.scale_image()
+        mask_processor.scale_image()
+
+
+        # add border
+        mask_processor.add_border()
 
 
         return mask_processor.image
@@ -1191,6 +1194,28 @@ class TemplateView(BaseView):
             'login_disabled'     : self.login_disabled,
             'docker'             : self.docker,
         }
+
+        # Expose the tool exactly where the server-side decorator will allow
+        # it: Config-save access, a current local camera, and the master switch.
+        config_save_allowed = bool(
+            self.login_disabled
+            or (
+                current_user.is_authenticated
+                and current_user.is_admin
+            )
+        )
+        supported_asi676mc = any(
+            asi676mc.camera_record_matches(camera)
+            for camera in IndiAllSkyDbCameraTable.query\
+                .filter(IndiAllSkyDbCameraTable.hidden == sa_false())\
+                .filter(IndiAllSkyDbCameraTable.local == sa_true())\
+                .all()
+        )
+        context['asi676mc_calibration_available'] = bool(
+            config_save_allowed
+            and supported_asi676mc
+            and asi676mc.feature_enabled(self.indi_allsky_config)
+        )
 
         # night set in get_astrometric_info()
         context['night'] = int(self.night)  # javascript does not play well with bools

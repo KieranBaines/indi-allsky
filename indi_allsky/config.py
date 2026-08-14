@@ -200,6 +200,7 @@ class IndiAllSkyConfigBase(object):
         "WEB_NONLOCAL_IMAGES"      : False,
         "WEB_LOCAL_IMAGES_ADMIN"   : False,
         "WEB_EXTRA_TEXT"           : "",
+        "WEBSOCKET_API_KEY"        : "",
         "WEB_STATUS_TEMPLATE"      : "Status: {status:s}\nLat: {latitude:+0.1f}/Long: {longitude:+0.1f}\nMode: {mode:s}\nNext change: {mode_next_change:s} [{mode_next_change_h:0.1f}h]\nSun: {sun_alt:0.1f}&deg; {sun_dir:s}\nMoon: {moon_alt:0.1f}&deg; {moon_dir:s}\nRise: {moon_next_rise:s} [{moon_next_rise_h:0.1f}h]\nSet: {moon_next_set:s} [{moon_next_set_h:0.1f}h]\nPhase: {moon_phase_str:s} <span data-bs-toggle=\"tooltip\" data-bs-placement=\"right\" title=\"{moon_phase:0.0f}%\">{moon_glyph:s}</span>\nSmoke: {smoke_rating:s} {smoke_rating_status}\nKp-index: {kpindex:0.2f} {kpindex_rating:s} {kpindex_trend:s}\nBt: {aurora_mag_bt:0.1f}nT/Bz: {aurora_mag_gsm_bz:+0.1f}/NH: {aurora_n_hemi_gw:d}GW\nAurora: {ovation_max:d}% {aurora_data_status:s}",
         "HEALTHCHECK" : {
             "DISK_USAGE"     : 90.0,
@@ -255,6 +256,34 @@ class IndiAllSkyConfigBase(object):
             "IMAGE_CIRCLE_MASK_DIAMETER" : 3000,
             "IMAGE_CIRCLE_MASK_BLUR"     : 35,
             "IMAGE_CIRCLE_MASK_OPACITY"  : 100,
+        },
+        # Opt-in, model-specific RAW correction. Runtime performs its own
+        # camera/layout checks even if this configuration block is enabled.
+        "IMAGE_ASI676MC_REPAIR" : {
+            "ENABLE"                      : False,
+            # Detection-only is the safe starting point. The settings page
+            # also selects this when the feature is enabled for the first
+            # time; a user must deliberately opt into pixel repair.
+            "EXCLUDE_ONLY"                : True,
+            "LOG_EVERY_FRAME"             : False,
+            "GALLERY_ENABLE"              : True,
+            "SAVE_DIAGNOSTIC_FITS"         : False,
+            # Opt-in because retaining the untouched previous FITS in RAM adds
+            # roughly one full camera frame per active camera.  The parent
+            # option remains the default low-memory bad/following workflow.
+            "SAVE_PRECEDING_FITS"          : False,
+            "PURPLE_RATIO_THRESHOLD"      : 1.5,
+            "RED_SIDE_RATIO_THRESHOLD"    : 1.15,
+            "BLUE_SIDE_RATIO_THRESHOLD"   : 1.75,
+            "SAMPLE_STEP"                 : 32,
+            "SOURCE_SATURATION_THRESHOLD" : 65000,
+            "GAIN_R"                      : 0.91004,
+            "GAIN_G1"                     : 1.68652,
+            "GAIN_G2"                     : 1.09238,
+            "GAIN_B"                      : 0.59537,
+            "HIGHLIGHT_BLEND_START_RATIO" : 0.55,
+            "HIGHLIGHT_BLEND_END_RATIO"   : 0.75,
+            "CHUNK_ROWS"                  : 128,
         },
         "IMAGE_CALIBRATE_DARK"          : True,
         "IMAGE_CALIBRATE_BPM"           : False,
@@ -557,6 +586,17 @@ class IndiAllSkyConfigBase(object):
             "TLS"                    : True,
             "CERT_BYPASS"            : True,
             "PUBLISH_IMAGE"          : True,
+        },
+        "ALLSKYMAP" : {
+            "ENABLE"                 : False,
+            "API_URL"                : "https://allsky-map.com",
+            "API_KEY"                : "",
+            "API_KEY_E"              : "",
+            "CAMERA_NAME"            : "",
+            "CAMERA_OWNER"           : "",
+            "WEBSITE_URL"            : "",
+            "UPLOAD_IMAGE"           : True,
+            "INTERVAL"               : 10,
         },
         "SYNCAPI" : {
             "ENABLE"                 : False,
@@ -1045,6 +1085,14 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
                 syncapi__apikey = config.get('SYNCAPI', {}).get('APIKEY', '')
 
 
+            allskymap__apikey_e = config.get('ALLSKYMAP', {}).get('API_KEY_E', '')
+            if allskymap__apikey_e:
+                # not catching InvalidToken
+                allskymap__apikey = f_key.decrypt(allskymap__apikey_e.encode()).decode()
+            else:
+                allskymap__apikey = config.get('ALLSKYMAP', {}).get('API_KEY', '')
+
+
             pycurl_camera__password_e = config.get('PYCURL_CAMERA', {}).get('PASSWORD_E', '')
             if pycurl_camera__password_e:
                 # not catching InvalidToken
@@ -1122,6 +1170,7 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
             s3upload__secret_key = config.get('S3UPLOAD', {}).get('SECRET_KEY', '')
             mqttpublish__password = config.get('MQTTPUBLISH', {}).get('PASSWORD', '')
             syncapi__apikey = config.get('SYNCAPI', {}).get('APIKEY', '')
+            allskymap__apikey = config.get('ALLSKYMAP', {}).get('API_KEY', '')
             pycurl_camera__password = config.get('PYCURL_CAMERA', {}).get('PASSWORD', '')
             temp_sensor__openweathermap_apikey = config.get('TEMP_SENSOR', {}).get('OPENWEATHERMAP_APIKEY', '')
             temp_sensor__wunderground_apikey = config.get('TEMP_SENSOR', {}).get('WUNDERGROUND_APIKEY', '')
@@ -1138,6 +1187,7 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
             'FILETRANSFER',
             'S3UPLOAD',
             'MQTTPUBLISH',
+            'ALLSKYMAP',
             'SYNCAPI',
             'PYCURL_CAMERA',
             'TEMP_SENSOR',
@@ -1160,6 +1210,8 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
         config['MQTTPUBLISH']['PASSWORD_E'] = ''
         config['SYNCAPI']['APIKEY'] = syncapi__apikey
         config['SYNCAPI']['APIKEY_E'] = ''
+        config['ALLSKYMAP']['API_KEY'] = allskymap__apikey
+        config['ALLSKYMAP']['API_KEY_E'] = ''
         config['PYCURL_CAMERA']['PASSWORD'] = pycurl_camera__password
         config['PYCURL_CAMERA']['PASSWORD_E'] = ''
         config['TEMP_SENSOR']['OPENWEATHERMAP_APIKEY'] = temp_sensor__openweathermap_apikey
@@ -1301,6 +1353,15 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
                 syncapi__apikey = ''
 
 
+            allskymap__apikey = str(config.get('ALLSKYMAP', {}).get('API_KEY', ''))
+            if allskymap__apikey:
+                allskymap__apikey_e = f_key.encrypt(allskymap__apikey.encode()).decode()
+                allskymap__apikey = ''
+            else:
+                allskymap__apikey_e = ''
+                allskymap__apikey = ''
+
+
             pycurl_camera__password = str(config.get('PYCURL_CAMERA', {}).get('PASSWORD', ''))
             if pycurl_camera__password:
                 pycurl_camera__password_e = f_key.encrypt(pycurl_camera__password.encode()).decode()
@@ -1393,6 +1454,8 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
             mqttpublish__password_e = ''
             syncapi__apikey = str(config.get('SYNCAPI', {}).get('APIKEY', ''))
             syncapi__apikey_e = ''
+            allskymap__apikey = str(config.get('ALLSKYMAP', {}).get('API_KEY', ''))
+            allskymap__apikey_e = ''
             pycurl_camera__password = str(config.get('PYCURL_CAMERA', {}).get('PASSWORD', ''))
             pycurl_camera__password_e = ''
             temp_sensor__openweathermap_apikey = str(config.get('TEMP_SENSOR', {}).get('OPENWEATHERMAP_APIKEY', ''))
@@ -1418,6 +1481,7 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
             'FILETRANSFER',
             'S3UPLOAD',
             'MQTTPUBLISH',
+            'ALLSKYMAP',
             'SYNCAPI',
             'PYCURL_CAMERA',
             'TEMP_SENSOR',
@@ -1440,6 +1504,8 @@ class IndiAllSkyConfig(IndiAllSkyConfigBase):
         config['MQTTPUBLISH']['PASSWORD_E'] = mqttpublish__password_e
         config['SYNCAPI']['APIKEY'] = syncapi__apikey
         config['SYNCAPI']['APIKEY_E'] = syncapi__apikey_e
+        config['ALLSKYMAP']['API_KEY'] = allskymap__apikey
+        config['ALLSKYMAP']['API_KEY_E'] = allskymap__apikey_e
         config['PYCURL_CAMERA']['PASSWORD'] = pycurl_camera__password
         config['PYCURL_CAMERA']['PASSWORD_E'] = pycurl_camera__password_e
         config['TEMP_SENSOR']['OPENWEATHERMAP_APIKEY'] = temp_sensor__openweathermap_apikey
