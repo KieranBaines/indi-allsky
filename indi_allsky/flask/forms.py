@@ -768,6 +768,28 @@ def DETECT_STARS_THOLD_validator(form, field):
         raise ValidationError('Threshold must be 1.0 or less')
 
 
+def DETECT_STARS_SEP_THOLD_validator(form, field):
+    if not isinstance(field.data, (int, float)):
+        raise ValidationError('Please enter valid number')
+
+    if field.data < 0.5:
+        raise ValidationError('Sigma must be 0.5 or greater')
+
+    if field.data > 50.0:
+        raise ValidationError('Sigma must be 50.0 or less')
+
+
+def DETECT_STARS_SEP_MAX_RADIUS_validator(form, field):
+    if not isinstance(field.data, int):
+        raise ValidationError('Please enter valid number')
+
+    if field.data < 1:
+        raise ValidationError('Max radius must be 1 or greater')
+
+    if field.data > 500:
+        raise ValidationError('Max radius must be 500 or less')
+
+
 def DETECT_METEORS_THOLD_validator(form, field):
     if not isinstance(field.data, int):
         raise ValidationError('Please enter valid number')
@@ -4556,6 +4578,11 @@ class IndiAllskyConfigForm(FlaskForm):
         ('GAIN_18X', '[4] - 18x'),
     )
 
+    DETECT_STARS_METHOD_choices = (
+        ('template', 'Template Match'),
+        ('sep', 'SEP (Source Extractor)'),
+    )
+
 
     ENCRYPT_PASSWORDS                = BooleanField('Encrypt Passwords')
     CAMERA_INTERFACE                 = SelectField('Camera Interface', choices=CAMERA_INTERFACE_choices, validators=[DataRequired(), CAMERA_INTERFACE_validator])
@@ -4651,6 +4678,9 @@ class IndiAllskyConfigForm(FlaskForm):
     ADU_FOV_DIV                      = SelectField('ADU FoV', choices=ADU_FOV_DIV_choices, validators=[ADU_FOV_DIV_validator])
     DETECT_STARS                     = BooleanField('Star Detection')
     DETECT_STARS_THOLD               = FloatField('Star Detection Threshold', validators=[DataRequired(), DETECT_STARS_THOLD_validator])
+    DETECT_STARS_METHOD              = SelectField('Star Detection Method', choices=DETECT_STARS_METHOD_choices, validators=[DataRequired()])
+    DETECT_STARS_SEP_THOLD           = FloatField('SEP Sigma Threshold', validators=[DataRequired(), DETECT_STARS_SEP_THOLD_validator], widget=NumberInput(step=0.5))
+    DETECT_STARS_SEP_MAX_RADIUS      = IntegerField('SEP Max Star Radius', validators=[DataRequired(), DETECT_STARS_SEP_MAX_RADIUS_validator])
     DETECT_METEORS                   = BooleanField('Meteor Detection')
     DETECT_METEORS_THOLD             = IntegerField('Meteor Detection Threshold', validators=[DataRequired(), DETECT_METEORS_THOLD_validator])
     DETECT_MASK                      = StringField('Detection Mask', validators=[DETECT_MASK_validator])
@@ -8681,6 +8711,7 @@ class IndiAllskyMiniVideoViewer(FlaskForm):
                 'id'                : v.id,
                 'url'               : str(url),
                 'success'           : v.success,
+                'source'            : data.get('source', 'standard'),
                 'thumbnail_url'     : str(thumbnail_url),
                 'dayDate_long'      : v.dayDate.strftime('%B %d, %Y'),
                 'dayDate'           : v.dayDate.strftime('%Y%m%d'),
@@ -9604,6 +9635,14 @@ class IndiAllskyImageProcessingForm(FlaskForm):
     IMAGE_FLIP_H                     = BooleanField('Flip Image Horizontally')
     IMAGE_COLORMAP                   = SelectField('Apply Colormap', choices=IMAGE_COLORMAP_choices, validators=[IMAGE_COLORMAP_validator])
     DETECT_MASK                      = StringField('Detection Mask', validators=[DETECT_MASK_validator])
+    DETECT_STARS_METHOD_choices = IndiAllskyConfigForm.DETECT_STARS_METHOD_choices
+
+    RUN_DETECTION                    = BooleanField('Run Detection')
+    DETECT_STARS_METHOD              = SelectField('Star Detection Method', choices=DETECT_STARS_METHOD_choices)
+    DETECT_STARS_THOLD               = FloatField('Star Detection Threshold', validators=[DETECT_STARS_THOLD_validator], widget=NumberInput(step=0.01))
+    DETECT_STARS_SEP_THOLD           = FloatField('Star Sigma Threshold', validators=[DETECT_STARS_SEP_THOLD_validator], widget=NumberInput(step=0.5))
+    DETECT_STARS_SEP_MAX_RADIUS      = IntegerField('SEP Max Star Radius', validators=[DETECT_STARS_SEP_MAX_RADIUS_validator])
+    DETECT_METEORS_THOLD             = IntegerField('Meteor Detection Threshold', validators=[DETECT_METEORS_THOLD_validator])
     SQM_ROI_X1                       = IntegerField('SQM ROI x1', validators=[SQM_ROI_validator])
     SQM_ROI_Y1                       = IntegerField('SQM ROI y1', validators=[SQM_ROI_validator])
     SQM_ROI_X2                       = IntegerField('SQM ROI x2', validators=[SQM_ROI_validator])
@@ -9737,12 +9776,14 @@ class IndiAllskyMiniTimelapseForm(FlaskForm):
         ('5', '5 FPS'),
         ('10', '10 FPS'),
         ('25', '25 FPS'),
+        ('30', '30 FPS'),
+        ('60', '60 FPS'),
     )
 
     CAMERA_ID                        = HiddenField('Camera ID', validators=[DataRequired()])
     IMAGE_ID                         = HiddenField('Image ID', validators=[DataRequired()])
-    PRE_SECONDS_SELECT               = SelectField('Pre-Selection Time', choices=SECONDS_choices, validators=[DataRequired()])
-    POST_SECONDS_SELECT              = SelectField('Post-Selection Time', choices=SECONDS_choices, validators=[DataRequired()])
+    PRE_SECONDS_SELECT               = SelectField('Before selected image', choices=SECONDS_choices, validators=[DataRequired()])
+    POST_SECONDS_SELECT              = SelectField('After selected image', choices=SECONDS_choices, validators=[DataRequired()])
     FRAMERATE_SELECT                 = SelectField('Speed', choices=FRAMERATE_SELECT_choices, validators=[DataRequired()])
     NOTE                             = StringField('Description', validators=[DataRequired()])
 

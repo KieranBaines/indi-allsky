@@ -140,6 +140,7 @@ class ImageProcessor(object):
         self._alpha_mask_dict = dict()  # index for every bin mode
 
         self._gamma_lut = None
+        self._gamma_lut_gamma = None
 
         self.focus_mode = self.config.get('FOCUS_MODE', False)
 
@@ -385,7 +386,13 @@ class ImageProcessor(object):
         self._adu_mask_dict = self._detection_mask_dict  # reuse detection mask for ADU mask (if defined)
 
         self._sqm = IndiAllskySqm(self.config, self.exposure_av, self.gain_av, self.binning_av, mask=self._detection_mask_dict)
-        self._stars_detect = IndiAllSkyStars(self.config, mask=self._detection_mask_dict)
+        if self.config.get('DETECT_STARS_METHOD', 'template') == 'sep':
+            # imported on demand: sep is unavailable on some legacy platforms
+            from .starsSep import IndiAllSkyStarsSEP
+            self._stars_detect = IndiAllSkyStarsSEP(self.config, mask=self._detection_mask_dict)
+        else:
+            self._stars_detect = IndiAllSkyStars(self.config, mask=self._detection_mask_dict)
+
         self._lineDetect = IndiAllskyDetectLines(self.config, mask=self._detection_mask_dict)
         self._draw = IndiAllSkyDraw(self.config, mask=self._detection_mask_dict)
 
@@ -2544,9 +2551,10 @@ class ImageProcessor(object):
 
 
     def _apply_gamma_correction(self, gamma):
-        if isinstance(self._gamma_lut, type(None)):
+        if self._gamma_lut is None or self._gamma_lut_gamma != gamma:
             range_array = numpy.arange(0, 256, dtype=numpy.float32)
             self._gamma_lut = (((range_array / 255) ** (1.0 / gamma)) * 255).astype(numpy.uint8)
+            self._gamma_lut_gamma = gamma
 
 
         self.image = self._gamma_lut.take(self.image, mode='raise')
@@ -2732,7 +2740,7 @@ class ImageProcessor(object):
         new_height = new_height - (new_height % 2)
         new_width = new_width - (new_width % 2)
 
-        logger.info('Scaling image by %d%%, new size: %d x %d', new_width, new_height)
+        logger.info('Scaling image by %d%%, new size: %d x %d', scale, new_width, new_height)
 
         self.image = cv2.resize(self.image, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
