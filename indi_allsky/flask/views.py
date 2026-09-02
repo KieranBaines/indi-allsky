@@ -2120,9 +2120,30 @@ class JsonChartView(JsonView):
         if self.indi_allsky_config['IMAGE_SCALE'] and self.indi_allsky_config['IMAGE_SCALE'] != 100:
             _img_processor.scale_image()
 
-        # match _load_detection_mask(): it applies add_border() as its final
-        # transform, so the image must too or mask/image sizes will not match.
-        _img_processor.add_border()
+        # _load_detection_mask() applies add_border() (IMAGE_BORDER) as its final
+        # transform. MaskProcessor.add_border() builds a monochrome (2D) canvas and
+        # cannot take a 3-channel colour image, so replicate the same border here
+        # directly on the colour image so mask/image sizes match.
+        import cv2 as _cv2_border
+        _border = self.indi_allsky_config.get('IMAGE_BORDER', {})
+        _b_top = int(_border.get('TOP', 0))
+        _b_left = int(_border.get('LEFT', 0))
+        _b_right = int(_border.get('RIGHT', 0))
+        _b_bottom = int(_border.get('BOTTOM', 0))
+        if _b_top or _b_left or _b_right or _b_bottom:
+            image_data = _cv2_border.copyMakeBorder(
+                _img_processor.image,
+                _b_top, _b_bottom, _b_left, _b_right,
+                _cv2_border.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
+            # match the mask path's even-dimension resize
+            _bh, _bw = image_data.shape[:2]
+            _bh_even = _bh - (_bh % 2)
+            _bw_even = _bw - (_bw % 2)
+            if (_bh_even, _bw_even) != (_bh, _bw):
+                image_data = _cv2_border.resize(image_data, (_bw_even, _bh_even), interpolation=_cv2_border.INTER_AREA)
+            _img_processor.image = image_data
 
         image_data = _img_processor.image
 
