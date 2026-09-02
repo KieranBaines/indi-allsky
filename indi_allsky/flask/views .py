@@ -1,0 +1,15005 @@
+import os
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+import io
+import tempfile
+import json
+from collections import OrderedDict
+from functools import wraps
+import time
+import math
+import base64
+from pathlib import Path
+import socket
+import ipaddress
+import re
+import threading
+import psutil
+import dbus
+import ephem
+from pprint import pformat  # noqa: F401
+
+from passlib.hash import argon2
+
+from ..version import __version__
+from .. import constants
+from .. import asi676mc
+from .. import asi676mc_calibration
+from ..processing import ImageProcessor
+from ..lens_solver import IndiAllSkyLensSolver
+from ..lens_solver import parseSolverRequestValues
+from ..lens_solver import applySolvedValuesToConfig
+from ..panorama import panoramaSourceCircleClipped
+from ..panorama import validatePanoramaMiniTimelapseRequest
+
+from cryptography.fernet import InvalidToken
+
+from flask import request
+from flask import abort
+from flask import session
+from flask import jsonify
+from flask import Blueprint
+from flask import redirect
+from flask import Response
+from flask import url_for
+from flask import send_from_directory
+from flask import send_file
+from flask import stream_with_context
+from flask import current_app as app
+
+from flask_login import login_required
+from flask_login import current_user
+
+from .misc import login_optional_media
+
+from . import db
+
+from .models import IndiAllSkyDbCameraTable
+from .models import IndiAllSkyDbImageTable
+from .models import IndiAllSkyDbVideoTable
+from .models import IndiAllSkyDbMiniVideoTable
+from .models import IndiAllSkyDbKeogramTable
+from .models import IndiAllSkyDbStarTrailsTable
+from .models import IndiAllSkyDbStarTrailsVideoTable
+from .models import IndiAllSkyDbDarkFrameTable
+from .models import IndiAllSkyDbBadPixelMapTable
+from .models import IndiAllSkyDbRawImageTable
+from .models import IndiAllSkyDbFitsImageTable
+from .models import IndiAllSkyDbPanoramaImageTable
+from .models import IndiAllSkyDbPanoramaVideoTable
+from .models import IndiAllSkyDbThumbnailTable
+from .models import IndiAllSkyDbTaskQueueTable
+from .models import IndiAllSkyDbNotificationTable
+from .models import IndiAllSkyDbUserTable
+from .models import IndiAllSkyDbConfigTable
+from .models import IndiAllSkyDbTleDataTable
+
+from .models import TaskQueueQueue
+from .models import TaskQueueState
+
+from sqlalchemy import func
+from sqlalchemy import literal_column
+#from sqlalchemy import extract
+from sqlalchemy import desc
+from sqlalchemy import cast
+from sqlalchemy import and_
+from sqlalchemy import or_
+#from sqlalchemy.types import DateTime
+from sqlalchemy.types import Integer
+from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql.expression import true as sa_true
+from sqlalchemy.sql.expression import false as sa_false
+from sqlalchemy.sql.expression import null as sa_null
+
+from .forms import IndiAllskyConfigForm
+from .forms import IndiAllskyImageViewer
+from .forms import IndiAllskyImageViewerPreload
+from .forms import IndiAllskyFitsImageViewer
+from .forms import IndiAllskyFitsImageViewerPreload
+from .forms import IndiAllskyGalleryViewer
+from .forms import IndiAllskyGalleryViewerPreload
+from .forms import IndiAllskyVideoViewer
+from .forms import IndiAllskyVideoViewerPreload
+from .forms import IndiAllskyMiniVideoViewer
+from .forms import IndiAllskyMiniVideoViewerPreload
+from .forms import IndiAllskySystemInfoForm
+from .forms import IndiAllskyLoopHistoryForm
+from .forms import IndiAllskyChartHistoryForm
+from .forms import IndiAllskySetDateTimeForm
+from .forms import IndiAllskySetTimezoneForm
+from .forms import IndiAllskyTimelapseGeneratorForm
+from .forms import IndiAllskyFocusForm
+from .forms import IndiAllskyUserInfoForm
+from .forms import IndiAllskyImageExcludeForm
+from .forms import IndiAllskyImageProcessingForm
+from .forms import IndiAllskyCameraSimulatorForm
+from .forms import IndiAllskyFocusControllerForm
+from .forms import IndiAllskyMiniTimelapseForm
+from .forms import IndiAllskyLongTermKeogramForm
+from .forms import IndiAllskyNetworkManagerForm
+from .forms import IndiAllskyDriveManagerForm
+from .forms import IndiAllskyImageCircleHelperForm
+from .forms import IndiAllskyVirtualSkyHelperForm
+from .forms import IndiAllskyConfigRestoreForm
+from .forms import IndiAllskyIndiServerChangeForm
+from .forms import IndiAllskyAsi676mcCalibrationForm
+
+from .base_views import BaseView
+from .base_views import TemplateView
+from .base_views import FormView
+from .base_views import JsonView
+
+from .youtube_views import YoutubeAuthorizeView
+from .youtube_views import YoutubeCallbackView
+from .youtube_views import YoutubeRefreshAuthView
+from .youtube_views import YoutubeRevokeAuthView
+
+from ..exceptions import ConfigSaveException
+from ..exceptions import NotFound
+
+
+bp_allsky = Blueprint(
+    'indi_allsky',
+    __name__,
+    template_folder='templates',
+    static_folder='static',
+    #url_prefix='/',  # wsgi
+    url_prefix='/indi-allsky',  # gunicorn
+    static_url_path='static',
+)
+
+
+def _visible_asi676mc_cameras():
+    """Return visible local records whose current identity is ASI676MC."""
+    visible_cameras = IndiAllSkyDbCameraTable.query\
+        .filter(IndiAllSkyDbCameraTable.hidden == sa_false())\
+        .filter(IndiAllSkyDbCameraTable.local == sa_true())\
+        .all()
+
+    return [
+        camera
+        for camera in visible_cameras
+        if asi676mc.camera_record_matches(camera)
+    ]
+
+
+def _can_save_standard_configuration():
+    """Mirror the standard Config save policy exactly."""
+    return bool(
+        app.config.get('LOGIN_DISABLED', False)
+        or (
+            current_user.is_authenticated
+            and current_user.is_admin
+        )
+    )
+
+
+def _asi676mc_feature_enabled():
+    """Read the current persisted master switch before opening the tool."""
+    from ..config import IndiAllSkyConfig
+
+    return asi676mc.feature_enabled(IndiAllSkyConfig().config)
+
+
+def _calibration_owner():
+    """Return a stable per-user or per-browser private session owner."""
+    if current_user.is_authenticated:
+        return 'user:{0}'.format(current_user.username)
+    owner_token = session.get('asi676mc_calibration_owner')
+    if not owner_token:
+        owner_token = os.urandom(16).hex()
+        session['asi676mc_calibration_owner'] = owner_token
+    return 'browser:{0}'.format(owner_token)
+
+
+def _calibration_save_actor():
+    """Return the Config audit name used with or without authentication."""
+    return current_user.username if current_user.is_authenticated else 'system'
+
+
+def _camera_identity(camera):
+    """Freeze the camera record identity bound to one calibration result."""
+    return {
+        'id': int(camera.id),
+        'uuid': str(camera.uuid),
+        'name': asi676mc.camera_record_identity_name(camera),
+    }
+
+
+def _supported_asi676mc_camera(camera_id):
+    """Resolve one selectable visible local ASI676MC by database ID."""
+    try:
+        camera_id = int(camera_id)
+    except (TypeError, ValueError):
+        return None
+    camera = IndiAllSkyDbCameraTable.query\
+        .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+        .filter(IndiAllSkyDbCameraTable.hidden == sa_false())\
+        .filter(IndiAllSkyDbCameraTable.local == sa_true())\
+        .first()
+    if camera is None or not asi676mc.camera_record_matches(camera):
+        return None
+    return camera
+
+
+def asi676mc_calibration_required(func):
+    """Require Config-save capability and a local supported camera."""
+    @wraps(func)
+    def decorated(*args, **kwargs):
+        """Enforce the complete calibration availability gate."""
+        if not _can_save_standard_configuration():
+            abort(403)
+        if not _asi676mc_feature_enabled():
+            abort(404)
+        if not _visible_asi676mc_cameras():
+            abort(404)
+        return func(*args, **kwargs)
+
+    return decorated
+
+
+class AjaxStatusUpdateView(BaseView):
+    methods = ['GET']
+
+    def dispatch_request(self):
+        camera_id = int(request.args['camera_id'])
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+        # query the latest image entry
+        camera_now_minus_15m = self.camera_now - timedelta(minutes=15)
+        self.latest_image_entry = db.session.query(
+            IndiAllSkyDbImageTable,
+        )\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .filter(IndiAllSkyDbImageTable.createDate > camera_now_minus_15m)\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .first()
+
+
+        status_data = dict()
+        status_data.update(self.get_indi_allsky_status())
+        status_data.update(self.get_camera_info())
+        status_data.update(self.get_astrometric_info())
+        status_data.update(self.get_smoke_info())
+        status_data.update(self.get_aurora_info())
+        status_data.update(self.get_image_data())
+
+
+        status_data['uptime'] = int(time.time() - psutil.boot_time())
+        status_data['uptime_str'] = self.getUptime()
+
+
+        data = {
+            'status_text' : self.get_status_text(status_data) + self.get_web_extra_text(),
+        }
+
+        return jsonify(data)
+
+
+class IndexCanvasView(TemplateView):
+    page_title = 'Latest'
+    latest_image_view = 'indi_allsky.js_latest_image_view'
+
+
+    def get_context(self):
+        context = super(IndexCanvasView, self).get_context()
+
+        context['latest_image_view'] = self.latest_image_view
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        return context
+
+
+class JsonLatestImageView(JsonView):
+    model = IndiAllSkyDbImageTable
+    latest_image_t = 'images/latest.{0}'
+
+
+    def __init__(self, **kwargs):
+        super(JsonLatestImageView, self).__init__(**kwargs)
+
+        self.history_seconds = 900
+
+
+    def get_objects(self):
+        camera_id = int(request.args['camera_id'])
+        history_seconds = int(request.args.get('limit_s', self.history_seconds))
+        night = bool(int(request.args.get('night', 1)))
+
+        # sanity check
+        if history_seconds > 86400:
+            history_seconds = 86400
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        no_image_message = 'No Image for 15 minutes'
+
+
+        if self.web_nonlocal_images:
+            no_image_message += '<br>(Non-local images enabled)'
+
+
+        data = {
+            'latest_image' : {
+                'url'     : None,
+                'message' : no_image_message,
+                'width'   : 1,
+                'height'  : 1,
+            },
+        }
+
+
+        if self.indi_allsky_config.get('FOCUS_MODE', False):
+            latest_image_uri = Path('images/latest.{0}'.format(self.indi_allsky_config.get('IMAGE_FILE_TYPE', 'jpg')))
+
+            image_dir = Path(self.indi_allsky_config['IMAGE_FOLDER']).absolute()
+            latest_image_p = image_dir.joinpath(latest_image_uri.name)
+
+            if latest_image_p.exists():
+                # use latest image if it exists
+                max_age = self.camera_now - timedelta(seconds=history_seconds)
+                if latest_image_p.stat().st_mtime > max_age.timestamp():
+
+                    data['latest_image']['url'] = '{0:s}?{1:d}'.format(str(latest_image_uri), int(datetime.timestamp(self.camera_now)))
+                    data['latest_image']['message'] = ''
+                    return data
+                else:
+                    return data
+            else:
+                return data
+
+
+        if self.capture_pause:
+            data['latest_image']['message'] = 'Capture paused'
+            return data
+
+
+        if not night:
+            ### day
+            if not self.local_indi_allsky and self.daytime_capture and not self.daytime_capture_save:
+                # remote cameras will not receive daytime images when save is disabled
+                if self.sun_set_date:
+                    utcnow = datetime.now(tz=timezone.utc)
+                    delta_sun_set = self.sun_set_date - utcnow.replace(tzinfo=None)
+                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Night starts in {0:0.1f} hours.</div>'.format(delta_sun_set.total_seconds() / 3600)
+                else:
+                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Sun never sets.</div>'
+
+                return data
+            elif not self.daytime_capture:
+                if self.sun_set_date:
+                    utcnow = datetime.now(tz=timezone.utc)
+                    delta_sun_set = self.sun_set_date - utcnow.replace(tzinfo=None)
+                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Night starts in {0:0.1f} hours.</div>'.format(delta_sun_set.total_seconds() / 3600)
+                else:
+                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Sun never sets.</div>'
+
+            elif self.daytime_capture and not self.daytime_capture_save:
+                if self.web_nonlocal_images:
+                    if not self.verify_admin_network():
+                        # only show locally hosted assets if coming from admin networks
+                        return data
+
+                # images are not stored in the DB in this condition
+                latest_image_uri = Path(self.latest_image_t.format(self.indi_allsky_config.get('IMAGE_FILE_TYPE', 'jpg')))
+
+                image_dir = Path(self.indi_allsky_config['IMAGE_FOLDER']).absolute()
+                latest_image_p = image_dir.joinpath(latest_image_uri.name)
+
+
+                if not latest_image_p.exists():
+                    return data
+
+
+                # use latest image if it exists
+                data['latest_image']['url'] = '{0:s}?{1:d}'.format(str(latest_image_uri), int(time.time()))
+
+                max_age = self.camera_now - timedelta(seconds=history_seconds)
+                if latest_image_p.stat().st_mtime > max_age.timestamp():
+                    data['latest_image']['message'] = ''
+                else:
+                    data['latest_image']['message'] = 'Image is out of date'
+
+                return data
+
+
+        # use database
+        latest_image_data = self.getLatestImage(camera_id, history_seconds)
+        if latest_image_data.get('url'):
+            data['latest_image']['url'] = latest_image_data['url']
+            data['latest_image']['width'] = latest_image_data['width']
+            data['latest_image']['height'] = latest_image_data['height']
+            data['latest_image']['message'] = ''
+
+
+        return data
+
+
+    def getLatestImage(self, camera_id, history_seconds):
+        camera_now_minus_seconds = self.camera_now - timedelta(seconds=history_seconds)
+
+        latest_image_q = self.model.query\
+            .join(self.model.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.createDate > camera_now_minus_seconds,
+                )
+            )
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+                # Do not serve local assets
+                latest_image_q = latest_image_q\
+                    .filter(
+                        or_(
+                            self.model.remote_url != sa_null(),
+                            self.model.s3_key != sa_null(),
+                        )
+                    )
+
+
+        latest_image = latest_image_q\
+            .order_by(self.model.createDate.desc())\
+            .first()
+
+
+        if not latest_image:
+            return {'url': None}
+
+
+        try:
+            url = latest_image.getUrl(s3_prefix=self.s3_prefix, local=local)
+        except ValueError as e:
+            app.logger.error('Error determining relative file name: %s', str(e))
+            return {'url': None}
+
+
+        image_data = {
+            'url' : str(url),
+            'width' : latest_image.width,
+            'height' : latest_image.height,
+        }
+
+        return image_data
+
+
+class IndexImgView(TemplateView):
+    page_title = 'Latest'
+    latest_image_view = 'indi_allsky.js_latest_image_view'
+
+
+    def get_context(self):
+        context = super(IndexImgView, self).get_context()
+
+        context['latest_image_view'] = self.latest_image_view
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        return context
+
+
+class VirtualSkyView(TemplateView):
+    page_title = 'VirtualSky'
+    image_loop_view = 'indi_allsky.js_image_loop_view'
+
+
+    def get_context(self):
+        context = super(VirtualSkyView, self).get_context()
+
+        context['image_loop_view'] = self.image_loop_view
+
+
+        timestamp = int(request.args.get('timestamp', 0))
+        context['timestamp'] = timestamp
+
+
+        data = {
+            'AZIMUTH_ANGLE'         : self.camera.az,
+            'IMAGE_CIRCLE_DIAMETER' : self.camera.data.get('vs_image_circle_diameter', 3500),
+            'LATITUDE_OFFSET'       : self.camera.data.get('vs_latitude_offset', 0.0),
+            'LONGITUDE_OFFSET'      : self.camera.data.get('vs_longitude_offset', 0.0),
+            'OFFSET_X'              : self.camera.data.get('vs_offset_x', 0.0),
+            'OFFSET_Y'              : self.camera.data.get('vs_offset_y', 0.0),
+            'MAGNITUDE'             : self.camera.data.get('vs_magnitude', 6.0),
+            'CONSTELLATIONS'        : self.camera.data.get('vs_constellations', True),
+            'CONSTELLATIONLABELS'   : self.camera.data.get('vs_constellationlabels', False),
+            'SHOWSTARS'             : self.camera.data.get('vs_showstars', True),
+            'SHOWSTARLABELS'        : self.camera.data.get('vs_showstarlabels', True),
+            'SHOWPLANETS'           : self.camera.data.get('vs_showplanets', True),
+            'SHOWPLANETLABELS'      : self.camera.data.get('vs_showplanetlabels', True),
+            #'FLIP_NS'               : self.camera.data.get('vs_flip_ns', False),
+            #'FLIP_EW'               : self.camera.data.get('vs_flip_ew', False),
+        }
+
+        context['form_virtualsky'] = IndiAllskyVirtualSkyHelperForm(data=data)
+
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+
+        ### Camera DB settings
+        context['camera_latitude'], context['camera_longitude'] = \
+            self.getCameraPrivacyLatLong(self.camera)
+
+
+        ### Calculate time offset
+        context['time_offset'] = self.camera.utc_offset - datetime.now().astimezone().utcoffset().total_seconds()
+
+
+        return context
+
+
+class RealtimeKeogramView(TemplateView):
+    page_title = 'Realtime Keogram'
+
+
+    def get_context(self):
+        context = super(RealtimeKeogramView, self).get_context()
+
+        context['keogram_uri'] = str(Path('images').joinpath('ccd_{0:s}'.format(self.camera.uuid), 'realtime_keogram.{0:s}'.format(self.indi_allsky_config.get('IMAGE_FILE_TYPE', 'jpg'))))
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        return context
+
+
+class LatestImageRedirect(BaseView):
+    model = IndiAllSkyDbImageTable
+
+
+    def dispatch_request(self):
+        camera_id = int(request.args.get('camera_id', 0))
+        night = request.args.get('night')  # can be None
+
+        if not camera_id:
+            camera = self.getLatestCamera()
+            camera_id = camera.id
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        local = True
+        if self.web_nonlocal_images:
+            local = False
+
+
+        image_entry = self.getLatestImage(camera_id, night=night)
+
+
+        image_url = image_entry.getUrl(s3_prefix=self.s3_prefix, local=local)
+
+
+        return redirect(image_url, code=302)
+
+
+    def getLatestImage(self, camera_id, night=None):
+        if isinstance(night, type(None)):
+            latest_image_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .order_by(self.model.createDate.desc())\
+                .first()
+        else:
+            # filter based on night
+            night_bool = bool(int(night))
+
+            latest_image_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .filter(self.model.night == night_bool)\
+                .order_by(self.model.createDate.desc())\
+                .first()
+
+
+        return latest_image_entry
+
+
+class LatestKeogramRedirect(LatestImageRedirect):
+    model = IndiAllSkyDbKeogramTable
+
+
+class LatestStartrailRedirect(LatestImageRedirect):
+    model = IndiAllSkyDbStarTrailsTable
+
+
+class LatestPanoramaImageRedirect(LatestImageRedirect):
+    model = IndiAllSkyDbPanoramaImageTable
+
+
+class LatestRawImageRedirect(LatestImageRedirect):
+    model = IndiAllSkyDbRawImageTable
+
+
+class LatestThumbnailRedirect(LatestImageRedirect):
+
+    def getLatestImage(self, camera_id):
+        latest_image_thumbnail_entry = db.session.query(
+            IndiAllSkyDbImageTable,
+            IndiAllSkyDbThumbnailTable,
+        )\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .join(IndiAllSkyDbThumbnailTable, IndiAllSkyDbImageTable.thumbnail_uuid == IndiAllSkyDbThumbnailTable.uuid)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .first()
+
+        _, latest_thumbnail_entry = latest_image_thumbnail_entry
+
+        return latest_thumbnail_entry
+
+
+class LatestTimelapseVideoRedirect(BaseView):
+    model = IndiAllSkyDbVideoTable
+
+    def dispatch_request(self):
+        camera_id = int(request.args.get('camera_id', 0))
+        night = request.args.get('night')  # can be None
+
+
+        if not camera_id:
+            camera = self.getLatestCamera()
+            camera_id = camera.id
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        local = True
+        if self.web_nonlocal_images:
+            local = False
+
+
+        video_entry = self.getLatestVideo(camera_id, night=night)
+
+
+        video_url = video_entry.getUrl(s3_prefix=self.s3_prefix, local=local)
+
+
+        return redirect(video_url, code=302)
+
+
+    def getLatestVideo(self, camera_id, night=None):
+        if isinstance(night, type(None)):
+            latest_video_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .order_by(self.model.dayDate.desc())\
+                .first()
+        else:
+            # filter based on night
+            night_bool = bool(int(night))
+
+            latest_video_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .filter(self.model.night == night_bool)\
+                .order_by(self.model.dayDate.desc())\
+                .first()
+
+        return latest_video_entry
+
+
+class LatestStartrailVideoRedirect(LatestTimelapseVideoRedirect):
+    model = IndiAllSkyDbStarTrailsVideoTable
+
+
+class LatestPanoramaVideoRedirect(LatestTimelapseVideoRedirect):
+    model = IndiAllSkyDbPanoramaVideoTable
+
+
+class LatestImageViewRedirect(BaseView):
+    model = IndiAllSkyDbImageTable
+    view_view = 'indi_allsky.timelapse_image_view'
+
+
+    def dispatch_request(self):
+        camera_id = int(request.args.get('camera_id', 0))
+        night = request.args.get('night')  # can be None
+
+
+        if not camera_id:
+            camera = self.getLatestCamera()
+            camera_id = camera.id
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        image_entry = self.getLatestImage(camera_id, night=night)
+
+
+        view_url = url_for(self.view_view, id=image_entry.id)
+
+
+        return redirect(view_url, code=302)
+
+
+    def getLatestImage(self, camera_id, night=None):
+        if isinstance(night, type(None)):
+            latest_image_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .order_by(self.model.createDate.desc())\
+                .first()
+        else:
+            # filter based on night
+            night_bool = bool(int(night))
+
+            latest_image_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .filter(self.model.night == night_bool)\
+                .order_by(self.model.createDate.desc())\
+                .first()
+
+
+        return latest_image_entry
+
+
+class LatestKeogramViewRedirect(LatestImageViewRedirect):
+    model = IndiAllSkyDbKeogramTable
+    view_view = 'indi_allsky.keogram_image_view'
+
+
+class LatestStartrailViewRedirect(LatestImageViewRedirect):
+    model = IndiAllSkyDbStarTrailsTable
+    view_view = 'indi_allsky.startrail_image_view'
+
+
+class LatestPanoramaImageViewRedirect(LatestImageViewRedirect):
+    model = IndiAllSkyDbPanoramaImageTable
+    view_view = 'indi_allsky.panorama_image_view'
+
+
+class LatestRawImageViewRedirect(LatestImageViewRedirect):
+    model = IndiAllSkyDbRawImageTable
+    view_view = 'indi_allsky.raw_image_view'
+
+
+class LatestTimelapseVideoWatchRedirect(BaseView):
+    model = IndiAllSkyDbVideoTable
+    watch_view = 'indi_allsky.timelapse_video_view'
+
+
+    def dispatch_request(self):
+        camera_id = int(request.args.get('camera_id', 0))
+        night = request.args.get('night')  # can be None
+
+
+        if not camera_id:
+            camera = self.getLatestCamera()
+            camera_id = camera.id
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        video_entry = self.getLatestVideo(camera_id, night=night)
+
+
+        view_url = url_for(self.watch_view, id=video_entry.id)
+
+
+        return redirect(view_url, code=302)
+
+
+    def getLatestVideo(self, camera_id, night=None):
+        if isinstance(night, type(None)):
+            latest_video_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .order_by(self.model.dayDate.desc())\
+                .first()
+        else:
+            # filter based on night
+            night_bool = bool(int(night))
+
+            latest_video_entry = self.model.query\
+                .join(self.model.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .filter(self.model.night == night_bool)\
+                .order_by(self.model.dayDate.desc())\
+                .first()
+
+
+        return latest_video_entry
+
+
+class LatestStartrailVideoWatchRedirect(LatestTimelapseVideoWatchRedirect):
+    model = IndiAllSkyDbStarTrailsVideoTable
+    watch_view = 'indi_allsky.startrail_video_view'
+
+
+class LatestPanoramaVideoWatchRedirect(LatestTimelapseVideoWatchRedirect):
+    model = IndiAllSkyDbPanoramaVideoTable
+    watch_view = 'indi_allsky.panorama_video_view'
+
+
+class LatestPanoramaCanvasView(IndexCanvasView):
+    page_title = 'Panorama'
+    latest_image_view = 'indi_allsky.js_latest_panorama_view'
+
+
+class LatestPanoramaImgView(IndexImgView):
+    page_title = 'Panorama'
+    latest_image_view = 'indi_allsky.js_latest_panorama_view'
+
+
+class JsonLatestPanoramaView(JsonLatestImageView):
+    model = IndiAllSkyDbPanoramaImageTable
+    latest_image_t = 'images/panorama.{0}'
+
+
+class LatestRawImageCanvasView(IndexCanvasView):
+    page_title = 'RAW Image'
+    latest_image_view = 'indi_allsky.js_latest_rawimage_view'
+
+
+class LatestRawImageImgView(IndexImgView):
+    page_title = 'RAW Image'
+    latest_image_view = 'indi_allsky.js_latest_rawimage_view'
+
+
+class JsonLatestRawImageView(JsonLatestImageView):
+    model = IndiAllSkyDbRawImageTable
+    latest_image_t = 'na'
+
+
+class PublicIndexView(BaseView):
+    # Legacy redirect
+    def dispatch_request(self):
+        return redirect(url_for('indi_allsky.index_view'))
+
+
+class MaskView(TemplateView):
+    page_title = 'Mask Base'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(MaskView, self).get_context()
+
+        mask_image_uri = Path('images/mask_base.png')
+
+        context['mask_image_uri'] = str(mask_image_uri)
+
+
+        image_dir = Path(self.indi_allsky_config['IMAGE_FOLDER']).absolute()
+        mask_image_p = image_dir.joinpath(mask_image_uri.name)
+
+        if mask_image_p.exists():
+            mask_mtime = mask_image_p.stat().st_mtime
+            mask_mtime_dt = datetime.fromtimestamp(mask_mtime)
+            context['mask_date'] = mask_mtime_dt.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            context['mask_date'] = ''
+
+
+        return context
+
+
+class CamerasView(TemplateView):
+    page_title = 'Cameras'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(CamerasView, self).get_context()
+
+        context['camera_list'] = IndiAllSkyDbCameraTable.query\
+            .all()
+
+        return context
+
+
+class DarkFramesView(TemplateView):
+    page_title = 'Dark Frames'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(DarkFramesView, self).get_context()
+
+        darkframe_list = IndiAllSkyDbDarkFrameTable.query\
+            .join(IndiAllSkyDbCameraTable)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .order_by(
+                IndiAllSkyDbCameraTable.id.desc(),
+                IndiAllSkyDbDarkFrameTable.gain.asc(),
+                IndiAllSkyDbDarkFrameTable.exposure.asc(),
+            )
+
+        bpm_list = IndiAllSkyDbBadPixelMapTable.query\
+            .join(IndiAllSkyDbCameraTable)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .order_by(
+                IndiAllSkyDbCameraTable.id.desc(),
+                IndiAllSkyDbBadPixelMapTable.gain.asc(),
+                IndiAllSkyDbBadPixelMapTable.exposure.asc(),
+            )
+
+
+        d_info_list = list()
+        for d in darkframe_list:
+            file_path = d.getFilesystemPath()
+
+            try:
+                file_size = file_path.stat().st_size
+            except FileNotFoundError:
+                file_size = 0
+
+            d_info = {
+                'id' : d.id,
+                'camera_name'  : d.camera.name,
+                'createDate'   : d.createDate,
+                'active'       : d.active,
+                'bitdepth'     : d.bitdepth,
+                'gain'         : d.gain,
+                'exposure'     : d.exposure,
+                'binmode'      : d.binmode,
+                'width'        : d.width,
+                'height'       : d.height,
+                'temp'         : d.temp,
+                'adu'          : d.adu,
+                'filename'     : d.filename,
+                'url'          : d.getUrl(),
+                'hot_pixels'   : d.data.get('hot_pixels', -1),
+                'method'       : d.data.get('method', ''),
+                'size_mb'      : file_size / 1024 / 1024,
+            }
+
+            d_info_list.append(d_info)
+
+
+        b_info_list = list()
+        for b in bpm_list:
+            file_path = d.getFilesystemPath()
+
+            try:
+                file_size = file_path.stat().st_size
+            except FileNotFoundError:
+                file_size = 0
+
+            b_info = {
+                'id' : b.id,
+                'camera_name'  : b.camera.name,
+                'createDate'   : b.createDate,
+                'active'       : b.active,
+                'bitdepth'     : b.bitdepth,
+                'gain'         : b.gain,
+                'exposure'     : b.exposure,
+                'binmode'      : b.binmode,
+                'width'        : d.width,
+                'height'       : d.height,
+                'temp'         : b.temp,
+                'adu'          : b.adu,
+                'filename'     : b.filename,
+                'url'          : b.getUrl(),
+                'hot_pixels'   : d.data.get('hot_pixels', -1),
+                'size_mb'      : file_size / 1024 / 1024,
+            }
+
+            b_info_list.append(b_info)
+
+
+        context['darkframe_list'] = d_info_list
+        context['bpm_list'] = b_info_list
+
+        return context
+
+
+class ImageLagView(TemplateView):
+    page_title = 'Image Lag'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(ImageLagView, self).get_context()
+
+        timestamp = int(request.args.get('timestamp', 0))
+        if not timestamp:
+            timestamp = int(datetime.timestamp(self.camera_now))
+
+
+        ts_dt = datetime.fromtimestamp(timestamp) + timedelta(seconds=self.camera_time_offset)
+        ts_dt_minus_3h = ts_dt - timedelta(hours=3)
+
+
+        if db.engine.dialect.name == 'mysql':
+            createDate_s = func.date_format('%s', IndiAllSkyDbImageTable.createDate)  # mysql
+        elif db.engine.dialect.name == 'postgresql':
+            createDate_s = func.to_char(IndiAllSkyDbImageTable.createDate, '%s')  # postgres
+        else:
+            # assume sqlite
+            createDate_s = func.strftime('%s', IndiAllSkyDbImageTable.createDate)  # sqlite
+
+
+        image_lag_q = IndiAllSkyDbImageTable.query\
+            .add_columns(
+                IndiAllSkyDbImageTable.id,
+                IndiAllSkyDbImageTable.createDate,
+                IndiAllSkyDbImageTable.exposure,
+                IndiAllSkyDbImageTable.exp_elapsed,
+                (IndiAllSkyDbImageTable.exp_elapsed - IndiAllSkyDbImageTable.exposure).label('delta'),
+                IndiAllSkyDbImageTable.process_elapsed,
+                (cast(createDate_s, Integer) - func.lag(createDate_s).over(order_by=IndiAllSkyDbImageTable.createDate)).label('lag_diff'),
+            )\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == self.camera.id,
+                    IndiAllSkyDbImageTable.createDate < ts_dt,
+                    IndiAllSkyDbImageTable.createDate > ts_dt_minus_3h,
+                )
+            )\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .limit(50)
+        # filter is just to make it faster
+
+
+        context['image_lag_q'] = image_lag_q
+
+        return context
+
+
+class RollingAduView(TemplateView):
+    page_title = 'Historical ADU'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(RollingAduView, self).get_context()
+
+
+        timestamp = int(request.args.get('timestamp', 0))
+        if not timestamp:
+            timestamp = int(datetime.timestamp(self.camera_now))
+
+
+        ts_dt = datetime.fromtimestamp(timestamp) + timedelta(seconds=self.camera_time_offset)
+        ts_dt_minus_7d = self.camera_now - timedelta(days=7)
+
+
+        if db.engine.dialect.name == 'mysql':
+            createDate_s = func.unix_timestamp(IndiAllSkyDbImageTable.createDate)  # mysql
+
+            # this should give us average exposure, adu in 15 minute sets, during the night
+            rolling_adu_q = IndiAllSkyDbImageTable.query\
+                .add_columns(
+                    func.floor(createDate_s / 900).label('interval'),
+                    IndiAllSkyDbImageTable.createDate.label('dt'),
+                    func.count(IndiAllSkyDbImageTable.id).label('i_count'),
+                    func.avg(IndiAllSkyDbImageTable.exposure).label('exposure_avg'),
+                    func.avg(IndiAllSkyDbImageTable.adu).label('adu_avg'),
+                    func.avg(IndiAllSkyDbImageTable.sqm).label('jsqm_avg'),
+                    func.avg(IndiAllSkyDbImageTable.stars).label('stars_avg'),
+                )\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbImageTable.createDate < ts_dt,
+                        IndiAllSkyDbImageTable.createDate > ts_dt_minus_7d,
+                        or_(
+                            IndiAllSkyDbImageTable.createDate_hour >= 22,  # night is normally between 10p and 4a, right?
+                            IndiAllSkyDbImageTable.createDate_hour <= 4,
+                        )
+                    )
+                )\
+                .group_by('interval')\
+                .order_by(desc('interval'))
+
+        elif db.engine.dialect.name == 'postgresql':
+            createDate_s = func.to_char(IndiAllSkyDbImageTable.createDate, '%s')  # postgres
+            # fixme
+        else:
+            # assume sqlite
+            createDate_s = cast(func.strftime('%s', IndiAllSkyDbImageTable.createDate), Integer)  # sqlite
+
+            # this should give us average exposure, adu in 15 minute sets, during the night
+            rolling_adu_q = IndiAllSkyDbImageTable.query\
+                .add_columns(
+                    IndiAllSkyDbImageTable.createDate.label('dt'),
+                    func.count(IndiAllSkyDbImageTable.id).label('i_count'),
+                    func.avg(IndiAllSkyDbImageTable.exposure).label('exposure_avg'),
+                    func.avg(IndiAllSkyDbImageTable.adu).label('adu_avg'),
+                    func.avg(IndiAllSkyDbImageTable.sqm).label('jsqm_avg'),
+                    func.avg(IndiAllSkyDbImageTable.stars).label('stars_avg'),
+                )\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbImageTable.createDate < ts_dt,
+                        IndiAllSkyDbImageTable.createDate > ts_dt_minus_7d,
+                        or_(
+                            IndiAllSkyDbImageTable.createDate_hour >= 22,  # night is normally between 10p and 4a, right?
+                            IndiAllSkyDbImageTable.createDate_hour <= 4,
+                        )
+                    )
+                )\
+                .group_by(cast(createDate_s / 900, Integer))\
+                .order_by(IndiAllSkyDbImageTable.createDate.desc())  # cast is slightly faster than floor
+
+
+        context['rolling_adu_q'] = rolling_adu_q
+
+        return context
+
+
+class SqmView(TemplateView):
+    page_title = 'SQM'
+
+    def get_context(self):
+        context = super(SqmView, self).get_context()
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        return context
+
+
+class ImageLoopCanvasView(TemplateView):
+    page_title = 'Loop'
+    image_loop_view = 'indi_allsky.js_image_loop_view'
+
+    def get_context(self):
+        context = super(ImageLoopCanvasView, self).get_context()
+
+        context['image_loop_view'] = self.image_loop_view
+
+        context['timestamp'] = int(request.args.get('timestamp', 0))
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        context['form_history'] = IndiAllskyLoopHistoryForm()
+
+        return context
+
+
+class JsonImageLoopView(JsonView):
+    model = IndiAllSkyDbImageTable
+    include_id = False
+
+    def __init__(self, **kwargs):
+        super(JsonImageLoopView, self).__init__(**kwargs)
+
+        self.history_seconds = 900
+        self.sqm_history_minutes = 30
+        self.stars_history_minutes = 30
+        self._limit = 1000  # sanity check
+
+
+    def get_objects(self):
+        requested_history_seconds = int(request.args.get('limit_s', self.history_seconds))
+        history_seconds = requested_history_seconds
+        self.limit = int(request.args.get('limit', self._limit))
+        timestamp = int(request.args.get('timestamp', 0))
+        camera_id = int(request.args['camera_id'])
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        if not timestamp:
+            timestamp = int(datetime.timestamp(self.camera_now))
+
+        ts_dt = datetime.fromtimestamp(timestamp + 3)  # allow some jitter
+
+        # sanity check, limit to 4 hours
+        if history_seconds > 14400:
+            history_seconds = 14400
+
+
+        jsqm_data, camera_sqm_mag_data, camera_sqm_adu_data, device_sqm_mag_data = self.getSqmData(camera_id, ts_dt)
+
+        data = {
+            'message'    : '',
+            'image_list' : self.getLoopImages(camera_id, ts_dt, history_seconds),
+            'jsqm_data'  : jsqm_data,
+            'stars_data' : self.getStarsData(camera_id, ts_dt),
+            'camera_sqm_mag_data' : camera_sqm_mag_data,
+            'camera_sqm_adu_data' : camera_sqm_adu_data,
+            'device_sqm_mag_data' : device_sqm_mag_data,
+        }
+
+        if len(data['image_list']) == 0:
+            data['message'] = 'No Timelapse Data'
+
+        if request.args.get('mini_preflight') == '1':
+            data['standard_preflight'] = self.getMiniTimelapsePreflight(
+                camera_id,
+                timestamp,
+                requested_history_seconds,
+            )
+
+        return data
+
+
+    def getMiniTimelapsePreflight(self, camera_id, timestamp, history_seconds):
+        history_seconds = max(1, min(history_seconds, 86400))
+        end_dt = datetime.fromtimestamp(timestamp)
+        start_dt = end_dt - timedelta(seconds=history_seconds)
+
+        image_entries = self.model.query\
+            .join(self.model.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.exclude == sa_false(),
+                    self.model.createDate >= start_dt,
+                    self.model.createDate <= end_dt,
+                )
+            )\
+            .order_by(self.model.createDate.asc(), self.model.id.asc())\
+            .yield_per(100)
+
+        frame_count = 0
+        start_reference = None
+        end_reference = None
+        for image_entry in image_entries:
+            try:
+                image_path = Path(image_entry.getFilesystemPath())
+                if not image_path.stat().st_size:
+                    continue
+            except (OSError, ValueError):
+                continue
+
+            frame_count += 1
+            frame_reference = {
+                'timestamp' : int(image_entry.createDate.timestamp()),
+                'datetime'  : image_entry.createDate.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            if start_reference is None:
+                start_reference = frame_reference
+            end_reference = frame_reference
+
+        return {
+            'frame_count'             : frame_count,
+            'has_enough_local_frames' : frame_count >= 2,
+            'start_reference'         : start_reference,
+            'end_reference'           : end_reference,
+        }
+
+
+    def getLoopImages(self, camera_id, loop_dt, history_seconds):
+        ts_minus_seconds = loop_dt - timedelta(seconds=history_seconds)
+
+        latest_images_q = self.model.query\
+            .join(self.model.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.exclude == sa_false(),
+                    self.model.createDate > ts_minus_seconds,
+                    self.model.createDate < loop_dt,
+                )
+            )
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+                # Do not serve local assets
+                latest_images_q = latest_images_q\
+                    .filter(
+                        or_(
+                            self.model.remote_url != sa_null(),
+                            self.model.s3_key != sa_null(),
+                        )
+                    )
+
+
+        latest_images = latest_images_q\
+            .order_by(self.model.createDate.desc())\
+            .limit(self.limit)
+
+
+        image_list = list()
+        for i in latest_images:
+            try:
+                url = i.getUrl(s3_prefix=self.s3_prefix, local=local)
+            except ValueError as e:
+                app.logger.error('Error determining relative file name: %s', str(e))
+                continue
+
+
+            data = {
+                'url'       : str(url),
+                'width'     : i.width,
+                'height'    : i.height,
+                'timestamp' : int(i.createDate.timestamp()),
+            }
+            if self.include_id:
+                data['id'] = i.id
+
+
+            try:
+                data['jsqm'] = i.sqm
+                data['stars'] = i.stars
+                data['detections'] = i.detections
+            except AttributeError:
+                # view is reused for panoramas
+                data['jsqm'] = 0
+                data['stars'] = 0
+                data['detections'] = 0
+
+
+            image_list.append(data)
+
+
+        return image_list
+
+
+    def getSqmData(self, camera_id, ts_dt):
+        ts_minus_minutes = ts_dt - timedelta(minutes=self.sqm_history_minutes)
+
+        sqm_images = self.model.query\
+            .join(IndiAllSkyDbCameraTable)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.exclude == sa_false(),
+                    self.model.createDate > ts_minus_minutes,
+                    self.model.createDate < ts_dt,
+                )
+            )\
+            .order_by(self.model.createDate.desc())
+
+
+        jsqm_list = list()
+        camera_sqm_mag_list = list()
+        camera_sqm_adu_list = list()
+        device_sqm_mag_list = list()
+        for i in sqm_images:
+            try:
+                jsqm = i.sqm
+            except AttributeError:
+                jsqm = 0
+
+
+            jsqm_list.append(jsqm)
+            camera_sqm_mag_list.append(i.data.get('sensor_user_8', 0.0))
+            camera_sqm_adu_list.append(i.data.get('sensor_user_9', 0.0))
+            device_sqm_mag_list.append(i.data.get('sensor_user_7', 0.0))
+
+
+        try:
+            jsqm_data = {
+                'max'  : max(jsqm_list),
+                'min'  : min(jsqm_list),
+                'avg'  : sum(jsqm_list) / len(jsqm_list),
+                'last' : jsqm_list[0],
+            }
+
+        except (ValueError, IndexError):
+            # list is probably empty
+            jsqm_data = {
+                'max' : 0.0,
+                'min' : 0.0,
+                'avg' : 0.0,
+                'last' : 0.0,
+            }
+
+
+        try:
+            camera_sqm_mag_data = {
+                'max'  : max(camera_sqm_mag_list),
+                'min'  : min(camera_sqm_mag_list),
+                'avg'  : sum(camera_sqm_mag_list) / len(camera_sqm_mag_list),
+                'last' : camera_sqm_mag_list[0],
+            }
+        except (ValueError, IndexError):
+            # list is probably empty
+            camera_sqm_mag_data = {
+                'max' : 0.0,
+                'min' : 0.0,
+                'avg' : 0.0,
+                'last' : 0.0,
+            }
+
+
+        try:
+            camera_sqm_adu_data = {
+                'max'  : max(camera_sqm_adu_list),
+                'min'  : min(camera_sqm_adu_list),
+                'avg'  : sum(camera_sqm_adu_list) / len(camera_sqm_adu_list),
+                'last' : camera_sqm_adu_list[0],
+            }
+        except (ValueError, IndexError):
+            # list is probably empty
+            camera_sqm_adu_data = {
+                'max' : 0.0,
+                'min' : 0.0,
+                'avg' : 0.0,
+                'last' : 0.0,
+            }
+
+
+        try:
+            device_sqm_mag_data = {
+                'max'  : max(device_sqm_mag_list),
+                'min'  : min(device_sqm_mag_list),
+                'avg'  : sum(device_sqm_mag_list) / len(device_sqm_mag_list),
+                'last' : device_sqm_mag_list[0],
+            }
+        except (ValueError, IndexError):
+            # list is probably empty
+            device_sqm_mag_data = {
+                'max' : 0.0,
+                'min' : 0.0,
+                'avg' : 0.0,
+                'last' : 0.0,
+            }
+
+
+        return jsqm_data, camera_sqm_mag_data, camera_sqm_adu_data, device_sqm_mag_data
+
+
+    def getStarsData(self, camera_id, ts_dt):
+        ts_minus_minutes = ts_dt - timedelta(minutes=self.stars_history_minutes)
+
+        stars_images = self.model.query\
+            .add_columns(
+                func.max(self.model.stars).label('image_max_stars'),
+                func.min(self.model.stars).label('image_min_stars'),
+                func.avg(self.model.stars).label('image_avg_stars'),
+            )\
+            .join(IndiAllSkyDbCameraTable)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.exclude == sa_false(),
+                    self.model.createDate > ts_minus_minutes,
+                    self.model.createDate < ts_dt,
+                )
+            )\
+            .first()
+
+
+        stars_data = {
+            'max' : stars_images.image_max_stars,
+            'min' : stars_images.image_min_stars,
+            'avg' : stars_images.image_avg_stars,
+        }
+
+        return stars_data
+
+
+class ImageLoopImgView(TemplateView):
+    page_title = 'Loop'
+    image_loop_view = 'indi_allsky.js_image_loop_view'
+
+    def get_context(self):
+        context = super(ImageLoopImgView, self).get_context()
+
+        context['image_loop_view'] = self.image_loop_view
+
+        context['timestamp'] = int(request.args.get('timestamp', 0))
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        context['form_history'] = IndiAllskyLoopHistoryForm()
+
+        return context
+
+
+class PanoramaLoopCanvasView(ImageLoopCanvasView):
+    page_title = 'Panorama Loop'
+    image_loop_view = 'indi_allsky.js_panorama_loop_view'
+
+
+class PanoramaLoopImgView(ImageLoopImgView):
+    page_title = 'Panorama Loop'
+    image_loop_view = 'indi_allsky.js_panorama_loop_view'
+
+
+class JsonPanoramaLoopView(JsonImageLoopView):
+    model = IndiAllSkyDbPanoramaImageTable
+    include_id = True
+
+
+    def get_objects(self):
+        data = super(JsonPanoramaLoopView, self).get_objects()
+
+        expected_width = int(request.args.get('source_width', 0))
+        expected_height = int(request.args.get('source_height', 0))
+        if not expected_width or not expected_height:
+            return data
+
+        requested_history_seconds = int(request.args.get('limit_s', self.history_seconds))
+        requested_history_seconds = max(1, min(requested_history_seconds, 86400))
+        timestamp = int(request.args.get('timestamp', 0))
+        camera_id = int(request.args['camera_id'])
+
+        if not timestamp:
+            timestamp = int(datetime.timestamp(self.camera_now))
+
+        # Preflight must match the exact range used by the video worker.
+        loop_dt = datetime.fromtimestamp(timestamp)
+        start_dt = loop_dt - timedelta(seconds=requested_history_seconds)
+
+        panorama_entries = self.model.query\
+            .join(self.model.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    self.model.exclude == sa_false(),
+                    self.model.createDate >= start_dt,
+                    self.model.createDate <= loop_dt,
+                )
+            )\
+            .order_by(self.model.createDate.asc(), self.model.id.asc())\
+            .yield_per(100)
+
+        local = not self.web_nonlocal_images or (
+            self.web_local_images_admin and self.verify_admin_network()
+        )
+
+        local_frame_count = 0
+        dimensions_match = True
+        start_reference_entry = None
+        end_reference_entry = None
+        preview_entry_ids = {entry['id'] for entry in data['image_list']}
+        available_preview_entry_ids = set()
+        for panorama_entry in panorama_entries:
+
+            dimension_mismatch = (
+                panorama_entry.width != expected_width
+                or panorama_entry.height != expected_height
+            )
+
+            try:
+                panorama_path = Path(panorama_entry.getFilesystemPath())
+                if not panorama_path.stat().st_size:
+                    continue
+
+                local_frame_count += 1
+                if dimension_mismatch:
+                    dimensions_match = False
+                    continue
+            except (OSError, ValueError):
+                continue
+
+            if panorama_entry.id in preview_entry_ids:
+                available_preview_entry_ids.add(panorama_entry.id)
+            if start_reference_entry is None:
+                start_reference_entry = panorama_entry
+            end_reference_entry = panorama_entry
+
+        data['image_list'] = [
+            entry for entry in data['image_list']
+            if entry['id'] in available_preview_entry_ids
+        ]
+
+        def get_reference(panorama_entry):
+            if panorama_entry is None:
+                return None
+            try:
+                panorama_url = panorama_entry.getUrl(
+                    s3_prefix=self.s3_prefix,
+                    local=local,
+                )
+            except (OSError, ValueError):
+                return None
+
+            return {
+                'id'        : panorama_entry.id,
+                'url'       : str(panorama_url),
+                'timestamp' : int(panorama_entry.createDate.timestamp()),
+                'datetime'  : panorama_entry.createDate.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+
+        data['panorama_preflight'] = {
+            'frame_count'             : local_frame_count,
+            'has_enough_local_frames' : local_frame_count >= 2,
+            'dimensions_match'        : dimensions_match,
+            'start_reference'         : get_reference(start_reference_entry),
+            'end_reference'           : get_reference(end_reference_entry),
+        }
+
+        return data
+
+
+    def getSqmData(self, *args):
+        sqm_data = {
+            'max'  : 0,
+            'min'  : 0,
+            'avg'  : 0,
+            'last' : 0,
+        }
+
+        # jsqm, camera, device
+        return sqm_data, sqm_data, sqm_data, sqm_data
+
+
+    def getStarsData(self, *args):
+        stars_data = {
+            'max' : 0,
+            'min' : 0,
+            'avg' : 0,
+        }
+
+        return stars_data
+
+
+class RawImageLoopCanvasView(ImageLoopCanvasView):
+    page_title = 'RAW Image Loop'
+    image_loop_view = 'indi_allsky.js_rawimage_loop_view'
+
+
+class RawImageLoopImgView(ImageLoopImgView):
+    page_title = 'RAW Image Loop'
+    image_loop_view = 'indi_allsky.js_rawimage_loop_view'
+
+
+class JsonRawImageLoopView(JsonImageLoopView):
+    model = IndiAllSkyDbRawImageTable
+
+
+    def getSqmData(self, *args):
+        sqm_data = {
+            'max'  : 0,
+            'min'  : 0,
+            'avg'  : 0,
+            'last' : 0,
+        }
+
+        # jsqm, camera, device
+        return sqm_data, sqm_data, sqm_data
+
+
+    def getStarsData(self, *args):
+        stars_data = {
+            'max' : 0,
+            'min' : 0,
+            'avg' : 0,
+        }
+
+        return stars_data
+
+
+class ChartView(TemplateView):
+    page_title = 'Charts'
+
+    def get_context(self):
+        context = super(ChartView, self).get_context()
+
+        context['timestamp'] = int(request.args.get('timestamp', 0))
+
+        refreshInterval_ms = math.ceil(self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0)) * 1000
+        context['refreshInterval'] = refreshInterval_ms + 1000  # additional time for exposures to download
+
+        context['form_history'] = IndiAllskyChartHistoryForm()
+
+
+        if self.camera.data:
+            camera_data = dict(self.camera.data)
+        else:
+            camera_data = dict()
+
+
+        custom_chart_1_key = camera_data.get('custom_chart_1_key', 'sensor_user_10')
+        custom_chart_2_key = camera_data.get('custom_chart_2_key', 'sensor_user_11')
+        custom_chart_3_key = camera_data.get('custom_chart_3_key', 'sensor_user_12')
+        custom_chart_4_key = camera_data.get('custom_chart_4_key', 'sensor_user_13')
+        custom_chart_5_key = camera_data.get('custom_chart_5_key', 'sensor_user_14')
+        custom_chart_6_key = camera_data.get('custom_chart_6_key', 'sensor_user_15')
+        custom_chart_7_key = camera_data.get('custom_chart_7_key', 'sensor_user_16')
+        custom_chart_8_key = camera_data.get('custom_chart_8_key', 'sensor_user_17')
+        custom_chart_9_key = camera_data.get('custom_chart_9_key', 'sensor_user_18')
+
+
+        context['label_custom_chart_1'] = camera_data.get(custom_chart_1_key, 'Unset')
+        context['min_custom_chart_1'] = camera_data.get('custom_chart_1_min', 0.0)
+        context['label_custom_chart_2'] = camera_data.get(custom_chart_2_key, 'Unset')
+        context['min_custom_chart_2'] = camera_data.get('custom_chart_2_min', 0.0)
+        context['label_custom_chart_3'] = camera_data.get(custom_chart_3_key, 'Unset')
+        context['min_custom_chart_3'] = camera_data.get('custom_chart_3_min', 0.0)
+        context['label_custom_chart_4'] = camera_data.get(custom_chart_4_key, 'Unset')
+        context['min_custom_chart_4'] = camera_data.get('custom_chart_4_min', 0.0)
+        context['label_custom_chart_5'] = camera_data.get(custom_chart_5_key, 'Unset')
+        context['min_custom_chart_5'] = camera_data.get('custom_chart_5_min', 0.0)
+        context['label_custom_chart_6'] = camera_data.get(custom_chart_6_key, 'Unset')
+        context['min_custom_chart_6'] = camera_data.get('custom_chart_6_min', 0.0)
+        context['label_custom_chart_7'] = camera_data.get(custom_chart_7_key, 'Unset')
+        context['min_custom_chart_7'] = camera_data.get('custom_chart_7_min', 0.0)
+        context['label_custom_chart_8'] = camera_data.get(custom_chart_8_key, 'Unset')
+        context['min_custom_chart_8'] = camera_data.get('custom_chart_8_min', 0.0)
+        context['label_custom_chart_9'] = camera_data.get(custom_chart_9_key, 'Unset')
+        context['min_custom_chart_9'] = camera_data.get('custom_chart_9_min', 0.0)
+
+
+        return context
+
+
+class JsonChartView(JsonView):
+    def __init__(self, **kwargs):
+        super(JsonChartView, self).__init__(**kwargs)
+
+        self.chart_history_seconds = 900
+
+
+    def get_objects(self):
+        camera_id = int(request.args['camera_id'])
+        history_seconds = int(request.args.get('limit_s', self.chart_history_seconds))
+        timestamp = int(request.args.get('timestamp', 0))
+
+        self.cameraSetup(camera_id=camera_id)
+
+        if not timestamp:
+            timestamp = int(datetime.timestamp(self.camera_now))
+
+        ts_dt = datetime.fromtimestamp(timestamp + 3)  # allow some jitter
+
+        # safety, limit history to 1 day
+        if history_seconds > 86400:
+            history_seconds = 86400
+
+        data = {
+            'chart_data' : self.getChartData(camera_id, ts_dt, history_seconds),
+            'message' : '',
+        }
+
+
+        if len(data['chart_data']['jsqm']) == 0:
+            data['message'] = 'No chart data in history range'
+
+
+        return data
+
+
+    def getChartData(self, camera_id, ts_dt, history_seconds):
+        import numpy
+
+        ts_minus_seconds = ts_dt - timedelta(seconds=history_seconds)
+
+        chart_query = IndiAllSkyDbImageTable.query\
+            .add_columns(
+                IndiAllSkyDbImageTable.createDate,
+                IndiAllSkyDbImageTable.sqm.label('jsqm'),
+                func.avg(IndiAllSkyDbImageTable.stars).over(order_by=IndiAllSkyDbImageTable.createDate, rows=(-5, 0)).label('stars_rolling'),
+                IndiAllSkyDbImageTable.temp,
+                IndiAllSkyDbImageTable.gain,
+                IndiAllSkyDbImageTable.exposure,
+                IndiAllSkyDbImageTable.detections,
+                #(IndiAllSkyDbImageTable.sqm - func.lag(IndiAllSkyDbImageTable.sqm).over(order_by=IndiAllSkyDbImageTable.createDate)).label('jsqm_diff'),
+                IndiAllSkyDbImageTable.data,
+            )\
+            .join(IndiAllSkyDbCameraTable)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    IndiAllSkyDbImageTable.createDate > ts_minus_seconds,
+                    IndiAllSkyDbImageTable.createDate < ts_dt,
+                )
+            )\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        #app.logger.info('Chart SQL: %s', str(chart_query))
+
+        chart_data = {
+            'jsqm'   : [],
+            'jsqm_d' : [],
+            'stars' : [],
+            'temp'  : [],
+            'gain'  : [],
+            'exp'   : [],
+            'detection' : [],
+            'custom_1'  : [],
+            'custom_2'  : [],
+            'custom_3'  : [],
+            'custom_4'  : [],
+            'custom_5'  : [],
+            'custom_6'  : [],
+            'custom_7'  : [],
+            'custom_8'  : [],
+            'custom_9'  : [],
+            'histogram' : {
+                'red'   : [],
+                'green' : [],
+                'blue'  : [],
+                'gray'  : [],
+            },
+        }
+
+
+        if self.camera.data:
+            camera_data = dict(self.camera.data)
+        else:
+            camera_data = dict()
+
+
+        custom_chart_1_key = camera_data.get('custom_chart_1_key', 'sensor_user_10')
+        custom_chart_2_key = camera_data.get('custom_chart_2_key', 'sensor_user_11')
+        custom_chart_3_key = camera_data.get('custom_chart_3_key', 'sensor_user_12')
+        custom_chart_4_key = camera_data.get('custom_chart_4_key', 'sensor_user_13')
+        custom_chart_5_key = camera_data.get('custom_chart_5_key', 'sensor_user_14')
+        custom_chart_6_key = camera_data.get('custom_chart_6_key', 'sensor_user_15')
+        custom_chart_7_key = camera_data.get('custom_chart_7_key', 'sensor_user_16')
+        custom_chart_8_key = camera_data.get('custom_chart_8_key', 'sensor_user_17')
+        custom_chart_9_key = camera_data.get('custom_chart_9_key', 'sensor_user_18')
+
+
+        for i in chart_query:
+            x = i.createDate.strftime('%H:%M:%S')
+
+            jsqm_data = {
+                'x' : x,
+                'y' : i.jsqm,
+            }
+            chart_data['jsqm'].append(jsqm_data)
+
+            star_data = {
+                'x' : x,
+                'y' : int(i.stars_rolling),
+            }
+            chart_data['stars'].append(star_data)
+
+
+            if self.indi_allsky_config.get('TEMP_DISPLAY') == 'f':
+                sensortemp = ((i.temp * 9.0) / 5.0) + 32
+            elif self.indi_allsky_config.get('TEMP_DISPLAY') == 'k':
+                sensortemp = i.temp + 273.15
+            else:
+                sensortemp = i.temp
+
+            temp_data = {
+                'x' : x,
+                'y' : sensortemp,
+            }
+            chart_data['temp'].append(temp_data)
+
+            exp_data = {
+                'x' : x,
+                'y' : i.exposure,
+            }
+            chart_data['exp'].append(exp_data)
+
+            gain_data = {
+                'x' : x,
+                'y' : i.gain,
+            }
+            chart_data['gain'].append(gain_data)
+
+            #jsqm_d_data = {
+            #    'x' : x,
+            #    'y' : i.jsqm_diff,
+            #}
+            #chart_data['jsqm_d'].append(jsqm_d_data)
+
+
+            if i.detections > 0:
+                detection = 1
+            else:
+                detection = 0
+
+            detection_data = {
+                'x' : x,
+                'y' : detection,
+            }
+            chart_data['detection'].append(detection_data)
+
+
+            # custom chart 1
+            try:
+                custom_1_y = i.data[custom_chart_1_key]
+            except KeyError:
+                custom_1_y = 0
+
+            custom_1_data = {
+                'x' : x,
+                'y' : custom_1_y,
+            }
+            chart_data['custom_1'].append(custom_1_data)
+
+
+            # custom chart 2
+            try:
+                custom_2_y = i.data[custom_chart_2_key]
+            except KeyError:
+                custom_2_y = 0
+
+            custom_2_data = {
+                'x' : x,
+                'y' : custom_2_y,
+            }
+            chart_data['custom_2'].append(custom_2_data)
+
+
+            # custom chart 3
+            try:
+                custom_3_y = i.data[custom_chart_3_key]
+            except KeyError:
+                custom_3_y = 0
+
+            custom_3_data = {
+                'x' : x,
+                'y' : custom_3_y,
+            }
+            chart_data['custom_3'].append(custom_3_data)
+
+
+            # custom chart 4
+            try:
+                custom_4_y = i.data[custom_chart_4_key]
+            except KeyError:
+                custom_4_y = 0
+
+            custom_4_data = {
+                'x' : x,
+                'y' : custom_4_y,
+            }
+            chart_data['custom_4'].append(custom_4_data)
+
+
+            # custom chart 5
+            try:
+                custom_5_y = i.data[custom_chart_5_key]
+            except KeyError:
+                custom_5_y = 0
+
+            custom_5_data = {
+                'x' : x,
+                'y' : custom_5_y,
+            }
+            chart_data['custom_5'].append(custom_5_data)
+
+
+            # custom chart 6
+            try:
+                custom_6_y = i.data[custom_chart_6_key]
+            except KeyError:
+                custom_6_y = 0
+
+            custom_6_data = {
+                'x' : x,
+                'y' : custom_6_y,
+            }
+            chart_data['custom_6'].append(custom_6_data)
+
+
+            # custom chart 7
+            try:
+                custom_7_y = i.data[custom_chart_7_key]
+            except KeyError:
+                custom_7_y = 0
+
+            custom_7_data = {
+                'x' : x,
+                'y' : custom_7_y,
+            }
+            chart_data['custom_7'].append(custom_7_data)
+
+
+            # custom chart 8
+            try:
+                custom_8_y = i.data[custom_chart_8_key]
+            except KeyError:
+                custom_8_y = 0
+
+            custom_8_data = {
+                'x' : x,
+                'y' : custom_8_y,
+            }
+            chart_data['custom_8'].append(custom_8_data)
+
+
+            # custom chart 9
+            try:
+                custom_9_y = i.data[custom_chart_9_key]
+            except KeyError:
+                custom_9_y = 0
+
+            custom_9_data = {
+                'x' : x,
+                'y' : custom_9_y,
+            }
+            chart_data['custom_9'].append(custom_9_data)
+
+
+        # build last image histogram
+        now_minus_seconds = ts_dt - timedelta(seconds=history_seconds)
+
+        latest_image = IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(
+                and_(
+                    IndiAllSkyDbCameraTable.id == camera_id,
+                    IndiAllSkyDbImageTable.createDate > now_minus_seconds,
+                    IndiAllSkyDbImageTable.createDate < ts_dt,
+                )
+            )\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .first()
+
+
+        if not latest_image:
+            return chart_data
+
+
+        latest_image_p = latest_image.getFilesystemPath()
+        if not latest_image_p.exists():
+            app.logger.error('Image does not exist: %s', latest_image_p)
+            return chart_data
+
+
+        #image_start = time.time()
+
+
+        if latest_image_p.suffix in ('.jpg', '.jpeg'):
+            import simplejpeg
+
+            try:
+                with io.open(str(latest_image_p), 'rb') as f_img:
+                    image_data = simplejpeg.decode_jpeg(f_img.read(), colorspace='BGR')
+            except ValueError:
+                app.logger.error('Unable to read %s', latest_image_p)
+                return chart_data
+
+        elif latest_image_p.suffix in ('.png', ):
+            import cv2
+
+            image_data = cv2.imread(str(latest_image_p), cv2.IMREAD_UNCHANGED)
+
+            if isinstance(image_data, type(None)):
+                app.logger.error('Unable to read %s', latest_image_p)
+                return chart_data
+
+        else:
+            # pillow supports remaining types
+            import cv2
+            import PIL
+            from PIL import Image
+
+            try:
+                with Image.open(str(latest_image_p)) as img_pil:
+                    image_data = cv2.cvtColor(numpy.array(img_pil), cv2.COLOR_RGB2BGR)
+            except PIL.UnidentifiedImageError:
+                app.logger.error('Unable to read %s', latest_image_p)
+                return chart_data
+
+
+            app.logger.warning('Unsupported image format')
+            return chart_data
+
+
+        #image_elapsed_s = time.time() - image_start
+        #app.logger.info('Image read in %0.4f s', image_elapsed_s)
+
+
+        # The detection mask is rotated/flipped/cropped/scaled in _load_detection_mask()
+        # to match post-processed images. The saved image read above is the raw, full-size
+        # frame, so apply the same transform chain here or the mask and image shapes will
+        # not match (numpy.ma.masked_array raises MaskError when IMAGE_CROP_ROI + DETECT_MASK
+        # are both set). Reuses MaskProcessor (plain numpy/cv2 ops, works on 3-channel BGR).
+        from ..maskProcessing import MaskProcessor
+
+        _img_processor = MaskProcessor(
+            self.indi_allsky_config,
+        )
+        _img_processor.binning = latest_image.binmode
+        _img_processor.image = image_data
+
+        if self.indi_allsky_config.get('IMAGE_ROTATE'):
+            _img_processor.rotate_90()
+
+        if self.indi_allsky_config.get('IMAGE_ROTATE_ANGLE'):
+            _img_processor.rotate_angle()
+
+        if self.indi_allsky_config.get('IMAGE_FLIP_V'):
+            _img_processor.flip_v()
+
+        if self.indi_allsky_config.get('IMAGE_FLIP_H'):
+            _img_processor.flip_h()
+
+        if self.indi_allsky_config.get('IMAGE_CROP_ROI'):
+            _img_processor.crop_image()
+
+        if self.indi_allsky_config['IMAGE_SCALE'] and self.indi_allsky_config['IMAGE_SCALE'] != 100:
+            _img_processor.scale_image()
+
+        image_data = _img_processor.image
+
+
+        image_height, image_width = image_data.shape[:2]
+        app.logger.info('Calculating histogram from RoI')
+
+        #mask = numpy.zeros(image_data.shape[:2], numpy.uint8)
+        numpy_mask = numpy.full(image_data.shape[:2], True, numpy.bool_)
+
+
+        _sqm_mask = self._load_detection_mask(latest_image.binmode)
+
+
+        if isinstance(_sqm_mask, type(None)):
+            sqm_roi = self.indi_allsky_config.get('SQM_ROI', [])
+
+            try:
+                x1 = int(sqm_roi[0] / latest_image.binmode)
+                y1 = int(sqm_roi[1] / latest_image.binmode)
+                x2 = int(sqm_roi[2] / latest_image.binmode)
+                y2 = int(sqm_roi[3] / latest_image.binmode)
+            except IndexError:
+                sqm_fov_div = self.indi_allsky_config.get('SQM_FOV_DIV', 4)
+                x1 = int((image_width / 2) - (image_width / sqm_fov_div))
+                y1 = int((image_height / 2) - (image_height / sqm_fov_div))
+                x2 = int((image_width / 2) + (image_width / sqm_fov_div))
+                y2 = int((image_height / 2) + (image_height / sqm_fov_div))
+
+
+            #mask[y1:y2, x1:x2] = 255
+            # True values will be masked
+            numpy_mask[y1:y2, x1:x2] = False
+        else:
+            # True values will be masked
+            numpy_mask = _sqm_mask == 0
+
+
+        if len(image_data.shape) == 2:
+            # mono
+            #h_numpy = cv2.calcHist([image_data], [0], mask, [256], [0, 256])
+            gray_ma = numpy.ma.masked_array(image_data, mask=numpy_mask)
+            h_numpy = numpy.histogram(gray_ma.compressed(), bins=256, range=(0, 256))
+
+            #for x, val in enumerate(h_numpy.tolist()):
+            for x, val in enumerate(h_numpy[0].tolist()):
+                h_data = {
+                    'x' : str(x),
+                    #'y' : val[0]
+                    'y' : val,
+                }
+                chart_data['histogram']['gray'].append(h_data)
+
+        else:
+            # color
+            color = ('blue', 'green', 'red')
+            for i, col in enumerate(color):
+                #h_numpy = cv2.calcHist([image_data], [i], mask, [256], [0, 256])
+                col_ma = numpy.ma.masked_array(image_data[:, :, i], mask=numpy_mask)
+                h_numpy = numpy.histogram(col_ma.compressed(), bins=256, range=(0, 256))
+
+                #for x, val in enumerate(h_numpy.tolist()):
+                for x, val in enumerate(h_numpy[0].tolist()):
+                    h_data = {
+                        'x' : str(x),
+                        #'y' : val[0]
+                        'y' : val,
+                    }
+                    chart_data['histogram'][col].append(h_data)
+
+
+        return chart_data
+
+
+class JsonSensorPanelView(JsonView):
+    def __init__(self, **kwargs):
+        super(JsonSensorPanelView, self).__init__(**kwargs)
+        self.history_seconds = 900
+
+    def get_objects(self):
+        camera_id = int(request.args['camera_id'])
+
+        # Setup camera context (needed for camera_now, db, etc.)
+        self.cameraSetup(camera_id=camera_id)
+
+        # Query latest image entry (same logic as TemplateView: last 15 min)
+        camera_now_minus_15m = self.camera_now - timedelta(minutes=15)
+        self.latest_image_entry = db.session.query(
+            IndiAllSkyDbImageTable,
+        )\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .filter(IndiAllSkyDbImageTable.createDate > camera_now_minus_15m)\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .first()
+
+        data = self.get_image_data()
+
+        # Pack values as arrays (index = slot number)
+        sensor_user = [data.get(f'sensor_user_{i}', 0.0) for i in range(60)]
+        sensor_temp = [data.get(f'sensor_temp_{i}', 0.0) for i in range(60)]
+
+        if self.latest_image_entry:
+            last_update = str(self.latest_image_entry.createDate)
+            last_update_age_s = int((self.camera_now - self.latest_image_entry.createDate).total_seconds())
+        else:
+            last_update = None
+            last_update_age_s = None
+
+        from ..sensors_mapping import format_named_sensors
+        named_sensors = format_named_sensors(sensor_temp, sensor_user, getattr(self, 'indi_allsky_config', {}))
+
+        payload = {
+            'last_update': last_update,
+            'last_update_age_s': last_update_age_s,
+            'sensor_user': sensor_user,
+            'sensor_temp': sensor_temp,
+            'sensors': named_sensors,
+        }
+
+        try:
+            from ..events import event_manager
+            event_manager.broadcast('sensor_update', payload)
+        except Exception:
+            pass
+
+        return payload
+
+
+class SensorPanelView(TemplateView):
+    page_title = 'Sensor Panel'
+
+    def get_context(self):
+        context = super(SensorPanelView, self).get_context()
+
+        # Use the latest image metadata as the "current" sensor values.
+        # This updates at your exposure cadence, which is typically good enough for a live panel.
+        image_data = self.get_image_data()
+
+        if self.camera.data:
+            camera_data = dict(self.camera.data)
+        else:
+            camera_data = dict()
+
+        show_all = int(request.args.get('all', 0))
+
+        # Build tables for user and temp sensor slots.
+        user_rows = []
+        temp_rows = []
+
+        for i in range(60):
+            key = f'sensor_user_{i}'
+            label = camera_data.get(key, key)
+            value = image_data.get(key, 0.0)
+
+            default_label = f'User Slot {i}'
+            if show_all or i < 10 or label != default_label or abs(value) > 0.0:
+                user_rows.append({
+                    'slot': key,
+                    'index': i,
+                    'label': label,
+                    'value': value,
+                })
+
+        for i in range(60):
+            key = f'sensor_temp_{i}'
+            label = camera_data.get(key, key)
+            value = image_data.get(key, 0.0)
+
+            # Default naming in capture.py uses "Future Use" for 1..9.
+            is_future_use = label.startswith('Future Use')
+
+            if show_all or i == 0 or (not is_future_use) or abs(value) > 0.0:
+                temp_rows.append({
+                    'slot': key,
+                    'index': i,
+                    'label': label,
+                    'value': value,
+                })
+
+        # Age of the "current" values
+        if self.latest_image_entry:
+            context['last_update'] = self.latest_image_entry.createDate
+            context['last_update_age_s'] = int((self.camera_now - self.latest_image_entry.createDate).total_seconds())
+        else:
+            context['last_update'] = None
+            context['last_update_age_s'] = None
+
+        context['show_all'] = bool(show_all)
+        context['refreshInterval'] = 5000  # ms
+        context['user_rows'] = user_rows
+        context['temp_rows'] = temp_rows
+
+        return context
+
+
+class ConfigView(FormView):
+    page_title = 'Config'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(ConfigView, self).get_context()
+
+        asi676mc_cameras = _visible_asi676mc_cameras()
+        asi676mc_repair_supported = bool(asi676mc_cameras)
+        asi676mc_repair_config = self.indi_allsky_config.get(
+            'IMAGE_ASI676MC_REPAIR',
+            {},
+        )
+        asi676mc_repair_defaults = asi676mc.DEFAULT_SETTINGS
+        context['asi676mc_repair_supported'] = asi676mc_repair_supported
+        context['asi676mc_repair_defaults'] = asi676mc_repair_defaults
+        context['asi676mc_camera_names'] = [
+            camera.friendlyName or camera.name
+            for camera in asi676mc_cameras
+        ]
+
+        context['camera_minGain'] = self.camera.minGain
+        context['camera_maxGain'] = self.camera.maxGain
+        context['camera_minBinning'] = self.camera.minBinning
+        context['camera_maxBinning'] = self.camera.maxBinning
+        context['camera_minExposure'] = self.camera.minExposure
+
+        if self.camera.maxExposure > 120:
+            context['camera_maxExposure'] = 120
+        else:
+            context['camera_maxExposure'] = self.camera.maxExposure
+
+
+        context['config_id'] = self.indi_allsky_config_id
+
+
+        ### a few checks to start
+        fits_enabled = self.indi_allsky_config.get('IMAGE_SAVE_FITS')
+        fits_save_period = self.indi_allsky_config.get('IMAGE_SAVE_FITS_PERIOD', 7200)
+
+        if fits_enabled and fits_save_period < 600:
+            # Only warn if saving more often than every 10 minutes
+            context['fits_enabled'] = fits_enabled
+
+
+        context['mark_detections_enabled'] = self.indi_allsky_config.get('DETECT_DRAW')
+
+
+        ### timezone validator
+        if not self.validate_longitude_timezone():
+            context['longitude_validation_message'] = '<div class="tw:alert tw:alert-warning tw:py-2.5 tw:text-xs tw:rounded-[var(--radius-box)] shadow-sm tw:my-2"><i class="tw:icon-[lucide--alert-triangle] tw:w-4 tw:h-4"></i><span>Warning: Longitude validation failed. Incorrect time, timezone, or longitude could cause this condition</span></div>'
+        else:
+            context['longitude_validation_message'] = ''
+
+
+        if self.latest_image_entry:
+            dh_level_default = self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_DEF', 0)
+            dh_level_low = self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_LOW', 33)
+            dh_level_med = self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_MED', 66)
+            dh_level_high = self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_HIGH', 100)
+
+            dh_thold_diff_low = self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_LOW', -15)
+            dh_thold_diff_med = self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_MED', -10)
+            dh_thold_diff_high = self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_HIGH', -5)
+
+
+            fan_level_default = self.indi_allsky_config.get('FAN', {}).get('LEVEL_DEF', 0)
+            fan_level_low = self.indi_allsky_config.get('FAN', {}).get('LEVEL_LOW', 33)
+            fan_level_med = self.indi_allsky_config.get('FAN', {}).get('LEVEL_MED', 66)
+            fan_level_high = self.indi_allsky_config.get('FAN', {}).get('LEVEL_HIGH', 100)
+
+            fan_thold_diff_low = self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_LOW', -10)
+            fan_thold_diff_med = self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_MED', -5)
+            fan_thold_diff_high = self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_HIGH', 0)
+
+
+            dh_temp_slot_var = self.indi_allsky_config.get('DEW_HEATER', {}).get('TEMP_USER_VAR_SLOT', 'sensor_user_10')
+            dh_dewpoint_slot_var = self.indi_allsky_config.get('DEW_HEATER', {}).get('DEWPOINT_USER_VAR_SLOT', 'sensor_user_2')
+
+            fan_temp_slot_var = self.indi_allsky_config.get('FAN', {}).get('TEMP_USER_VAR_SLOT', 'sensor_user_10')
+
+
+            raw_mag = self.latest_image_entry.data.get('camera_sqm_raw_mag', 0.0)
+            if raw_mag:
+                mag_offset = self.indi_allsky_config.get('CAMERA_SQM', {}).get('MAGNITUDE_OFFSET', 25.0)
+
+                context['camera_sqm_raw_mag_str'] = '{0:0.2f}'.format(raw_mag)
+                context['camera_sqm_calc_sqm_str'] = '{0:0.2f}'.format(mag_offset + raw_mag)  # raw_mag is negative
+            else:
+                context['camera_sqm_raw_mag_str'] = 'Not available'
+                context['camera_sqm_calc_sqm_str'] = 'Not available'
+
+
+            if self.latest_image_entry.data.get(dh_temp_slot_var):
+                dh_temp = self.latest_image_entry.data[dh_temp_slot_var]
+                context['dh_temp_str'] = '{0:0.1f}°'.format(dh_temp)
+            else:
+                dh_temp = None
+                context['dh_temp_str'] = 'Not available'
+
+            if self.latest_image_entry.data.get(dh_dewpoint_slot_var):
+                dh_dewpoint = self.latest_image_entry.data[dh_dewpoint_slot_var]
+                context['dh_dewpoint_str'] = '{0:0.1f}°'.format(dh_dewpoint)
+            else:
+                dh_dewpoint = None
+                context['dh_dewpoint_str'] = 'Not available'
+
+
+            dh_manual_target = self.indi_allsky_config.get('DEW_HEATER', {}).get('MANUAL_TARGET', 0.0)
+            if not dh_manual_target:
+                if not isinstance(dh_temp, type(None)) and not isinstance(dh_dewpoint, type(None)):
+                    dh_temp_delta = dh_temp - dh_dewpoint
+                    context['dh_temp_delta_str'] = 'Δ{0:+0.1f}°'.format(dh_temp_delta)
+
+                    dh_target_low = dh_dewpoint + dh_thold_diff_low
+                    dh_target_med = dh_dewpoint + dh_thold_diff_med
+                    dh_target_high = dh_dewpoint + dh_thold_diff_high
+                    context['dh_target_low_str'] = '{0:0.1f}°'.format(dh_target_low)
+                    context['dh_target_med_str'] = '{0:0.1f}°'.format(dh_target_med)
+                    context['dh_target_high_str'] = '{0:0.1f}°'.format(dh_target_high)
+
+
+                    if dh_temp_delta <= dh_thold_diff_high:
+                        # set dew heater to high
+                        context['dh_status_str'] = '{0:d}% (High)'.format(dh_level_high)
+                    elif dh_temp_delta <= dh_thold_diff_med:
+                        # set dew heater to medium
+                        context['dh_status_str'] = '{0:d}% (Medium)'.format(dh_level_med)
+                    elif dh_temp_delta <= dh_thold_diff_low:
+                        # set dew heater to low
+                        context['dh_status_str'] = '{0:d}% (Low)'.format(dh_level_low)
+                    else:
+                        context['dh_status_str'] = '{0:d}% (Default)'.format(dh_level_default)
+
+                else:
+                    context['dh_temp_delta_str'] = 'Not available'
+                    context['dh_target_low_str'] = 'n/a'
+                    context['dh_target_med_str'] = 'n/a'
+                    context['dh_target_high_str'] = 'n/a'
+                    context['dh_status_str'] = 'n/a'
+            else:
+                if not isinstance(dh_temp, type(None)):
+                    dh_temp_delta = dh_temp - dh_manual_target
+                    context['dh_temp_delta_str'] = 'Δ{0:+0.1f}° (manual target)'.format(dh_temp_delta)
+
+                    dh_target_low = dh_manual_target + dh_thold_diff_low
+                    dh_target_med = dh_manual_target + dh_thold_diff_med
+                    dh_target_high = dh_manual_target + dh_thold_diff_high
+                    context['dh_target_low_str'] = '{0:0.1f}°'.format(dh_target_low)
+                    context['dh_target_med_str'] = '{0:0.1f}°'.format(dh_target_med)
+                    context['dh_target_high_str'] = '{0:0.1f}°'.format(dh_target_high)
+
+                    if dh_temp_delta <= dh_thold_diff_high:
+                        # set dew heater to high
+                        context['dh_status_str'] = '{0:d}% (High)'.format(dh_level_high)
+                    elif dh_temp_delta <= dh_thold_diff_med:
+                        # set dew heater to medium
+                        context['dh_status_str'] = '{0:d}% (Medium)'.format(dh_level_med)
+                    elif dh_temp_delta <= dh_thold_diff_low:
+                        # set dew heater to low
+                        context['dh_status_str'] = '{0:d}% (Low)'.format(dh_level_low)
+                    else:
+                        context['dh_status_str'] = '{0:d}% (Default)'.format(dh_level_default)
+                else:
+                    context['dh_temp_delta_str'] = 'Not available'
+                    context['dh_target_low_str'] = 'n/a'
+                    context['dh_target_med_str'] = 'n/a'
+                    context['dh_target_high_str'] = 'n/a'
+                    context['dh_status_str'] = 'n/a'
+
+
+            if self.latest_image_entry.data.get(fan_temp_slot_var):
+                fan_temp = self.latest_image_entry.data[fan_temp_slot_var]
+                context['fan_temp_str'] = '{0:0.1f}°'.format(fan_temp)
+            else:
+                fan_temp = None
+                context['fan_temp_str'] = 'Not available'
+
+
+            fan_target = self.indi_allsky_config.get('FAN', {}).get('TARGET', 30.0)
+            if not isinstance(fan_temp, type(None)):
+                fan_temp_delta = fan_temp - fan_target
+                context['fan_temp_delta_str'] = 'Δ{0:+0.1f}°'.format(fan_temp_delta)
+
+                fan_target_low = fan_target + fan_thold_diff_low
+                fan_target_med = fan_target + fan_thold_diff_med
+                fan_target_high = fan_target + fan_thold_diff_high
+                context['fan_target_low_str'] = '{0:0.1f}°'.format(fan_target_low)
+                context['fan_target_med_str'] = '{0:0.1f}°'.format(fan_target_med)
+                context['fan_target_high_str'] = '{0:0.1f}°'.format(fan_target_high)
+
+
+                if fan_temp_delta > fan_thold_diff_high:
+                    # set fan to high
+                    context['fan_status_str'] = '{0:d}% (High)'.format(fan_level_high)
+                elif fan_temp_delta > fan_thold_diff_med:
+                    # set fan to medium
+                    context['fan_status_str'] = '{0:d}% (Medium)'.format(fan_level_med)
+                elif fan_temp_delta > fan_thold_diff_low:
+                    # set fan to low
+                    context['fan_status_str'] = '{0:d}% (Low)'.format(fan_level_low)
+                else:
+                    context['fan_status_str'] = '{0:d}% (Default)'.format(fan_level_default)
+
+            else:
+                context['fan_temp_delta_str'] = 'Not available'
+                context['fan_target_low_str'] = 'n/a'
+                context['fan_target_med_str'] = 'n/a'
+                context['fan_target_high_str'] = 'n/a'
+                context['fan_status_str'] = 'n/a'
+        else:
+            context['camera_sqm_raw_mag_str'] = 'Not available'
+            context['camera_sqm_calc_sqm_str'] = 'Not available'
+
+            context['dh_temp_str'] = 'Not available'
+            context['dh_dewpoint_str'] = 'Not available'
+            context['dh_temp_delta_str'] = 'Not available'
+            context['dh_target_low_str'] = 'n/a'
+            context['dh_target_med_str'] = 'n/a'
+            context['dh_target_high_str'] = 'n/a'
+            context['dh_status_str'] = 'n/a'
+
+            context['fan_temp_str'] = 'Not available'
+            context['fan_temp_delta_str'] = 'Not available'
+            context['fan_target_low_str'] = 'n/a'
+            context['fan_target_med_str'] = 'n/a'
+            context['fan_target_high_str'] = 'n/a'
+            context['fan_status_str'] = 'n/a'
+
+
+        form_data = {
+            'CAMERA_INTERFACE'               : self.indi_allsky_config.get('CAMERA_INTERFACE', 'indi'),
+            'INDI_SERVER'                    : self.indi_allsky_config.get('INDI_SERVER', 'localhost'),
+            'INDI_PORT'                      : self.indi_allsky_config.get('INDI_PORT', 7624),
+            'INDI_CAMERA_NAME'               : self.indi_allsky_config.get('INDI_CAMERA_NAME', ''),
+            'WEBSITE__TITLE'                 : self.indi_allsky_config.get('WEBSITE', {}).get('TITLE', 'indi-allsky'),
+            'OWNER'                          : self.indi_allsky_config.get('OWNER', ''),
+            'LENS_NAME'                      : self.indi_allsky_config.get('LENS_NAME', 'AllSky Lens'),
+            'LENS_FOCAL_LENGTH'              : self.indi_allsky_config.get('LENS_FOCAL_LENGTH', 2.5),
+            'LENS_FOCAL_RATIO'               : self.indi_allsky_config.get('LENS_FOCAL_RATIO', 2.0),
+            'LENS_IMAGE_CIRCLE'              : self.indi_allsky_config.get('LENS_IMAGE_CIRCLE', 3000),
+            'LENS_OFFSET_X'                  : self.indi_allsky_config.get('LENS_OFFSET_X', 0),
+            'LENS_OFFSET_Y'                  : self.indi_allsky_config.get('LENS_OFFSET_Y', 0),
+            'LENS_ALTITUDE'                  : self.indi_allsky_config.get('LENS_ALTITUDE', 90.0),
+            'LENS_AZIMUTH'                   : self.indi_allsky_config.get('LENS_AZIMUTH', 0.0),
+            'CCD_CONFIG__NIGHT__GAIN'        : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('NIGHT', {}).get('GAIN', 100.0), 3),  # limit to 3 decimals
+            'CCD_CONFIG__NIGHT__BINNING'     : self.indi_allsky_config.get('CCD_CONFIG', {}).get('NIGHT', {}).get('BINNING', 1),
+            'CCD_CONFIG__MOONMODE__GAIN'     : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('MOONMODE', {}).get('GAIN', 75.0), 3),  # limit to 3 decimals
+            'CCD_CONFIG__MOONMODE__BINNING'  : self.indi_allsky_config.get('CCD_CONFIG', {}).get('MOONMODE', {}).get('BINNING', 1),
+            'CCD_CONFIG__DAY__GAIN'          : round(self.indi_allsky_config.get('CCD_CONFIG', {}).get('DAY', {}).get('GAIN', 0.0), 3),  # limit to 3 decimals
+            'CCD_CONFIG__DAY__BINNING'       : self.indi_allsky_config.get('CCD_CONFIG', {}).get('DAY', {}).get('BINNING', 1),
+            'CCD_CONFIG__EXPOSURE_CLASSNAME' : self.indi_allsky_config.get('CCD_CONFIG', {}).get('EXPOSURE_CLASSNAME', 'exposure_basic'),
+            'CCD_CONFIG__AUTO_GAIN_LEVELS'   : str(self.indi_allsky_config.get('CCD_CONFIG', {}).get('AUTO_GAIN_LEVELS', 8)),  # string in form, int in config
+            'CCD_EXPOSURE_MAX'               : self.indi_allsky_config.get('CCD_EXPOSURE_MAX', 15.0),
+            'CCD_EXPOSURE_DEF'               : '{0:.6f}'.format(self.indi_allsky_config.get('CCD_EXPOSURE_DEF', 0.0)),  # force 6 digits of precision
+            'CCD_EXPOSURE_MIN'               : '{0:.6f}'.format(self.indi_allsky_config.get('CCD_EXPOSURE_MIN', 0.0)),
+            'CCD_EXPOSURE_MIN_DAY'           : '{0:.6f}'.format(self.indi_allsky_config.get('CCD_EXPOSURE_MIN_DAY', 0.0)),
+            'CCD_EXPOSURE_TIMEOUT'           : self.indi_allsky_config.get('CCD_EXPOSURE_TIMEOUT', 330),
+            'CCD_BIT_DEPTH'                  : str(self.indi_allsky_config.get('CCD_BIT_DEPTH', 0)),  # string in form, int in config
+            'EXPOSURE_PERIOD'                : self.indi_allsky_config.get('EXPOSURE_PERIOD', 15.0),
+            'EXPOSURE_PERIOD_DAY'            : self.indi_allsky_config.get('EXPOSURE_PERIOD_DAY', 15.0),
+            'CAMERA_SQM__ENABLE'             : self.indi_allsky_config.get('CAMERA_SQM', {}).get('ENABLE', False),
+            'CAMERA_SQM__ENABLE_DAY'         : self.indi_allsky_config.get('CAMERA_SQM', {}).get('ENABLE_DAY', False),
+            'CAMERA_SQM__EXPOSURE'           : self.indi_allsky_config.get('CAMERA_SQM', {}).get('EXPOSURE', 10.0),
+            'CAMERA_SQM__GAIN'               : round(self.indi_allsky_config.get('CAMERA_SQM', {}).get('GAIN', 10.0), 3),  # limit to 3 decimals
+            'CAMERA_SQM__BINNING'            : self.indi_allsky_config.get('CAMERA_SQM', {}).get('BINNING', 1),
+            'CAMERA_SQM__EXPOSURE_PERIOD'    : self.indi_allsky_config.get('CAMERA_SQM', {}).get('EXPOSURE_PERIOD', 900),
+            'CAMERA_SQM__MAGNITUDE_OFFSET'   : self.indi_allsky_config.get('CAMERA_SQM', {}).get('MAGNITUDE_OFFSET', 25.0),
+            'FOCUS_MODE'                     : self.indi_allsky_config.get('FOCUS_MODE', False),
+            'FOCUS_DELAY'                    : self.indi_allsky_config.get('FOCUS_DELAY', 4.0),
+            'CFA_PATTERN'                    : self.indi_allsky_config.get('CFA_PATTERN', ''),
+            'USE_NIGHT_COLOR'                : self.indi_allsky_config.get('USE_NIGHT_COLOR', True),
+            'SCNR_ALGORITHM'                 : self.indi_allsky_config.get('SCNR_ALGORITHM', ''),
+            'SCNR_ALGORITHM_DAY'             : self.indi_allsky_config.get('SCNR_ALGORITHM_DAY', ''),
+            'SCNR_MTF_MIDTONES'              : self.indi_allsky_config.get('SCNR_MTF_MIDTONES', 0.55),
+            'SCNR_MTF_MIDTONES_DAY'          : self.indi_allsky_config.get('SCNR_MTF_MIDTONES_DAY', 0.55),
+            'IMAGE_DENOISE'                  : self.indi_allsky_config.get('IMAGE_DENOISE', ''),
+            'IMAGE_DENOISE_DAY'              : self.indi_allsky_config.get('IMAGE_DENOISE_DAY', ''),
+            'IMAGE_DENOISE_STRENGTH'         : self.indi_allsky_config.get('IMAGE_DENOISE_STRENGTH', 3),
+            'IMAGE_DENOISE_STRENGTH_DAY'     : self.indi_allsky_config.get('IMAGE_DENOISE_STRENGTH_DAY', 3),
+            'BILATERAL_SIGMA_COLOR'          : self.indi_allsky_config.get('BILATERAL_SIGMA_COLOR', 20),
+            'BILATERAL_SIGMA_COLOR_DAY'      : self.indi_allsky_config.get('BILATERAL_SIGMA_COLOR_DAY', 20),
+            'BILATERAL_SIGMA_SPACE'          : self.indi_allsky_config.get('BILATERAL_SIGMA_SPACE', 35),
+            'BILATERAL_SIGMA_SPACE_DAY'      : self.indi_allsky_config.get('BILATERAL_SIGMA_SPACE_DAY', 35),
+            'WBR_FACTOR'                     : self.indi_allsky_config.get('WBR_FACTOR', 1.0),
+            'WBG_FACTOR'                     : self.indi_allsky_config.get('WBG_FACTOR', 1.0),
+            'WBB_FACTOR'                     : self.indi_allsky_config.get('WBB_FACTOR', 1.0),
+            'WBR_FACTOR_DAY'                 : self.indi_allsky_config.get('WBR_FACTOR_DAY', 1.0),
+            'WBG_FACTOR_DAY'                 : self.indi_allsky_config.get('WBG_FACTOR_DAY', 1.0),
+            'WBB_FACTOR_DAY'                 : self.indi_allsky_config.get('WBB_FACTOR_DAY', 1.0),
+            'AUTO_WB'                        : self.indi_allsky_config.get('AUTO_WB', False),
+            'AUTO_WB_DAY'                    : self.indi_allsky_config.get('AUTO_WB_DAY', False),
+            'WBR_MTF_MIDTONES'               : self.indi_allsky_config.get('WBR_MTF_MIDTONES', 0.5),
+            'WBG_MTF_MIDTONES'               : self.indi_allsky_config.get('WBG_MTF_MIDTONES', 0.5),
+            'WBB_MTF_MIDTONES'               : self.indi_allsky_config.get('WBB_MTF_MIDTONES', 0.5),
+            'WBR_MTF_MIDTONES_DAY'           : self.indi_allsky_config.get('WBR_MTF_MIDTONES_DAY', 0.5),
+            'WBG_MTF_MIDTONES_DAY'           : self.indi_allsky_config.get('WBG_MTF_MIDTONES_DAY', 0.5),
+            'WBB_MTF_MIDTONES_DAY'           : self.indi_allsky_config.get('WBB_MTF_MIDTONES_DAY', 0.5),
+            'SATURATION_FACTOR'              : self.indi_allsky_config.get('SATURATION_FACTOR', 1.0),
+            'SATURATION_FACTOR_DAY'          : self.indi_allsky_config.get('SATURATION_FACTOR_DAY', 1.0),
+            'GAMMA_CORRECTION'               : self.indi_allsky_config.get('GAMMA_CORRECTION', 1.0),
+            'GAMMA_CORRECTION_DAY'           : self.indi_allsky_config.get('GAMMA_CORRECTION_DAY', 1.0),
+            'SHARPEN_AMOUNT'                 : self.indi_allsky_config.get('SHARPEN_AMOUNT', 0.0),
+            'SHARPEN_AMOUNT_DAY'             : self.indi_allsky_config.get('SHARPEN_AMOUNT_DAY', 0.0),
+            'CCD_COOLING'                    : self.indi_allsky_config.get('CCD_COOLING', False),
+            'CCD_COOLING_DAY'                : self.indi_allsky_config.get('CCD_COOLING_DAY', False),
+            'CCD_TEMP'                       : self.indi_allsky_config.get('CCD_TEMP', 15.0),
+            'CCD_TEMP_DAY'                   : self.indi_allsky_config.get('CCD_TEMP_DAY', 35.0),
+            'TEMP_DISPLAY'                   : self.indi_allsky_config.get('TEMP_DISPLAY', 'c'),
+            'PRESSURE_DISPLAY'               : self.indi_allsky_config.get('PRESSURE_DISPLAY', 'hpa'),
+            'WINDSPEED_DISPLAY'              : self.indi_allsky_config.get('WINDSPEED_DISPLAY', 'ms'),
+            'CCD_TEMP_SCRIPT'                : self.indi_allsky_config.get('CCD_TEMP_SCRIPT', ''),
+            'GPS_ENABLE'                     : self.indi_allsky_config.get('GPS_ENABLE', False),
+            'TARGET_ADU'                     : self.indi_allsky_config.get('TARGET_ADU', 75),
+            'TARGET_ADU_DAY'                 : self.indi_allsky_config.get('TARGET_ADU_DAY', 75),
+            'TARGET_ADU_DEV'                 : self.indi_allsky_config.get('TARGET_ADU_DEV', 10),
+            'TARGET_ADU_DEV_DAY'             : self.indi_allsky_config.get('TARGET_ADU_DEV_DAY', 20),
+            'ADU_FOV_DIV'                    : str(self.indi_allsky_config.get('ADU_FOV_DIV', 4)),  # string in form, int in config
+            'SQM_FOV_DIV'                    : str(self.indi_allsky_config.get('SQM_FOV_DIV', 4)),  # string in form, int in config
+            'DETECT_STARS'                   : self.indi_allsky_config.get('DETECT_STARS', True),
+            'DETECT_STARS_THOLD'             : self.indi_allsky_config.get('DETECT_STARS_THOLD', 0.6),
+            'DETECT_STARS_METHOD'            : self.indi_allsky_config.get('DETECT_STARS_METHOD', 'template'),
+            'DETECT_STARS_SEP_THOLD'         : self.indi_allsky_config.get('DETECT_STARS_SEP_THOLD', 5.0),
+            'DETECT_STARS_SEP_MAX_RADIUS'    : self.indi_allsky_config.get('DETECT_STARS_SEP_MAX_RADIUS', 20),
+            'DETECT_METEORS'                 : self.indi_allsky_config.get('DETECT_METEORS', False),
+            'DETECT_METEORS_THOLD'           : self.indi_allsky_config.get('DETECT_METEORS_THOLD', 125),
+            'DETECT_MASK'                    : self.indi_allsky_config.get('DETECT_MASK', ''),
+            'DETECT_DRAW'                    : self.indi_allsky_config.get('DETECT_DRAW', False),
+            'LOGO_OVERLAY'                   : self.indi_allsky_config.get('LOGO_OVERLAY', ''),
+            'HEALTHCHECK__DISK_USAGE'        : self.indi_allsky_config.get('HEALTHCHECK', {}).get('DISK_USAGE', 90.0),
+            'HEALTHCHECK__SWAP_USAGE'        : self.indi_allsky_config.get('HEALTHCHECK', {}).get('SWAP_USAGE', 90.0),
+            'LOCATION_NAME'                  : self.indi_allsky_config.get('LOCATION_NAME', ''),
+            'LOCATION_LATITUDE'              : '{0:+0.3f}'.format(self.indi_allsky_config.get('LOCATION_LATITUDE', 0.0)),
+            'LOCATION_LONGITUDE'             : '{0:+0.3f}'.format(self.indi_allsky_config.get('LOCATION_LONGITUDE', 0.0)),
+            'LOCATION_ELEVATION'             : self.indi_allsky_config.get('LOCATION_ELEVATION', 0),
+            'TIMELAPSE_ENABLE'               : self.indi_allsky_config.get('TIMELAPSE_ENABLE', True),
+            'TIMELAPSE_SKIP_FRAMES'          : self.indi_allsky_config.get('TIMELAPSE_SKIP_FRAMES', 4),
+            'TIMELAPSE__PRE_PROCESSOR'       : self.indi_allsky_config.get('TIMELAPSE', {}).get('PRE_PROCESSOR', 'standard'),
+            'TIMELAPSE__PRE_PROCESSOR_DAY'   : self.indi_allsky_config.get('TIMELAPSE', {}).get('PRE_PROCESSOR_DAY', 'standard'),
+            'TIMELAPSE__IMAGE_CIRCLE'        : self.indi_allsky_config.get('TIMELAPSE', {}).get('IMAGE_CIRCLE', 2000),
+            'TIMELAPSE__KEOGRAM_RATIO'       : self.indi_allsky_config.get('TIMELAPSE', {}).get('KEOGRAM_RATIO', 0.15),
+            'TIMELAPSE__PRE_SCALE'           : self.indi_allsky_config.get('TIMELAPSE', {}).get('PRE_SCALE', 50),
+            'TIMELAPSE__FFMPEG_REPORT'       : self.indi_allsky_config.get('TIMELAPSE', {}).get('FFMPEG_REPORT', False),
+            'TIMELAPSE__USE_NIGHT_CONFIG'    : self.indi_allsky_config.get('TIMELAPSE', {}).get('USE_NIGHT_CONFIG', True),
+            'CAPTURE_PAUSE'                  : self.indi_allsky_config.get('CAPTURE_PAUSE', False),
+            'DAYTIME_CAPTURE'                : self.indi_allsky_config.get('DAYTIME_CAPTURE', True),
+            'DAYTIME_CAPTURE_SAVE'           : self.indi_allsky_config.get('DAYTIME_CAPTURE_SAVE', True),
+            'DAYTIME_TIMELAPSE'              : self.indi_allsky_config.get('DAYTIME_TIMELAPSE', True),
+            'DAYTIME_CONTRAST_ENHANCE'       : self.indi_allsky_config.get('DAYTIME_CONTRAST_ENHANCE', False),
+            'NIGHT_CONTRAST_ENHANCE'         : self.indi_allsky_config.get('NIGHT_CONTRAST_ENHANCE', False),
+            'CONTRAST_ENHANCE_16BIT'         : self.indi_allsky_config.get('CONTRAST_ENHANCE_16BIT', False),
+            'CLAHE_CLIPLIMIT'                : self.indi_allsky_config.get('CLAHE_CLIPLIMIT', 3.0),
+            'CLAHE_GRIDSIZE'                 : self.indi_allsky_config.get('CLAHE_GRIDSIZE', 8),
+            'NIGHT_SUN_ALT_DEG'              : '{0:+0.1f}'.format(self.indi_allsky_config.get('NIGHT_SUN_ALT_DEG', -6.0)),
+            'NIGHT_MOONMODE_ALT_DEG'         : '{0:+0.1f}'.format(self.indi_allsky_config.get('NIGHT_MOONMODE_ALT_DEG', 5.0)),
+            'NIGHT_MOONMODE_PHASE'           : self.indi_allsky_config.get('NIGHT_MOONMODE_PHASE', 50.0),
+            'WEB_STATUS_TEMPLATE'            : self.indi_allsky_config.get('WEB_STATUS_TEMPLATE', ''),
+            'WEB_EXTRA_TEXT'                 : self.indi_allsky_config.get('WEB_EXTRA_TEXT', ''),
+            'WEBSOCKET_API_KEY'              : self.indi_allsky_config.get('WEBSOCKET_API_KEY', ''),
+            'WEB_NONLOCAL_IMAGES'            : self.indi_allsky_config.get('WEB_NONLOCAL_IMAGES', False),
+            'WEB_LOCAL_IMAGES_ADMIN'         : self.indi_allsky_config.get('WEB_LOCAL_IMAGES_ADMIN', False),
+            'IMAGE_STRETCH__CLASSNAME'       : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('CLASSNAME', ''),
+            'IMAGE_STRETCH__MODE1_GAMMA'     : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE1_GAMMA', 3.0),
+            'IMAGE_STRETCH__MODE1_STDDEVS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE1_STDDEVS', 2.25),
+            'IMAGE_STRETCH__MODE2_SHADOWS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_SHADOWS', 0.0),
+            'IMAGE_STRETCH__MODE2_MIDTONES'  : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_MIDTONES', 0.35),
+            'IMAGE_STRETCH__MODE2_HIGHLIGHTS': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_HIGHLIGHTS', 1.0),
+            'IMAGE_STRETCH__MODE3_BLACK_CLIP': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_BLACK_CLIP', -2.8),
+            'IMAGE_STRETCH__MODE3_SHADOWS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_SHADOWS', 0.0),
+            'IMAGE_STRETCH__MODE3_MIDTONES'  : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_MIDTONES', 0.25),
+            'IMAGE_STRETCH__MODE3_HIGHLIGHTS': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_HIGHLIGHTS', 1.0),
+            'IMAGE_STRETCH__SPLIT'           : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('SPLIT', False),
+            'IMAGE_STRETCH__MOONMODE'        : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MOONMODE', False),
+            'IMAGE_STRETCH__DAYTIME'         : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('DAYTIME', False),
+            'KEOGRAM_ANGLE'                  : self.indi_allsky_config.get('KEOGRAM_ANGLE', 0.0),
+            'KEOGRAM_H_SCALE'                : self.indi_allsky_config.get('KEOGRAM_H_SCALE', 100),
+            'KEOGRAM_V_SCALE'                : self.indi_allsky_config.get('KEOGRAM_V_SCALE', 33),
+            'KEOGRAM_CROP_TOP'               : self.indi_allsky_config.get('KEOGRAM_CROP_TOP', 0),
+            'KEOGRAM_CROP_BOTTOM'            : self.indi_allsky_config.get('KEOGRAM_CROP_BOTTOM', 0),
+            'KEOGRAM_LABEL'                  : self.indi_allsky_config.get('KEOGRAM_LABEL', True),
+            'LONGTERM_KEOGRAM__ENABLE'       : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('ENABLE', True),
+            'LONGTERM_KEOGRAM__OFFSET_X'     : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('OFFSET_X', 0),
+            'LONGTERM_KEOGRAM__OFFSET_Y'     : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('OFFSET_Y', 0),
+            'LONGTERM_KEOGRAM__OPENCV_FONT_SCALE'    : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('OPENCV_FONT_SCALE', 0.8),
+            'LONGTERM_KEOGRAM__PIL_FONT_SIZE'        : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('PIL_FONT_SIZE', 30),
+            'LONGTERM_KEOGRAM__MONTH_LABEL_TEMPLATE' : self.indi_allsky_config.get('LONGTERM_KEOGRAM', {}).get('MONTH_LABEL_TEMPLATE', '{month:%B %Y}'),
+            'REALTIME_KEOGRAM__MAX_ENTRIES'  : self.indi_allsky_config.get('REALTIME_KEOGRAM', {}).get('MAX_ENTRIES', 1000),
+            'REALTIME_KEOGRAM__SAVE_INTERVAL': self.indi_allsky_config.get('REALTIME_KEOGRAM', {}).get('SAVE_INTERVAL', 25),
+            'REALTIME_KEOGRAM__LABEL'        : self.indi_allsky_config.get('REALTIME_KEOGRAM', {}).get('LABEL', False),
+            'STARTRAILS_SUN_ALT_THOLD'       : '{0:+0.1f}'.format(self.indi_allsky_config.get('STARTRAILS_SUN_ALT_THOLD', -15.0)),
+            'STARTRAILS_MOONMODE_THOLD'      : self.indi_allsky_config.get('STARTRAILS_MOONMODE_THOLD', True),
+            'STARTRAILS_MOON_ALT_THOLD'      : '{0:+0.1f}'.format(self.indi_allsky_config.get('STARTRAILS_MOON_ALT_THOLD', 91.0)),
+            'STARTRAILS_MOON_PHASE_THOLD'    : self.indi_allsky_config.get('STARTRAILS_MOON_PHASE_THOLD', 101.0),
+            'STARTRAILS_MAX_ADU'             : self.indi_allsky_config.get('STARTRAILS_MAX_ADU', 65),
+            'STARTRAILS_MASK_THOLD'          : self.indi_allsky_config.get('STARTRAILS_MASK_THOLD', 255),
+            'STARTRAILS_PIXEL_THOLD'         : self.indi_allsky_config.get('STARTRAILS_PIXEL_THOLD', 1.0),
+            'STARTRAILS_MIN_STARS'           : self.indi_allsky_config.get('STARTRAILS_MIN_STARS', 0),
+            'STARTRAILS_TIMELAPSE'           : self.indi_allsky_config.get('STARTRAILS_TIMELAPSE', True),
+            'STARTRAILS_TIMELAPSE_MINFRAMES' : self.indi_allsky_config.get('STARTRAILS_TIMELAPSE_MINFRAMES', 250),
+            'STARTRAILS_USE_DB_DATA'         : self.indi_allsky_config.get('STARTRAILS_USE_DB_DATA', True),
+            'STARTRAILS__IMAGE_CIRCLE_MASK_ENABLE'  : self.indi_allsky_config.get('STARTRAILS', {}).get('IMAGE_CIRCLE_MASK_ENABLE', False),
+            'STARTRAILS__IMAGE_CIRCLE_MASK_DIAMETER': self.indi_allsky_config.get('STARTRAILS', {}).get('IMAGE_CIRCLE_MASK_DIAMETER', 3000),
+            'STARTRAILS__IMAGE_CIRCLE_MASK_BLUR'    : self.indi_allsky_config.get('STARTRAILS', {}).get('IMAGE_CIRCLE_MASK_BLUR', 35),
+            'STARTRAILS__IMAGE_CIRCLE_MASK_OPACITY' : self.indi_allsky_config.get('STARTRAILS', {}).get('IMAGE_CIRCLE_MASK_OPACITY', 100),
+            'IMAGE_ASI676MC_REPAIR__ENABLE'                      : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('ENABLE', False) and asi676mc_repair_supported,
+            'IMAGE_ASI676MC_REPAIR__EXCLUDE_ONLY'                : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('EXCLUDE_ONLY', True),
+            'IMAGE_ASI676MC_REPAIR__LOG_EVERY_FRAME'             : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('LOG_EVERY_FRAME', False),
+            'IMAGE_ASI676MC_REPAIR__GALLERY_ENABLE'              : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('GALLERY_ENABLE', True),
+            'IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS'         : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('SAVE_DIAGNOSTIC_FITS', False),
+            'IMAGE_ASI676MC_REPAIR__SAVE_PRECEDING_FITS'          : self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('SAVE_PRECEDING_FITS', False),
+            'IMAGE_ASI676MC_REPAIR__PURPLE_RATIO_THRESHOLD'      : asi676mc_repair_config.get('PURPLE_RATIO_THRESHOLD', asi676mc_repair_defaults['PURPLE_RATIO_THRESHOLD']),
+            'IMAGE_ASI676MC_REPAIR__RED_SIDE_RATIO_THRESHOLD'    : asi676mc_repair_config.get('RED_SIDE_RATIO_THRESHOLD', asi676mc_repair_defaults['RED_SIDE_RATIO_THRESHOLD']),
+            'IMAGE_ASI676MC_REPAIR__BLUE_SIDE_RATIO_THRESHOLD'   : asi676mc_repair_config.get('BLUE_SIDE_RATIO_THRESHOLD', asi676mc_repair_defaults['BLUE_SIDE_RATIO_THRESHOLD']),
+            'IMAGE_ASI676MC_REPAIR__SAMPLE_STEP'                 : asi676mc_repair_config.get('SAMPLE_STEP', asi676mc_repair_defaults['SAMPLE_STEP']),
+            'IMAGE_ASI676MC_REPAIR__SOURCE_SATURATION_THRESHOLD' : asi676mc_repair_config.get('SOURCE_SATURATION_THRESHOLD', asi676mc_repair_defaults['SOURCE_SATURATION_THRESHOLD']),
+            'IMAGE_ASI676MC_REPAIR__GAIN_R'                      : asi676mc_repair_config.get('GAIN_R', asi676mc_repair_defaults['GAIN_R']),
+            'IMAGE_ASI676MC_REPAIR__GAIN_G1'                     : asi676mc_repair_config.get('GAIN_G1', asi676mc_repair_defaults['GAIN_G1']),
+            'IMAGE_ASI676MC_REPAIR__GAIN_G2'                     : asi676mc_repair_config.get('GAIN_G2', asi676mc_repair_defaults['GAIN_G2']),
+            'IMAGE_ASI676MC_REPAIR__GAIN_B'                      : asi676mc_repair_config.get('GAIN_B', asi676mc_repair_defaults['GAIN_B']),
+            'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_START_RATIO' : asi676mc_repair_config.get('HIGHLIGHT_BLEND_START_RATIO', asi676mc_repair_defaults['HIGHLIGHT_BLEND_START_RATIO']),
+            'IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_END_RATIO'   : asi676mc_repair_config.get('HIGHLIGHT_BLEND_END_RATIO', asi676mc_repair_defaults['HIGHLIGHT_BLEND_END_RATIO']),
+            'IMAGE_ASI676MC_REPAIR__CHUNK_ROWS'                  : asi676mc_repair_config.get('CHUNK_ROWS', asi676mc_repair_defaults['CHUNK_ROWS']),
+            'IMAGE_CALIBRATE_DARK'           : self.indi_allsky_config.get('IMAGE_CALIBRATE_DARK', True),
+            'IMAGE_CALIBRATE_BPM'            : self.indi_allsky_config.get('IMAGE_CALIBRATE_BPM', False),
+            'IMAGE_CALIBRATE_FIX_HOLES'      : self.indi_allsky_config.get('IMAGE_CALIBRATE_FIX_HOLES', False),
+            'IMAGE_CALIBRATE_HOLE_THOLD'     : self.indi_allsky_config.get('IMAGE_CALIBRATE_HOLE_THOLD', 30),
+            'IMAGE_CALIBRATE_MANUAL_OFFSET'  : self.indi_allsky_config.get('IMAGE_CALIBRATE_MANUAL_OFFSET', 0),
+            'IMAGE_SAVE_FITS_PRE_DARK'       : self.indi_allsky_config.get('IMAGE_SAVE_FITS_PRE_DARK', False),
+            'PRIVACY_MODE'                   : self.indi_allsky_config.get('PRIVACY_MODE', False),
+            'IMAGE_EXIF_PRIVACY'             : self.indi_allsky_config.get('IMAGE_EXIF_PRIVACY', False),
+            'IMAGE_FILE_TYPE'                : self.indi_allsky_config.get('IMAGE_FILE_TYPE', 'jpg'),
+            'IMAGE_FILE_COMPRESSION__JPG'    : self.indi_allsky_config.get('IMAGE_FILE_COMPRESSION', {}).get('jpg', 90),
+            'IMAGE_FILE_COMPRESSION__PNG'    : self.indi_allsky_config.get('IMAGE_FILE_COMPRESSION', {}).get('png', 5),
+            'IMAGE_FILE_COMPRESSION__TIF'    : 'LZW',
+            'IMAGE_FOLDER'                   : self.indi_allsky_config.get('IMAGE_FOLDER', '/var/www/html/allsky/images'),
+            'VARLIB_FOLDER'                  : self.indi_allsky_config.get('VARLIB_FOLDER', '/var/lib/indi-allsky'),
+            'IMAGE_LABEL_TEMPLATE'           : self.indi_allsky_config.get('IMAGE_LABEL_TEMPLATE', ''),
+            'IMAGE_EXTRA_TEXT'               : self.indi_allsky_config.get('IMAGE_EXTRA_TEXT', ''),
+            'IMAGE_ROTATE'                   : self.indi_allsky_config.get('IMAGE_ROTATE', ''),
+            'IMAGE_ROTATE_ANGLE'             : self.indi_allsky_config.get('IMAGE_ROTATE_ANGLE', 0),
+            'IMAGE_ROTATE_KEEP_SIZE'         : self.indi_allsky_config.get('IMAGE_ROTATE_KEEP_SIZE', False),
+            #'IMAGE_ROTATE_WITH_OFFSET'       : self.indi_allsky_config.get('IMAGE_ROTATE_WITH_OFFSET', False),
+            'IMAGE_FLIP_V'                   : self.indi_allsky_config.get('IMAGE_FLIP_V', True),
+            'IMAGE_FLIP_H'                   : self.indi_allsky_config.get('IMAGE_FLIP_H', True),
+            'IMAGE_SCALE'                    : self.indi_allsky_config.get('IMAGE_SCALE', 100),
+            'IMAGE_COLORMAP'                 : self.indi_allsky_config.get('IMAGE_COLORMAP', ''),
+            'IMAGE_CIRCLE_MASK__ENABLE'      : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('ENABLE', False),
+            'IMAGE_CIRCLE_MASK__DIAMETER'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('DIAMETER', 3000),
+            'IMAGE_CIRCLE_MASK__OFFSET_X'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OFFSET_X', 0),
+            'IMAGE_CIRCLE_MASK__OFFSET_Y'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OFFSET_Y', 0),
+            'IMAGE_CIRCLE_MASK__BLUR'        : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('BLUR', 35),
+            'IMAGE_CIRCLE_MASK__OPACITY'     : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OPACITY', 100),
+            'IMAGE_CIRCLE_MASK__OUTLINE'     : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OUTLINE', False),
+            'IMAGE_CROP_IMAGE_CIRCLE'        : self.indi_allsky_config.get('IMAGE_CROP_IMAGE_CIRCLE', False),
+            'FISH2PANO__ENABLE'              : self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE', True),
+            'FISH2PANO__DIAMETER'            : self.indi_allsky_config.get('FISH2PANO', {}).get('DIAMETER', 3000),
+            'FISH2PANO__OFFSET_X'            : self.indi_allsky_config.get('FISH2PANO', {}).get('OFFSET_X', 0),
+            'FISH2PANO__OFFSET_Y'            : self.indi_allsky_config.get('FISH2PANO', {}).get('OFFSET_Y', 0),
+            'FISH2PANO__ROTATE_ANGLE'        : self.indi_allsky_config.get('FISH2PANO', {}).get('ROTATE_ANGLE', -90),
+            'FISH2PANO__SCALE'               : self.indi_allsky_config.get('FISH2PANO', {}).get('SCALE', 0.5),
+            'FISH2PANO__MODULUS'             : self.indi_allsky_config.get('FISH2PANO', {}).get('MODULUS', 2),
+            'FISH2PANO__FLIP_H'              : self.indi_allsky_config.get('FISH2PANO', {}).get('FLIP_H', False),
+            'FISH2PANO__ENABLE_CARDINAL_DIRS': self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE_CARDINAL_DIRS', True),
+            'FISH2PANO__DIRS_OFFSET_BOTTOM'  : self.indi_allsky_config.get('FISH2PANO', {}).get('DIRS_OFFSET_BOTTOM', 25),
+            'FISH2PANO__OPENCV_FONT_SCALE'   : self.indi_allsky_config.get('FISH2PANO', {}).get('OPENCV_FONT_SCALE', 0.8),
+            'FISH2PANO__PIL_FONT_SIZE'       : self.indi_allsky_config.get('FISH2PANO', {}).get('PIL_FONT_SIZE', 30),
+            'IMAGE_SAVE_FITS'                : self.indi_allsky_config.get('IMAGE_SAVE_FITS', False),
+            'IMAGE_SAVE_FITS_COMPRESSED'     : self.indi_allsky_config.get('IMAGE_SAVE_FITS_COMPRESSED', False),
+            'IMAGE_SAVE_FITS_PERIOD'         : str(self.indi_allsky_config.get('IMAGE_SAVE_FITS_PERIOD', 7200)),  # string in form, int in config
+            'NIGHT_GRAYSCALE'                : self.indi_allsky_config.get('NIGHT_GRAYSCALE', False),
+            'DAYTIME_GRAYSCALE'              : self.indi_allsky_config.get('DAYTIME_GRAYSCALE', False),
+            'MOON_OVERLAY__ENABLE'           : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('ENABLE', True),
+            'MOON_OVERLAY__X'                : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('X', -500),
+            'MOON_OVERLAY__Y'                : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('Y', -200),
+            'MOON_OVERLAY__SCALE'            : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('SCALE', 0.5),
+            'MOON_OVERLAY__DARK_SIDE_SCALE'  : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('DARK_SIDE_SCALE', 0.4),
+            'MOON_OVERLAY__FLIP_V'           : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('FLIP_V', False),
+            'MOON_OVERLAY__FLIP_H'           : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('FLIP_H', False),
+            'LIGHTGRAPH_OVERLAY__ENABLE'     : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('ENABLE', False),
+            'LIGHTGRAPH_OVERLAY__GRAPH_HEIGHT' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('GRAPH_HEIGHT', 30),
+            'LIGHTGRAPH_OVERLAY__GRAPH_BORDER' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('GRAPH_BORDER', 3),
+            'LIGHTGRAPH_OVERLAY__Y'          : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('Y', 10),
+            'LIGHTGRAPH_OVERLAY__OFFSET_X'   : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OFFSET_X', 0),
+            'LIGHTGRAPH_OVERLAY__SCALE'      : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('SCALE', 1.0),
+            'LIGHTGRAPH_OVERLAY__NOW_MARKER_SIZE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NOW_MARKER_SIZE', 8),
+            'LIGHTGRAPH_OVERLAY__OPACITY'    : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OPACITY', 100),
+            'LIGHTGRAPH_OVERLAY__PIL_FONT_SIZE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('PIL_FONT_SIZE', 20),
+            'LIGHTGRAPH_OVERLAY__OPENCV_FONT_SCALE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OPENCV_FONT_SCALE', 0.5),
+            'LIGHTGRAPH_OVERLAY__LABEL'      : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('LABEL', True),
+            'LIGHTGRAPH_OVERLAY__HOUR_LINES' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('HOUR_LINES', True),
+            'IMAGE_OVERLAY__ENABLE'          : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('ENABLE', False),
+            'IMAGE_OVERLAY__LOAD_INTERVAL'   : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('LOAD_INTERVAL', 600),
+            'IMAGE_OVERLAY__A_URL'           : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_URL', ''),
+            'IMAGE_OVERLAY__A_IMAGE_FILE_TYPE' : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_IMAGE_FILE_TYPE', 'jpg'),
+            'IMAGE_OVERLAY__A_WIDTH'         : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_WIDTH', 250),
+            'IMAGE_OVERLAY__A_HEIGHT'        : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_HEIGHT', 250),
+            'IMAGE_OVERLAY__A_X'             : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_X', 300),
+            'IMAGE_OVERLAY__A_Y'             : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_Y', -300),
+            'IMAGE_OVERLAY__A_USERNAME'      : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_USERNAME', ''),
+            'IMAGE_OVERLAY__A_PASSWORD'      : self.indi_allsky_config.get('IMAGE_OVERLAY', {}).get('A_PASSWORD', ''),
+            'IMAGE_EXPORT_RAW'               : self.indi_allsky_config.get('IMAGE_EXPORT_RAW', ''),
+            'IMAGE_EXPORT_FOLDER'            : self.indi_allsky_config.get('IMAGE_EXPORT_FOLDER', '/var/www/html/allsky/images/export'),
+            'IMAGE_EXPORT_FLIP_V'            : self.indi_allsky_config.get('IMAGE_EXPORT_FLIP_V', False),
+            'IMAGE_EXPORT_FLIP_H'            : self.indi_allsky_config.get('IMAGE_EXPORT_FLIP_H', False),
+            'IMAGE_STACK_METHOD'             : self.indi_allsky_config.get('IMAGE_STACK_METHOD', 'maximum'),
+            'IMAGE_STACK_COUNT'              : str(self.indi_allsky_config.get('IMAGE_STACK_COUNT', 1)),  # string in form, int in config
+            'IMAGE_STACK_ALIGN'              : self.indi_allsky_config.get('IMAGE_STACK_ALIGN', False),
+            'IMAGE_ALIGN_DETECTSIGMA'        : self.indi_allsky_config.get('IMAGE_ALIGN_DETECTSIGMA', 5),
+            'IMAGE_ALIGN_POINTS'             : self.indi_allsky_config.get('IMAGE_ALIGN_POINTS', 50),
+            'IMAGE_ALIGN_SOURCEMINAREA'      : self.indi_allsky_config.get('IMAGE_ALIGN_SOURCEMINAREA', 10),
+            'IMAGE_STACK_SPLIT'              : self.indi_allsky_config.get('IMAGE_STACK_SPLIT', False),
+            'IMAGE_STACK_MOONMODE'           : self.indi_allsky_config.get('IMAGE_STACK_MOONMODE', False),
+            'IMAGE_STACK_DAY'                : self.indi_allsky_config.get('IMAGE_STACK_DAY', False),
+            'IMAGE_QUEUE_MAX'                : self.indi_allsky_config.get('IMAGE_QUEUE_MAX', 3),
+            'IMAGE_QUEUE_MIN'                : self.indi_allsky_config.get('IMAGE_QUEUE_MIN', 1),
+            'IMAGE_QUEUE_BACKOFF'            : self.indi_allsky_config.get('IMAGE_QUEUE_BACKOFF', 0.5),
+            'IMAGE_SAVE_HOOK_PRE'            : self.indi_allsky_config.get('IMAGE_SAVE_HOOK_PRE', ''),
+            'IMAGE_SAVE_HOOK_POST'           : self.indi_allsky_config.get('IMAGE_SAVE_HOOK_POST', ''),
+            'IMAGE_SAVE_HOOK_TIMEOUT'        : self.indi_allsky_config.get('IMAGE_SAVE_HOOK_TIMEOUT', 5),
+            'CAPTURE_HOOK_PRE'               : self.indi_allsky_config.get('CAPTURE_HOOK_PRE', ''),
+            'CAPTURE_HOOK_TIMEOUT'           : self.indi_allsky_config.get('CAPTURE_HOOK_TIMEOUT', 5),
+            'BACKUP_DB_PERIOD_DAYS'          : self.indi_allsky_config.get('BACKUP_DB_PERIOD_DAYS', 7),
+            'IMAGE_EXPIRE_DAYS'              : self.indi_allsky_config.get('IMAGE_EXPIRE_DAYS', 10),
+            'IMAGE_RAW_EXPIRE_DAYS'          : self.indi_allsky_config.get('IMAGE_RAW_EXPIRE_DAYS', 10),
+            'IMAGE_FITS_EXPIRE_DAYS'         : self.indi_allsky_config.get('IMAGE_FITS_EXPIRE_DAYS', 10),
+            'TIMELAPSE_EXPIRE_DAYS'          : self.indi_allsky_config.get('TIMELAPSE_EXPIRE_DAYS', 365),
+            'TIMELAPSE_OVERWRITE'            : self.indi_allsky_config.get('TIMELAPSE_OVERWRITE', False),
+            'FFMPEG_FRAMERATE'               : self.indi_allsky_config.get('FFMPEG_FRAMERATE', 25),
+            'FFMPEG_FRAMERATE_DAY'           : self.indi_allsky_config.get('FFMPEG_FRAMERATE_DAY', 25),
+            'FFMPEG_BITRATE'                 : self.indi_allsky_config.get('FFMPEG_BITRATE', '5000k'),
+            'FFMPEG_BITRATE_DAY'             : self.indi_allsky_config.get('FFMPEG_BITRATE_DAY', '5000k'),
+            'FFMPEG_VFSCALE'                 : self.indi_allsky_config.get('FFMPEG_VFSCALE', ''),
+            'FFMPEG_VFSCALE_DAY'             : self.indi_allsky_config.get('FFMPEG_VFSCALE_DAY', ''),
+            'FFMPEG_VFSCALE_STARTRAIL'       : self.indi_allsky_config.get('FFMPEG_VFSCALE_STARTRAIL', ''),
+            'FFMPEG_CODEC'                   : self.indi_allsky_config.get('FFMPEG_CODEC', 'libx264'),
+            'FFMPEG_EXTRA_OPTIONS'           : self.indi_allsky_config.get('FFMPEG_EXTRA_OPTIONS', '-level 3.1'),
+            'FFMPEG_EXTRA_OPTIONS_DAY'       : self.indi_allsky_config.get('FFMPEG_EXTRA_OPTIONS_DAY', '-level 3.1'),
+            'IMAGE_LABEL_SYSTEM'             : self.indi_allsky_config.get('IMAGE_LABEL_SYSTEM', 'pillow'),
+            'TEXT_PROPERTIES__FONT_FACE'     : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_FACE', 'FONT_HERSHEY_SIMPLEX'),
+            'TEXT_PROPERTIES__FONT_SCALE'    : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_SCALE', 0.8),
+            'TEXT_PROPERTIES__FONT_THICKNESS': self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_THICKNESS', 1),
+            'TEXT_PROPERTIES__FONT_OUTLINE'  : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_OUTLINE', True),
+            'TEXT_PROPERTIES__FONT_HEIGHT'   : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_HEIGHT', 30),
+            'TEXT_PROPERTIES__FONT_X'        : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_X', 15),
+            'TEXT_PROPERTIES__FONT_Y'        : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_Y', 30),
+            'TEXT_PROPERTIES__PIL_FONT_FILE' : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_FILE', 'fonts-freefont-ttf/FreeSans.ttf'),
+            'TEXT_PROPERTIES__PIL_FONT_CUSTOM' : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_CUSTOM', ''),
+            'TEXT_PROPERTIES__PIL_FONT_SIZE' : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_SIZE', 30),
+            'CARDINAL_DIRS__ENABLE'          : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('ENABLE', True),
+            'CARDINAL_DIRS__SWAP_NS'         : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('SWAP_NS', False),
+            'CARDINAL_DIRS__SWAP_EW'         : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('SWAP_EW', False),
+            'CARDINAL_DIRS__CHAR_NORTH'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_NORTH', 'N'),
+            'CARDINAL_DIRS__CHAR_EAST'       : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_EAST', 'E'),
+            'CARDINAL_DIRS__CHAR_WEST'       : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_WEST', 'W'),
+            'CARDINAL_DIRS__CHAR_SOUTH'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_SOUTH', 'S'),
+            'CARDINAL_DIRS__DIAMETER'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('DIAMETER', 3000),
+            'CARDINAL_DIRS__OFFSET_X'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_X', 0),
+            'CARDINAL_DIRS__OFFSET_Y'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_Y', 0),
+            'CARDINAL_DIRS__OFFSET_TOP'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_TOP', 15),
+            'CARDINAL_DIRS__OFFSET_LEFT'     : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_LEFT', 15),
+            'CARDINAL_DIRS__OFFSET_RIGHT'    : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_RIGHT', 15),
+            'CARDINAL_DIRS__OFFSET_BOTTOM'   : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_BOTTOM', 15),
+            'CARDINAL_DIRS__OPENCV_FONT_SCALE' : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OPENCV_FONT_SCALE', 0.5),
+            'CARDINAL_DIRS__PIL_FONT_SIZE'   : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('PIL_FONT_SIZE', 20),
+            'CARDINAL_DIRS__OUTLINE_CIRCLE'  : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OUTLINE_CIRCLE', False),
+            'ORB_PROPERTIES__MODE'           : self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('MODE', 'ha'),
+            'ORB_PROPERTIES__RADIUS'         : self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('RADIUS', 9),
+            'ORB_PROPERTIES__AZ_OFFSET'      : self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('AZ_OFFSET', 0.0),
+            'ORB_PROPERTIES__RETROGRADE'     : self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('RETROGRADE', False),
+            'IMAGE_BORDER__TOP'              : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('TOP', 0),
+            'IMAGE_BORDER__LEFT'             : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('LEFT', 0),
+            'IMAGE_BORDER__RIGHT'            : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('RIGHT', 0),
+            'IMAGE_BORDER__BOTTOM'           : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('BOTTOM', 0),
+            'UPLOAD_WORKERS'                 : self.indi_allsky_config.get('UPLOAD_WORKERS', 2),
+            'FILETRANSFER__CLASSNAME'        : self.indi_allsky_config.get('FILETRANSFER', {}).get('CLASSNAME', 'pycurl_sftp'),
+            'FILETRANSFER__HOST'             : self.indi_allsky_config.get('FILETRANSFER', {}).get('HOST', ''),
+            'FILETRANSFER__PORT'             : self.indi_allsky_config.get('FILETRANSFER', {}).get('PORT', 0),
+            'FILETRANSFER__USERNAME'         : self.indi_allsky_config.get('FILETRANSFER', {}).get('USERNAME', ''),
+            'FILETRANSFER__PASSWORD'         : self.indi_allsky_config.get('FILETRANSFER', {}).get('PASSWORD', ''),
+            'FILETRANSFER__PRIVATE_KEY'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('PRIVATE_KEY', ''),
+            'FILETRANSFER__PUBLIC_KEY'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('PUBLIC_KEY', ''),
+            'FILETRANSFER__CONNECT_TIMEOUT'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('CONNECT_TIMEOUT', 10.0),
+            'FILETRANSFER__TIMEOUT'          : self.indi_allsky_config.get('FILETRANSFER', {}).get('TIMEOUT', 60.0),
+            'FILETRANSFER__CERT_BYPASS'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('CERT_BYPASS', True),
+            'FILETRANSFER__ATOMIC_TRANSFERS' : self.indi_allsky_config.get('FILETRANSFER', {}).get('ATOMIC_TRANSFERS', False),
+            'FILETRANSFER__FORCE_IPV4'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('FORCE_IPV4', False),
+            'FILETRANSFER__FORCE_IPV6'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('FORCE_IPV6', False),
+            'FILETRANSFER__REMOTE_IMAGE_NAME'         : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_IMAGE_NAME', 'image_ccd{camera_id:d}_{ts:%Y%m%d_%H%M%S}.{ext}'),
+            'FILETRANSFER__REMOTE_IMAGE_FOLDER'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_IMAGE_FOLDER', '/home/allsky/upload/allsky/images/{day_date:%Y%m%d}/{timeofday:s}/{ts:%H}'),
+            'FILETRANSFER__REMOTE_PANORAMA_NAME'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_PANORAMA_NAME', 'panorama_ccd{camera_id:d}_{ts:%Y%m%d_%H%M%S}.{ext}'),
+            'FILETRANSFER__REMOTE_PANORAMA_FOLDER'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_PANORAMA_FOLDER', '/home/allsky/upload/allsky/panoramas/{day_date:%Y%m%d}/{timeofday:s}/{ts:%H}'),
+            'FILETRANSFER__REMOTE_METADATA_NAME'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_METADATA_NAME', 'latest_metadata.json'),
+            'FILETRANSFER__REMOTE_METADATA_FOLDER'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_METADATA_FOLDER', '/home/allsky/upload/allsky'),
+            'FILETRANSFER__REMOTE_RAW_NAME'           : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_RAW_NAME', 'raw_ccd{camera_id:d}_{ts:%Y%m%d_%H%M%S}.{ext}'),
+            'FILETRANSFER__REMOTE_RAW_FOLDER'         : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_RAW_FOLDER', '/home/allsky/upload/allsky/export/{day_date:%Y%m%d}/{timeofday:s}/{ts:%H}'),
+            'FILETRANSFER__REMOTE_FITS_NAME'          : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_FITS_NAME', 'image_ccd{camera_id:d}_{ts:%Y%m%d_%H%M%S}.{ext}'),
+            'FILETRANSFER__REMOTE_FITS_FOLDER'        : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_FITS_FOLDER', '/home/allsky/upload/allsky/fits/{day_date:%Y%m%d}/{timeofday:s}/{ts:%H}'),
+            'FILETRANSFER__REMOTE_VIDEO_NAME'         : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_VIDEO_NAME', 'allsky-timelapse_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_VIDEO_FOLDER'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_VIDEO_FOLDER', '/home/allsky/upload/allsky/videos/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_MINI_VIDEO_NAME'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_MINI_VIDEO_NAME', 'allsky-minitimelapse_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_MINI_VIDEO_FOLDER'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_MINI_VIDEO_FOLDER', '/home/allsky/upload/allsky/videos/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_KEOGRAM_NAME'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_KEOGRAM_NAME', 'allsky-keogram_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_KEOGRAM_FOLDER'     : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_KEOGRAM_FOLDER', '/home/allsky/upload/allsky/keograms/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_STARTRAIL_NAME'     : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_STARTRAIL_NAME', 'allsky-startrail_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_STARTRAIL_FOLDER'   : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_STARTRAIL_FOLDER', '/home/allsky/upload/allsky/startrails/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_STARTRAIL_VIDEO_NAME'   : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_STARTRAIL_VIDEO_NAME', 'allsky-startrail_timelapse_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_STARTRAIL_VIDEO_FOLDER' : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_STARTRAIL_VIDEO_FOLDER', '/home/allsky/upload/allsky/videos/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_PANORAMA_VIDEO_NAME'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_PANORAMA_VIDEO_NAME', 'allsky-panorama_timelapse_ccd{camera_id:d}_{day_date:%Y%m%d}_{timeofday:s}.{ext}'),
+            'FILETRANSFER__REMOTE_PANORAMA_VIDEO_FOLDER'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_PANORAMA_VIDEO_FOLDER', '/home/allsky/upload/allsky/videos/{day_date:%Y%m%d}'),
+            'FILETRANSFER__REMOTE_REALTIME_KEOGRAM_NAME'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_REALTIME_KEOGRAM_NAME', 'allsky-realtime_keogram_ccd{camera_id:d}.{ext}'),
+            'FILETRANSFER__REMOTE_REALTIME_KEOGRAM_FOLDER': self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_REALTIME_KEOGRAM_FOLDER', '/home/allsky/upload/allsky'),
+            'FILETRANSFER__REMOTE_ENDOFNIGHT_FOLDER'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_ENDOFNIGHT_FOLDER', '/home/allsky/upload/allsky'),
+            'FILETRANSFER__REMOTE_LATEST_FOLDER'          : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_LATEST_FOLDER', '/home/allsky/upload/allsky'),
+            'FILETRANSFER__REMOTE_DB_BACKUP_FOLDER'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('REMOTE_DB_BACKUP_FOLDER', '/home/allsky/upload/backup'),
+            'FILETRANSFER__UPLOAD_IMAGE'     : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_IMAGE', 0),
+            'FILETRANSFER__UPLOAD_PANORAMA'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_PANORAMA', 0),
+            'FILETRANSFER__UPLOAD_METADATA'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_METADATA', False),
+            'FILETRANSFER__UPLOAD_RAW'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_RAW', False),
+            'FILETRANSFER__UPLOAD_FITS'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_FITS', False),
+            'FILETRANSFER__UPLOAD_VIDEO'     : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_VIDEO', False),
+            'FILETRANSFER__UPLOAD_MINI_VIDEO': self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_MINI_VIDEO', False),
+            'FILETRANSFER__UPLOAD_KEOGRAM'   : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_KEOGRAM', False),
+            'FILETRANSFER__UPLOAD_STARTRAIL' : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_STARTRAIL', False),
+            'FILETRANSFER__UPLOAD_STARTRAIL_VIDEO' : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_STARTRAIL_VIDEO', False),
+            'FILETRANSFER__UPLOAD_PANORAMA_VIDEO'  : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_PANORAMA_VIDEO', False),
+            'FILETRANSFER__UPLOAD_REALTIME_KEOGRAM': self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_REALTIME_KEOGRAM', 0),
+            'FILETRANSFER__UPLOAD_ENDOFNIGHT'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_ENDOFNIGHT', False),
+            'FILETRANSFER__UPLOAD_LATEST_IMAGE'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_LATEST_IMAGE', False),
+            'FILETRANSFER__UPLOAD_LATEST_PANORAMA' : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_LATEST_PANORAMA', False),
+            'FILETRANSFER__UPLOAD_LATEST_RAW'      : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_LATEST_RAW', False),
+            'FILETRANSFER__UPLOAD_LATEST_VIDEO'    : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_LATEST_VIDEO', False),
+            'FILETRANSFER__UPLOAD_DB_BACKUP'       : self.indi_allsky_config.get('FILETRANSFER', {}).get('UPLOAD_DB_BACKUP', False),
+            'S3UPLOAD__CLASSNAME'            : self.indi_allsky_config.get('S3UPLOAD', {}).get('CLASSNAME', 'boto3_s3'),
+            'S3UPLOAD__ENABLE'               : self.indi_allsky_config.get('S3UPLOAD', {}).get('ENABLE', False),
+            'S3UPLOAD__ACCESS_KEY'           : self.indi_allsky_config.get('S3UPLOAD', {}).get('ACCESS_KEY', ''),
+            'S3UPLOAD__SECRET_KEY'           : self.indi_allsky_config.get('S3UPLOAD', {}).get('SECRET_KEY', ''),
+            'S3UPLOAD__CREDS_FILE'           : self.indi_allsky_config.get('S3UPLOAD', {}).get('CREDS_FILE', ''),
+            'S3UPLOAD__BUCKET'               : self.indi_allsky_config.get('S3UPLOAD', {}).get('BUCKET', 'change-me'),
+            'S3UPLOAD__REGION'               : self.indi_allsky_config.get('S3UPLOAD', {}).get('REGION', 'us-east-2'),
+            'S3UPLOAD__NAMESPACE'            : self.indi_allsky_config.get('S3UPLOAD', {}).get('NAMESPACE', ''),
+            'S3UPLOAD__HOST'                 : self.indi_allsky_config.get('S3UPLOAD', {}).get('HOST', 'amazonaws.com'),
+            'S3UPLOAD__ENDPOINT_URL'         : self.indi_allsky_config.get('S3UPLOAD', {}).get('ENDPOINT_URL', ''),
+            'S3UPLOAD__PORT'                 : self.indi_allsky_config.get('S3UPLOAD', {}).get('PORT', 0),
+            'S3UPLOAD__CONNECT_TIMEOUT'      : self.indi_allsky_config.get('S3UPLOAD', {}).get('CONNECT_TIMEOUT', 10.0),
+            'S3UPLOAD__TIMEOUT'              : self.indi_allsky_config.get('S3UPLOAD', {}).get('TIMEOUT', 60.0),
+            'S3UPLOAD__URL_TEMPLATE'         : self.indi_allsky_config.get('S3UPLOAD', {}).get('URL_TEMPLATE', 'https://{bucket}.s3.{region}.{host}'),
+            'S3UPLOAD__STORAGE_CLASS'        : self.indi_allsky_config.get('S3UPLOAD', {}).get('STORAGE_CLASS', 'STANDARD'),
+            'S3UPLOAD__ACL'                  : self.indi_allsky_config.get('S3UPLOAD', {}).get('ACL', ''),
+            'S3UPLOAD__TLS'                  : self.indi_allsky_config.get('S3UPLOAD', {}).get('TLS', True),
+            'S3UPLOAD__CERT_BYPASS'          : self.indi_allsky_config.get('S3UPLOAD', {}).get('CERT_BYPASS', False),
+            'S3UPLOAD__UPLOAD_FITS'          : self.indi_allsky_config.get('S3UPLOAD', {}).get('UPLOAD_FITS', False),
+            'S3UPLOAD__UPLOAD_RAW'           : self.indi_allsky_config.get('S3UPLOAD', {}).get('UPLOAD_RAW', False),
+            'MQTTPUBLISH__ENABLE'            : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('ENABLE', False),
+            'MQTTPUBLISH__TRANSPORT'         : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('TRANSPORT', 'tcp'),
+            'MQTTPUBLISH__PROTOCOL'          : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('PROTOCOL', 'MQTTv5'),
+            'MQTTPUBLISH__HOST'              : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('HOST', 'localhost'),
+            'MQTTPUBLISH__PORT'              : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('PORT', 8883),
+            'MQTTPUBLISH__USERNAME'          : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('USERNAME', 'indi-allsky'),
+            'MQTTPUBLISH__PASSWORD'          : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('PASSWORD', ''),
+            'MQTTPUBLISH__BASE_TOPIC'        : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('BASE_TOPIC', 'indi-allsky'),
+            'MQTTPUBLISH__QOS'               : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('QOS', 0),
+            'MQTTPUBLISH__TLS'               : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('TLS', True),
+            'MQTTPUBLISH__CERT_BYPASS'       : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('CERT_BYPASS', True),
+            'MQTTPUBLISH__PUBLISH_IMAGE'     : self.indi_allsky_config.get('MQTTPUBLISH', {}).get('PUBLISH_IMAGE', True),
+            'SYNCAPI__ENABLE'                : self.indi_allsky_config.get('SYNCAPI', {}).get('ENABLE', False),
+            'SYNCAPI__BASEURL'               : self.indi_allsky_config.get('SYNCAPI', {}).get('BASEURL', 'https://example.com/indi-allsky'),
+            'SYNCAPI__USERNAME'              : self.indi_allsky_config.get('SYNCAPI', {}).get('USERNAME', ''),
+            'SYNCAPI__APIKEY'                : self.indi_allsky_config.get('SYNCAPI', {}).get('APIKEY', ''),
+            'SYNCAPI__CERT_BYPASS'           : self.indi_allsky_config.get('SYNCAPI', {}).get('CERT_BYPASS', False),
+            'SYNCAPI__POST_S3'               : self.indi_allsky_config.get('SYNCAPI', {}).get('POST_S3', False),
+            'SYNCAPI__EMPTY_FILE'            : self.indi_allsky_config.get('SYNCAPI', {}).get('EMPTY_FILE', False),
+            'SYNCAPI__UPLOAD_IMAGE'          : self.indi_allsky_config.get('SYNCAPI', {}).get('UPLOAD_IMAGE', 1),
+            'SYNCAPI__UPLOAD_PANORAMA'       : self.indi_allsky_config.get('SYNCAPI', {}).get('UPLOAD_PANORAMA', 1),
+            'SYNCAPI__UPLOAD_VIDEO'          : True,  # cannot be changed
+            'SYNCAPI__CONNECT_TIMEOUT'       : self.indi_allsky_config.get('SYNCAPI', {}).get('CONNECT_TIMEOUT', 10.0),
+            'SYNCAPI__TIMEOUT'               : self.indi_allsky_config.get('SYNCAPI', {}).get('TIMEOUT', 60.0),
+            'ALLSKYMAP__ENABLE'              : self.indi_allsky_config.get('ALLSKYMAP', {}).get('ENABLE', False),
+            'ALLSKYMAP__API_URL'             : self.indi_allsky_config.get('ALLSKYMAP', {}).get('API_URL', 'https://allsky-map.com'),
+            'ALLSKYMAP__API_KEY'             : self.indi_allsky_config.get('ALLSKYMAP', {}).get('API_KEY', ''),
+            'ALLSKYMAP__CAMERA_NAME'         : self.indi_allsky_config.get('ALLSKYMAP', {}).get('CAMERA_NAME', ''),
+            'ALLSKYMAP__CAMERA_OWNER'        : self.indi_allsky_config.get('ALLSKYMAP', {}).get('CAMERA_OWNER', ''),
+            'ALLSKYMAP__WEBSITE_URL'         : self.indi_allsky_config.get('ALLSKYMAP', {}).get('WEBSITE_URL', ''),
+            'ALLSKYMAP__UPLOAD_IMAGE'        : self.indi_allsky_config.get('ALLSKYMAP', {}).get('UPLOAD_IMAGE', True),
+            'ALLSKYMAP__INTERVAL'            : self.indi_allsky_config.get('ALLSKYMAP', {}).get('INTERVAL', 10),
+            'YOUTUBE__ENABLE'                : self.indi_allsky_config.get('YOUTUBE', {}).get('ENABLE', False),
+            'YOUTUBE__SECRETS_FILE'          : self.indi_allsky_config.get('YOUTUBE', {}).get('SECRETS_FILE', ''),
+            'YOUTUBE__PRIVACY_STATUS'        : self.indi_allsky_config.get('YOUTUBE', {}).get('PRIVACY_STATUS', 'private'),
+            'YOUTUBE__TITLE_TEMPLATE'        : self.indi_allsky_config.get('YOUTUBE', {}).get('TITLE_TEMPLATE', 'Allsky {asset_label} - {day_date:%Y-%m-%d} - {timeofday}'),
+            'YOUTUBE__DESCRIPTION_TEMPLATE'  : self.indi_allsky_config.get('YOUTUBE', {}).get('DESCRIPTION_TEMPLATE', ''),
+            'YOUTUBE__CATEGORY'              : self.indi_allsky_config.get('YOUTUBE', {}).get('CATEGORY', 22),
+            'YOUTUBE__UPLOAD_VIDEO'          : self.indi_allsky_config.get('YOUTUBE', {}).get('UPLOAD_VIDEO', False),
+            'YOUTUBE__UPLOAD_MINI_VIDEO'     : self.indi_allsky_config.get('YOUTUBE', {}).get('UPLOAD_MINI_VIDEO', False),
+            'YOUTUBE__UPLOAD_STARTRAIL_VIDEO': self.indi_allsky_config.get('YOUTUBE', {}).get('UPLOAD_STARTRAIL_VIDEO', False),
+            'YOUTUBE__UPLOAD_PANORAMA_VIDEO' : self.indi_allsky_config.get('YOUTUBE', {}).get('UPLOAD_PANORAMA_VIDEO', False),
+            'LIBCAMERA__IMAGE_FILE_TYPE'     : self.indi_allsky_config.get('LIBCAMERA', {}).get('IMAGE_FILE_TYPE', 'jpg'),
+            'LIBCAMERA__IMAGE_FILE_TYPE_DAY' : self.indi_allsky_config.get('LIBCAMERA', {}).get('IMAGE_FILE_TYPE_DAY', 'jpg'),
+            'LIBCAMERA__IMMEDIATE'           : self.indi_allsky_config.get('LIBCAMERA', {}).get('IMMEDIATE', True),
+            'LIBCAMERA__IMMEDIATE_DAY'       : self.indi_allsky_config.get('LIBCAMERA', {}).get('IMMEDIATE_DAY', True),
+            'LIBCAMERA__AWB'                 : self.indi_allsky_config.get('LIBCAMERA', {}).get('AWB', 'auto'),
+            'LIBCAMERA__AWB_DAY'             : self.indi_allsky_config.get('LIBCAMERA', {}).get('AWB_DAY', 'auto'),
+            'LIBCAMERA__AWB_ENABLE'          : self.indi_allsky_config.get('LIBCAMERA', {}).get('AWB_ENABLE', True),
+            'LIBCAMERA__AWB_ENABLE_DAY'      : self.indi_allsky_config.get('LIBCAMERA', {}).get('AWB_ENABLE_DAY', True),
+            'LIBCAMERA__CCM_DISABLE'         : self.indi_allsky_config.get('LIBCAMERA', {}).get('CCM_DISABLE', False),
+            'LIBCAMERA__CCM_DISABLE_DAY'     : self.indi_allsky_config.get('LIBCAMERA', {}).get('CCM_DISABLE_DAY', False),
+            'LIBCAMERA__CAMERA_ID'           : str(self.indi_allsky_config.get('LIBCAMERA', {}).get('CAMERA_ID', 0)),  # string in form, int in config
+            'LIBCAMERA__EXTRA_OPTIONS'       : self.indi_allsky_config.get('LIBCAMERA', {}).get('EXTRA_OPTIONS', ''),
+            'LIBCAMERA__EXTRA_OPTIONS_DAY'   : self.indi_allsky_config.get('LIBCAMERA', {}).get('EXTRA_OPTIONS_DAY', ''),
+            'LIBCAMERA__MQTT_TRANSPORT'      : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_TRANSPORT', 'tcp'),
+            'LIBCAMERA__MQTT_PROTOCOL'       : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_PROTOCOL', 'MQTTv5'),
+            'LIBCAMERA__MQTT_HOST'           : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_HOST', 'localhost'),
+            'LIBCAMERA__MQTT_PORT'           : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_PORT', 8883),
+            'LIBCAMERA__MQTT_USERNAME'       : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_USERNAME', 'indi-allsky'),
+            'LIBCAMERA__MQTT_PASSWORD'       : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_PASSWORD', ''),
+            'LIBCAMERA__MQTT_QOS'            : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_QOS', 0),
+            'LIBCAMERA__MQTT_TLS'            : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_TLS', True),
+            'LIBCAMERA__MQTT_CERT_BYPASS'    : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_CERT_BYPASS', True),
+            'LIBCAMERA__MQTT_EXPOSURE_TOPIC' : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_EXPOSURE_TOPIC', 'libcamera/exposure'),
+            'LIBCAMERA__MQTT_IMAGE_TOPIC'    : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_IMAGE_TOPIC', 'libcamera/image'),
+            'LIBCAMERA__MQTT_METADATA_TOPIC' : self.indi_allsky_config.get('LIBCAMERA', {}).get('MQTT_METADATA_TOPIC', 'libcamera/metadata'),
+            'PYCURL_CAMERA__URL'             : self.indi_allsky_config.get('PYCURL_CAMERA', {}).get('URL', ''),
+            'PYCURL_CAMERA__IMAGE_FILE_TYPE' : self.indi_allsky_config.get('PYCURL_CAMERA', {}).get('IMAGE_FILE_TYPE', 'jpg'),
+            'PYCURL_CAMERA__USERNAME'        : self.indi_allsky_config.get('PYCURL_CAMERA', {}).get('USERNAME', ''),
+            'PYCURL_CAMERA__PASSWORD'        : self.indi_allsky_config.get('PYCURL_CAMERA', {}).get('PASSWORD', ''),
+            'ACCUM_CAMERA__SUB_EXPOSURE_MAX' : self.indi_allsky_config.get('ACCUM_CAMERA', {}).get('SUB_EXPOSURE_MAX', 1.0),
+            'ACCUM_CAMERA__EVEN_EXPOSURES'   : self.indi_allsky_config.get('ACCUM_CAMERA', {}).get('EVEN_EXPOSURES', True),
+            'ACCUM_CAMERA__CLAMP_16BIT'      : self.indi_allsky_config.get('ACCUM_CAMERA', {}).get('CLAMP_16BIT', False),
+            'TEST_CAMERA__WIDTH'             : self.indi_allsky_config.get('TEST_CAMERA', {}).get('WIDTH', 4056),
+            'TEST_CAMERA__HEIGHT'            : self.indi_allsky_config.get('TEST_CAMERA', {}).get('HEIGHT', 3040),
+            'TEST_CAMERA__IMAGE_CIRCLE_DIAMETER': self.indi_allsky_config.get('TEST_CAMERA', {}).get('IMAGE_CIRCLE_DIAMETER', 3500),
+            'TEST_CAMERA__IMAGE_CIRCLE_OFFSET_X': self.indi_allsky_config.get('TEST_CAMERA', {}).get('IMAGE_CIRCLE_OFFSET_X', 0),
+            'TEST_CAMERA__IMAGE_CIRCLE_OFFSET_Y': self.indi_allsky_config.get('TEST_CAMERA', {}).get('IMAGE_CIRCLE_OFFSET_Y', 0),
+            'TEST_CAMERA__ROTATING_STAR_COUNT'  : self.indi_allsky_config.get('TEST_CAMERA', {}).get('ROTATING_STAR_COUNT', 30000),
+            'TEST_CAMERA__ROTATING_STAR_FACTOR' : self.indi_allsky_config.get('TEST_CAMERA', {}).get('ROTATING_STAR_FACTOR', 1.0),
+            'TEST_CAMERA__BUBBLE_COUNT'      : self.indi_allsky_config.get('TEST_CAMERA', {}).get('BUBBLE_COUNT', 1000),
+            'VIRTUALSKY__MAGNITUDE'          : self.indi_allsky_config.get('VIRTUALSKY', {}).get('MAGNITUDE', 6.0),
+            'VIRTUALSKY__CONSTELLATIONS'     : self.indi_allsky_config.get('VIRTUALSKY', {}).get('CONSTELLATIONS', True),
+            'VIRTUALSKY__CONSTELLATIONLABELS': self.indi_allsky_config.get('VIRTUALSKY', {}).get('CONSTELLATIONLABELS', False),
+            'VIRTUALSKY__SHOWSTARS'          : self.indi_allsky_config.get('VIRTUALSKY', {}).get('SHOWSTARS', True),
+            'VIRTUALSKY__SHOWSTARLABELS'     : self.indi_allsky_config.get('VIRTUALSKY', {}).get('SHOWSTARLABELS', True),
+            'VIRTUALSKY__SHOWPLANETS'        : self.indi_allsky_config.get('VIRTUALSKY', {}).get('SHOWPLANETS', True),
+            'VIRTUALSKY__SHOWPLANETLABELS'   : self.indi_allsky_config.get('VIRTUALSKY', {}).get('SHOWPLANETLABELS', True),
+            'VIRTUALSKY__IMAGE_CIRCLE_DIAMETER' : self.indi_allsky_config.get('VIRTUALSKY', {}).get('IMAGE_CIRCLE_DIAMETER', 3500),
+            'VIRTUALSKY__LATITUDE_OFFSET'    : self.indi_allsky_config.get('VIRTUALSKY', {}).get('LATITUDE_OFFSET', 0.0),
+            'VIRTUALSKY__LONGITUDE_OFFSET'   : self.indi_allsky_config.get('VIRTUALSKY', {}).get('LONGITUDE_OFFSET', 0.0),
+            'VIRTUALSKY__OFFSET_X'           : self.indi_allsky_config.get('VIRTUALSKY', {}).get('OFFSET_X', 0),
+            'VIRTUALSKY__OFFSET_Y'           : self.indi_allsky_config.get('VIRTUALSKY', {}).get('OFFSET_Y', 0),
+            #'VIRTUALSKY__FLIP_NS'            : self.indi_allsky_config.get('VIRTUALSKY', {}).get('FLIP_NS', False),
+            #'VIRTUALSKY__FLIP_EW'            : self.indi_allsky_config.get('VIRTUALSKY', {}).get('FLIP_EW', False),
+            'CIRCULAR_DISPLAY__ENABLE'       : self.indi_allsky_config.get('CIRCULAR_DISPLAY', {}).get('ENABLE', False),
+            'CIRCULAR_DISPLAY__RESOLUTION'   : str(self.indi_allsky_config.get('CIRCULAR_DISPLAY', {}).get('RESOLUTION', 800)),  # string in form, int in config
+            'CIRCULAR_DISPLAY__IMAGE_CIRCLE_DIAMETER' : self.indi_allsky_config.get('CIRCULAR_DISPLAY', {}).get('IMAGE_CIRCLE_DIAMETER', 3500),
+            'FOCUSER__CLASSNAME'             : self.indi_allsky_config.get('FOCUSER', {}).get('CLASSNAME', ''),
+            'FOCUSER__GPIO_PIN_1'            : self.indi_allsky_config.get('FOCUSER', {}).get('GPIO_PIN_1', 'D17'),
+            'FOCUSER__GPIO_PIN_2'            : self.indi_allsky_config.get('FOCUSER', {}).get('GPIO_PIN_2', 'D18'),
+            'FOCUSER__GPIO_PIN_3'            : self.indi_allsky_config.get('FOCUSER', {}).get('GPIO_PIN_3', 'D27'),
+            'FOCUSER__GPIO_PIN_4'            : self.indi_allsky_config.get('FOCUSER', {}).get('GPIO_PIN_4', 'D22'),
+            'FOCUSER__I2C_ADDRESS'           : self.indi_allsky_config.get('FOCUSER', {}).get('I2C_ADDRESS', '0x60'),
+            'DEW_HEATER__CLASSNAME'          : self.indi_allsky_config.get('DEW_HEATER', {}).get('CLASSNAME', ''),
+            'DEW_HEATER__I2C_ADDRESS'        : self.indi_allsky_config.get('DEW_HEATER', {}).get('I2C_ADDRESS', '0x10'),
+            'DEW_HEATER__PIN_1'              : self.indi_allsky_config.get('DEW_HEATER', {}).get('PIN_1', 'D12'),
+            'DEW_HEATER__INVERT_OUTPUT'      : self.indi_allsky_config.get('DEW_HEATER', {}).get('INVERT_OUTPUT', False),
+            'DEW_HEATER__ENABLE_DAY'         : self.indi_allsky_config.get('DEW_HEATER', {}).get('ENABLE_DAY', False),
+            'DEW_HEATER__LEVEL_DEF'          : self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_DEF', 100),
+            'DEW_HEATER__THOLD_ENABLE'       : self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_ENABLE', False),
+            'DEW_HEATER__MANUAL_TARGET'      : self.indi_allsky_config.get('DEW_HEATER', {}).get('MANUAL_TARGET', 0.0),
+            'DEW_HEATER__TEMP_USER_VAR_SLOT' : self.indi_allsky_config.get('DEW_HEATER', {}).get('TEMP_USER_VAR_SLOT', 'sensor_user_10'),
+            'DEW_HEATER__DEWPOINT_USER_VAR_SLOT' : self.indi_allsky_config.get('DEW_HEATER', {}).get('DEWPOINT_USER_VAR_SLOT', 'sensor_user_2'),
+            'DEW_HEATER__LEVEL_LOW'          : self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_LOW', 33),
+            'DEW_HEATER__LEVEL_MED'          : self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_MED', 66),
+            'DEW_HEATER__LEVEL_HIGH'         : self.indi_allsky_config.get('DEW_HEATER', {}).get('LEVEL_HIGH', 100),
+            'DEW_HEATER__THOLD_DIFF_LOW'     : '{0:+d}'.format(self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_LOW', 15)),  # str for sign
+            'DEW_HEATER__THOLD_DIFF_MED'     : '{0:+d}'.format(self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_MED', 10)),
+            'DEW_HEATER__THOLD_DIFF_HIGH'    : '{0:+d}'.format(self.indi_allsky_config.get('DEW_HEATER', {}).get('THOLD_DIFF_HIGH', 5)),
+            'DEW_HEATER__HOLD_SECONDS'       : self.indi_allsky_config.get('DEW_HEATER', {}).get('HOLD_SECONDS', 0),
+            'DEW_HEATER__PWM_FREQUENCY'      : self.indi_allsky_config.get('DEW_HEATER', {}).get('PWM_FREQUENCY', 500),
+            'FAN__CLASSNAME'                 : self.indi_allsky_config.get('FAN', {}).get('CLASSNAME', ''),
+            'FAN__I2C_ADDRESS'               : self.indi_allsky_config.get('FAN', {}).get('I2C_ADDRESS', '0x11'),
+            'FAN__PIN_1'                     : self.indi_allsky_config.get('FAN', {}).get('PIN_1', 'D13'),
+            'FAN__INVERT_OUTPUT'             : self.indi_allsky_config.get('FAN', {}).get('INVERT_OUTPUT', False),
+            'FAN__ENABLE_NIGHT'              : self.indi_allsky_config.get('FAN', {}).get('ENABLE_NIGHT', False),
+            'FAN__LEVEL_DEF'                 : self.indi_allsky_config.get('FAN', {}).get('LEVEL_DEF', 100),
+            'FAN__THOLD_ENABLE'              : self.indi_allsky_config.get('FAN', {}).get('THOLD_ENABLE', False),
+            'FAN__TARGET'                    : self.indi_allsky_config.get('FAN', {}).get('TARGET', 30.0),
+            'FAN__TEMP_USER_VAR_SLOT'        : self.indi_allsky_config.get('FAN', {}).get('TEMP_USER_VAR_SLOT', 'sensor_user_10'),
+            'FAN__LEVEL_LOW'                 : self.indi_allsky_config.get('FAN', {}).get('LEVEL_LOW', 33),
+            'FAN__LEVEL_MED'                 : self.indi_allsky_config.get('FAN', {}).get('LEVEL_MED', 66),
+            'FAN__LEVEL_HIGH'                : self.indi_allsky_config.get('FAN', {}).get('LEVEL_HIGH', 100),
+            'FAN__THOLD_DIFF_LOW'            : '{0:+d}'.format(self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_LOW', -10)),  # str for sign
+            'FAN__THOLD_DIFF_MED'            : '{0:+d}'.format(self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_MED', -5)),
+            'FAN__THOLD_DIFF_HIGH'           : '{0:+d}'.format(self.indi_allsky_config.get('FAN', {}).get('THOLD_DIFF_HIGH', 0)),
+            'FAN__HOLD_SECONDS'              : self.indi_allsky_config.get('FAN', {}).get('HOLD_SECONDS', 0),
+            'FAN__PWM_FREQUENCY'             : self.indi_allsky_config.get('FAN', {}).get('PWM_FREQUENCY', 500),
+            'GENERIC_GPIO__A_CLASSNAME'      : self.indi_allsky_config.get('GENERIC_GPIO', {}).get('A_CLASSNAME', ''),
+            'GENERIC_GPIO__A_I2C_ADDRESS'    : self.indi_allsky_config.get('GENERIC_GPIO', {}).get('A_I2C_ADDRESS', '0x12'),
+            'GENERIC_GPIO__A_PIN_1'          : self.indi_allsky_config.get('GENERIC_GPIO', {}).get('A_PIN_1', 'D21'),
+            'GENERIC_GPIO__A_INVERT_OUTPUT'  : self.indi_allsky_config.get('GENERIC_GPIO', {}).get('A_INVERT_OUTPUT', False),
+            'MANUAL_GPIO__A_CLASSNAME'       : self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_CLASSNAME', ''),
+            'MANUAL_GPIO__A_PIN_1'           : self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_1', '21'),
+            'MANUAL_GPIO__A_PIN_2'           : self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_2', '25'),
+            'MANUAL_GPIO__A_PIN_3'           : self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_3', '16'),
+            'DEVICE__MQTT_TRANSPORT'         : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_TRANSPORT', 'tcp'),
+            'DEVICE__MQTT_PROTOCOL'          : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_PROTOCOL', 'MQTTv5'),
+            'DEVICE__MQTT_HOST'              : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_HOST', 'localhost'),
+            'DEVICE__MQTT_PORT'              : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_PORT', 8883),
+            'DEVICE__MQTT_USERNAME'          : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_USERNAME', 'indi-allsky'),
+            'DEVICE__MQTT_PASSWORD'          : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_PASSWORD', ''),
+            'DEVICE__MQTT_QOS'               : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_QOS', 0),
+            'DEVICE__MQTT_TLS'               : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_TLS', True),
+            'DEVICE__MQTT_CERT_BYPASS'       : self.indi_allsky_config.get('DEVICE', {}).get('MQTT_CERT_BYPASS', True),
+            'TEMP_SENSOR__A_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_CLASSNAME', ''),
+            'TEMP_SENSOR__A_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_LABEL', 'Sensor A'),
+            'TEMP_SENSOR__A_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_PIN_1', 'D5'),
+            'TEMP_SENSOR__A_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_PIN_2', ''),
+            'TEMP_SENSOR__A_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_I2C_ADDRESS', '0x77'),
+            'TEMP_SENSOR__A_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_USER_VAR_SLOT', 'sensor_user_10'),
+            'TEMP_SENSOR__A_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('A_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__B_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_CLASSNAME', ''),
+            'TEMP_SENSOR__B_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_LABEL', 'Sensor B'),
+            'TEMP_SENSOR__B_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_PIN_1', 'D6'),
+            'TEMP_SENSOR__B_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_PIN_2', ''),
+            'TEMP_SENSOR__B_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_I2C_ADDRESS', '0x76'),
+            'TEMP_SENSOR__B_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_USER_VAR_SLOT', 'sensor_user_20'),
+            'TEMP_SENSOR__B_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('B_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__C_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_CLASSNAME', ''),
+            'TEMP_SENSOR__C_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_LABEL', 'Sensor C'),
+            'TEMP_SENSOR__C_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_PIN_1', 'D16'),
+            'TEMP_SENSOR__C_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_PIN_2', ''),
+            'TEMP_SENSOR__C_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_I2C_ADDRESS', '0x40'),
+            'TEMP_SENSOR__C_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_USER_VAR_SLOT', 'sensor_user_30'),
+            'TEMP_SENSOR__C_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('C_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__D_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_CLASSNAME', ''),
+            'TEMP_SENSOR__D_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_LABEL', 'Sensor D'),
+            'TEMP_SENSOR__D_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_PIN_1', 'D26'),
+            'TEMP_SENSOR__D_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_PIN_2', ''),
+            'TEMP_SENSOR__D_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_I2C_ADDRESS', '0x50'),
+            'TEMP_SENSOR__D_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_USER_VAR_SLOT', 'sensor_user_40'),
+            'TEMP_SENSOR__D_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('D_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__E_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_CLASSNAME', ''),
+            'TEMP_SENSOR__E_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_LABEL', 'Sensor E'),
+            'TEMP_SENSOR__E_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_PIN_1', 'D25'),
+            'TEMP_SENSOR__E_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_PIN_2', ''),
+            'TEMP_SENSOR__E_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_I2C_ADDRESS', '0x51'),
+            'TEMP_SENSOR__E_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_USER_VAR_SLOT', 'sensor_user_50'),
+            'TEMP_SENSOR__E_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('E_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__F_CLASSNAME'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_CLASSNAME', ''),
+            'TEMP_SENSOR__F_LABEL'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_LABEL', 'Sensor F'),
+            'TEMP_SENSOR__F_PIN_1'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_PIN_1', 'D27'),
+            'TEMP_SENSOR__F_PIN_2'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_PIN_2', ''),
+            'TEMP_SENSOR__F_I2C_ADDRESS'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_I2C_ADDRESS', '0x52'),
+            'TEMP_SENSOR__F_USER_VAR_SLOT'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_USER_VAR_SLOT', 'sensor_user_55'),
+            'TEMP_SENSOR__F_TITLE_TEMPLATE'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('F_TITLE_TEMPLATE', '{name:s} - {label:s} - {probe:s}'),
+            'TEMP_SENSOR__FC37_ACTIVE_LOW'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('FC37_ACTIVE_LOW', True),
+            'TEMP_SENSOR__OPENWEATHERMAP_APIKEY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('OPENWEATHERMAP_APIKEY', ''),
+            'TEMP_SENSOR__WUNDERGROUND_APIKEY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('WUNDERGROUND_APIKEY', ''),
+            'TEMP_SENSOR__ASTROSPHERIC_APIKEY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('ASTROSPHERIC_APIKEY', ''),
+            'TEMP_SENSOR__AMBIENTWEATHER_APIKEY'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AMBIENTWEATHER_APIKEY', ''),
+            'TEMP_SENSOR__AMBIENTWEATHER_APPLICATIONKEY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AMBIENTWEATHER_APPLICATIONKEY', ''),
+            'TEMP_SENSOR__AMBIENTWEATHER_MACADDRESS'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AMBIENTWEATHER_MACADDRESS', ''),
+            'TEMP_SENSOR__ECOWITT_APIKEY'           : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('ECOWITT_APIKEY', ''),
+            'TEMP_SENSOR__ECOWITT_APPLICATIONKEY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('ECOWITT_APPLICATIONKEY', ''),
+            'TEMP_SENSOR__ECOWITT_MACADDRESS'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('ECOWITT_MACADDRESS', ''),
+            'TEMP_SENSOR__MQTT_TRANSPORT'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_TRANSPORT', 'tcp'),
+            'TEMP_SENSOR__MQTT_PROTOCOL'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_PROTOCOL', 'MQTTv5'),
+            'TEMP_SENSOR__MQTT_HOST'         : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_HOST', 'localhost'),
+            'TEMP_SENSOR__MQTT_PORT'         : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_PORT', 8883),
+            'TEMP_SENSOR__MQTT_USERNAME'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_USERNAME', 'indi-allsky'),
+            'TEMP_SENSOR__MQTT_PASSWORD'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_PASSWORD', ''),
+            'TEMP_SENSOR__MQTT_TLS'          : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_TLS', True),
+            'TEMP_SENSOR__MQTT_CERT_BYPASS'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('MQTT_CERT_BYPASS', True),
+            'TEMP_SENSOR__DHT_USE_PULSEIO'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('DHT_USE_PULSEIO', False),
+            'TEMP_SENSOR__SHT3X_HEATER_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT3X_HEATER_NIGHT', False),
+            'TEMP_SENSOR__SHT3X_HEATER_DAY'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT3X_HEATER_DAY', False),
+            'TEMP_SENSOR__SHT4X_MODE_NIGHT'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_MODE_NIGHT', 'NOHEAT_HIGHPRECISION'),
+            'TEMP_SENSOR__SHT4X_MODE_DAY'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_MODE_DAY', 'NOHEAT_HIGHPRECISION'),
+            'TEMP_SENSOR__SHT4X_HEATER_ENABLE' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_ENABLE', False),
+            'TEMP_SENSOR__SHT4X_HEATER_MODE' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_MODE', 'OFF'),
+            'TEMP_SENSOR__SHT4X_HEATER_COMMAND' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_COMMAND', 'LOWHEAT_100MS'),
+            'TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_INTERVAL_S', 60.0),
+            'TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_EQUILIBRATION_S', 60.0),
+            'TEMP_SENSOR__SHT4X_HEATER_PULSES' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_PULSES', 1),
+            'TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_MAX_DUTY', 0.05),
+            'TEMP_SENSOR__SHT4X_HEATER_RH_ON' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_RH_ON', 80.0),
+            'TEMP_SENSOR__SHT4X_HEATER_RH_OFF' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_HEATER_RH_OFF', 75.0),
+            'TEMP_SENSOR__SHT4X_REGEN_ENABLE' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_ENABLE', False),
+            'TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_INTERVAL_DAYS', 7.0),
+            'TEMP_SENSOR__SHT4X_REGEN_COMMAND' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_COMMAND', 'HIGHHEAT_1S'),
+            'TEMP_SENSOR__SHT4X_REGEN_PULSES' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_PULSES', 5),
+            'TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SHT4X_REGEN_EQUILIBRATION_S', 120.0),
+            'TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT' : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI7021_HEATER_LEVEL_NIGHT', -1)),  # string in form, int in config
+            'TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY' : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI7021_HEATER_LEVEL_DAY', -1)),  # string in form, int in config
+            'TEMP_SENSOR__HTU31D_HEATER_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('HTU31D_HEATER_NIGHT', False),
+            'TEMP_SENSOR__HTU31D_HEATER_DAY'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('HTU31D_HEATER_DAY', False),
+            'TEMP_SENSOR__HDC302X_HEATER_NIGHT'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('HDC302X_HEATER_NIGHT', 'OFF'),
+            'TEMP_SENSOR__HDC302X_HEATER_DAY'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('HDC302X_HEATER_DAY', 'OFF'),
+            'TEMP_SENSOR__TSL2561_GAIN_NIGHT': str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2561_GAIN_NIGHT', 1)),  # string in form, int in config
+            'TEMP_SENSOR__TSL2561_GAIN_DAY'  : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2561_GAIN_DAY', 0)),  # string in form, int in config
+            'TEMP_SENSOR__TSL2561_INT_NIGHT' : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2561_INT_NIGHT', 1)),  # string in form, int in config
+            'TEMP_SENSOR__TSL2561_INT_DAY'   : str(self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2561_INT_DAY', 1)),  # string in form, int in config
+            'TEMP_SENSOR__TSL2561_DISABLE_DAY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2561_DISABLE_DAY', False),
+            'TEMP_SENSOR__TSL2591_GAIN_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2591_GAIN_NIGHT', 'GAIN_MED'),
+            'TEMP_SENSOR__TSL2591_GAIN_DAY'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2591_GAIN_DAY', 'GAIN_LOW'),
+            'TEMP_SENSOR__TSL2591_INT_NIGHT' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2591_INT_NIGHT', 'INTEGRATIONTIME_100MS'),
+            'TEMP_SENSOR__TSL2591_INT_DAY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2591_INT_DAY', 'INTEGRATIONTIME_100MS'),
+            'TEMP_SENSOR__TSL2591_DISABLE_DAY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('TSL2591_DISABLE_DAY', False),
+            'TEMP_SENSOR__VEML7700_GAIN_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('VEML7700_GAIN_NIGHT', 'ALS_GAIN_1'),
+            'TEMP_SENSOR__VEML7700_GAIN_DAY' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('VEML7700_GAIN_DAY', 'ALS_GAIN_1_8'),
+            'TEMP_SENSOR__VEML7700_INT_NIGHT': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('VEML7700_INT_NIGHT', 'ALS_100MS'),
+            'TEMP_SENSOR__VEML7700_INT_DAY'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('VEML7700_INT_DAY', 'ALS_100MS'),
+            'TEMP_SENSOR__SI1145_VIS_GAIN_NIGHT' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_VIS_GAIN_NIGHT', 'GAIN_ADC_CLOCK_DIV_32'),
+            'TEMP_SENSOR__SI1145_VIS_GAIN_DAY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_VIS_GAIN_DAY', 'GAIN_ADC_CLOCK_DIV_1'),
+            'TEMP_SENSOR__SI1145_IR_GAIN_NIGHT'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_IR_GAIN_NIGHT', 'GAIN_ADC_CLOCK_DIV_32'),
+            'TEMP_SENSOR__SI1145_IR_GAIN_DAY'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_IR_GAIN_DAY', 'GAIN_ADC_CLOCK_DIV_1'),
+            'TEMP_SENSOR__SI1145_VIS_RANGE_HIGH_NIGHT' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_VIS_RANGE_HIGH_NIGHT', False),
+            'TEMP_SENSOR__SI1145_IR_RANGE_HIGH_NIGHT'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_IR_RANGE_HIGH_NIGHT', False),
+            'TEMP_SENSOR__SI1145_VIS_RANGE_HIGH_DAY'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_VIS_RANGE_HIGH_DAY', True),
+            'TEMP_SENSOR__SI1145_IR_RANGE_HIGH_DAY'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('SI1145_IR_RANGE_HIGH_DAY', True),
+            'TEMP_SENSOR__LTR390_GAIN_NIGHT'     : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('LTR390_GAIN_NIGHT', 'GAIN_9X'),
+            'TEMP_SENSOR__LTR390_GAIN_DAY'       : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('LTR390_GAIN_DAY', 'GAIN_1X'),
+            'TEMP_SENSOR__INA3221_CH1_ENABLE'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('INA3221_CH1_ENABLE', True),
+            'TEMP_SENSOR__INA3221_CH2_ENABLE'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('INA3221_CH2_ENABLE', True),
+            'TEMP_SENSOR__INA3221_CH3_ENABLE'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('INA3221_CH3_ENABLE', True),
+            'TEMP_SENSOR__AS3935_OUTDOOR_MODE'   : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AS3935_OUTDOOR_MODE', True),
+            'TEMP_SENSOR__AS3935_MASK_DISTURBER' : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AS3935_MASK_DISTURBER', False),
+            'TEMP_SENSOR__AS3935_NOISE_LEVEL'    : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AS3935_NOISE_LEVEL', 2),
+            'TEMP_SENSOR__AS3935_SPIKE_REJECTION': self.indi_allsky_config.get('TEMP_SENSOR', {}).get('AS3935_SPIKE_REJECTION', 2),
+            'TEMP_SENSOR__LUX_MAGNITUDE_OFFSET'  : self.indi_allsky_config.get('TEMP_SENSOR', {}).get('LUX_MAGNITUDE_OFFSET', 26.0),
+            'CHARTS__CUSTOM_SLOT_1'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_1', 'sensor_user_10'),
+            'CHARTS__CUSTOM_SLOT_1_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_1_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_2'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_2', 'sensor_user_11'),
+            'CHARTS__CUSTOM_SLOT_2_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_2_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_3'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_3', 'sensor_user_12'),
+            'CHARTS__CUSTOM_SLOT_3_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_3_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_4'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_4', 'sensor_user_13'),
+            'CHARTS__CUSTOM_SLOT_4_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_4_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_5'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_5', 'sensor_user_14'),
+            'CHARTS__CUSTOM_SLOT_5_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_5_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_6'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_6', 'sensor_user_15'),
+            'CHARTS__CUSTOM_SLOT_6_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_6_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_7'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_7', 'sensor_user_16'),
+            'CHARTS__CUSTOM_SLOT_7_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_7_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_8'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_8', 'sensor_user_14'),
+            'CHARTS__CUSTOM_SLOT_8_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_8_MIN', 0.0),
+            'CHARTS__CUSTOM_SLOT_9'          : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_9', 'sensor_user_15'),
+            'CHARTS__CUSTOM_SLOT_9_MIN'      : self.indi_allsky_config.get('CHARTS', {}).get('CUSTOM_SLOT_9_MIN', 0.0),
+            'ADSB__ENABLE'                   : self.indi_allsky_config.get('ADSB', {}).get('ENABLE', False),
+            'ADSB__DUMP1090_URL'             : self.indi_allsky_config.get('ADSB', {}).get('DUMP1090_URL', 'https://localhost/skyaware/data/aircraft.json'),
+            'ADSB__USERNAME'                 : self.indi_allsky_config.get('ADSB', {}).get('USERNAME', ''),
+            'ADSB__PASSWORD'                 : self.indi_allsky_config.get('ADSB', {}).get('PASSWORD', ''),
+            'ADSB__CERT_BYPASS'              : self.indi_allsky_config.get('ADSB', {}).get('CERT_BYPASS', True),
+            'ADSB__ALT_DEG_MIN'              : self.indi_allsky_config.get('ADSB', {}).get('ALT_DEG_MIN', 20.0),
+            'ADSB__LABEL_ENABLE'             : self.indi_allsky_config.get('ADSB', {}).get('LABEL_ENABLE', True),
+            'ADSB__LABEL_LIMIT'              : self.indi_allsky_config.get('ADSB', {}).get('LABEL_LIMIT', 10),
+            'ADSB__AIRCRAFT_LABEL_TEMPLATE'  : self.indi_allsky_config.get('ADSB', {}).get('AIRCRAFT_LABEL_TEMPLATE', '{id:s} {distance:0.1f}km {alt:0.1f}\u00b0 {dir:s}'),
+            'ADSB__IMAGE_LABEL_TEMPLATE_PREFIX' : self.indi_allsky_config.get('ADSB', {}).get('IMAGE_LABEL_TEMPLATE_PREFIX', '# xy:15,300 (Left)\n# anchor:la (Left Justified)\n# color:200,200,200\nAircraft'),
+            'SATELLITE_TRACK__ENABLE'              : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('ENABLE', False),
+            'SATELLITE_TRACK__DAYTIME_TRACK'       : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('DAYTIME_TRACK', False),
+            'SATELLITE_TRACK__ALT_DEG_MIN'         : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('ALT_DEG_MIN', 20.0),
+            'SATELLITE_TRACK__LABEL_ENABLE'        : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('LABEL_ENABLE', True),
+            'SATELLITE_TRACK__LABEL_LIMIT'         : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('LABEL_LIMIT', 10),
+            'SATELLITE_TRACK__SAT_LABEL_TEMPLATE'  : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('SAT_LABEL_TEMPLATE', '{label:s} {alt:0.1f}\u00b0 {dir:s}'),
+            'SATELLITE_TRACK__IMAGE_LABEL_TEMPLATE_PREFIX' : self.indi_allsky_config.get('SATELLITE_TRACK', {}).get('IMAGE_LABEL_TEMPLATE_PREFIX', '# xy:-15,200 (Right)\n# anchor:ra (Right Justified)\n# color:200,200,200\nSatellites'),
+            'RELOAD_ON_SAVE'                 : False,
+            'CONFIG_NOTE'                    : '',
+            'ENCRYPT_PASSWORDS'              : self.indi_allsky_config.get('ENCRYPT_PASSWORDS', False),  # do not adjust
+        }
+
+
+        # ADU_ROI
+        ADU_ROI = self.indi_allsky_config.get('ADU_ROI', [])
+        if ADU_ROI is None:
+            ADU_ROI = []
+        elif isinstance(ADU_ROI, bool):
+            ADU_ROI = []
+
+        try:
+            form_data['ADU_ROI_X1'] = ADU_ROI[0]
+        except IndexError:
+            form_data['ADU_ROI_X1'] = 0
+
+        try:
+            form_data['ADU_ROI_Y1'] = ADU_ROI[1]
+        except IndexError:
+            form_data['ADU_ROI_Y1'] = 0
+
+        try:
+            form_data['ADU_ROI_X2'] = ADU_ROI[2]
+        except IndexError:
+            form_data['ADU_ROI_X2'] = 0
+
+        try:
+            form_data['ADU_ROI_Y2'] = ADU_ROI[3]
+        except IndexError:
+            form_data['ADU_ROI_Y2'] = 0
+
+
+        # SQM_ROI
+        SQM_ROI = self.indi_allsky_config.get('SQM_ROI', [])
+        if SQM_ROI is None:
+            SQM_ROI = []
+        elif isinstance(SQM_ROI, bool):
+            SQM_ROI = []
+
+        try:
+            form_data['SQM_ROI_X1'] = SQM_ROI[0]
+        except IndexError:
+            form_data['SQM_ROI_X1'] = 0
+
+        try:
+            form_data['SQM_ROI_Y1'] = SQM_ROI[1]
+        except IndexError:
+            form_data['SQM_ROI_Y1'] = 0
+
+        try:
+            form_data['SQM_ROI_X2'] = SQM_ROI[2]
+        except IndexError:
+            form_data['SQM_ROI_X2'] = 0
+
+        try:
+            form_data['SQM_ROI_Y2'] = SQM_ROI[3]
+        except IndexError:
+            form_data['SQM_ROI_Y2'] = 0
+
+
+        # IMAGE_CROP_ROI
+        IMAGE_CROP_ROI = self.indi_allsky_config.get('IMAGE_CROP_ROI', [])
+        if IMAGE_CROP_ROI is None:
+            IMAGE_CROP_ROI = []
+        elif isinstance(IMAGE_CROP_ROI, bool):
+            IMAGE_CROP_ROI = []
+
+        try:
+            form_data['IMAGE_CROP_ROI_X1'] = IMAGE_CROP_ROI[0]
+        except IndexError:
+            form_data['IMAGE_CROP_ROI_X1'] = 0
+
+        try:
+            form_data['IMAGE_CROP_ROI_Y1'] = IMAGE_CROP_ROI[1]
+        except IndexError:
+            form_data['IMAGE_CROP_ROI_Y1'] = 0
+
+        try:
+            form_data['IMAGE_CROP_ROI_X2'] = IMAGE_CROP_ROI[2]
+        except IndexError:
+            form_data['IMAGE_CROP_ROI_X2'] = 0
+
+        try:
+            form_data['IMAGE_CROP_ROI_Y2'] = IMAGE_CROP_ROI[3]
+        except IndexError:
+            form_data['IMAGE_CROP_ROI_Y2'] = 0
+
+
+        # Font color
+        text_properties__font_color = self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_COLOR', [200, 200, 200])
+        form_data['TEXT_PROPERTIES__FONT_COLOR'] = ','.join([str(x) for x in text_properties__font_color])
+
+        # Cardinal directions color
+        cardinal_dirs__font_color = self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('FONT_COLOR', [200, 0, 0])
+        form_data['CARDINAL_DIRS__FONT_COLOR'] = ','.join([str(x) for x in cardinal_dirs__font_color])
+
+        # Sun orb color
+        orb_properties__sun_color = self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('SUN_COLOR', [200, 200, 100])
+        form_data['ORB_PROPERTIES__SUN_COLOR'] = ','.join([str(x) for x in orb_properties__sun_color])
+
+        # Moon orb color
+        orb_properties__moon_color = self.indi_allsky_config.get('ORB_PROPERTIES', {}).get('MOON_COLOR', [128, 128, 128])
+        form_data['ORB_PROPERTIES__MOON_COLOR'] = ','.join([str(x) for x in orb_properties__moon_color])
+
+        # Border color
+        image_border__color = self.indi_allsky_config.get('IMAGE_BORDER', {}).get('COLOR', [0, 0, 0])
+        form_data['IMAGE_BORDER__COLOR'] = ','.join([str(x) for x in image_border__color])
+
+        # Lightgraph colors
+        lightgraph_overlay__day_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('DAY_COLOR', [150, 150, 150])
+        form_data['LIGHTGRAPH_OVERLAY__DAY_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__day_color])
+
+        lightgraph_overlay__dusk_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('DUSK_COLOR', [200, 100, 60])
+        form_data['LIGHTGRAPH_OVERLAY__DUSK_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__dusk_color])
+
+        lightgraph_overlay__night_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NIGHT_COLOR', [30, 30, 30])
+        form_data['LIGHTGRAPH_OVERLAY__NIGHT_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__night_color])
+
+        lightgraph_overlay__moonmode_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('MOONMODE_COLOR', [50, 50, 50])
+        form_data['LIGHTGRAPH_OVERLAY__MOONMODE_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__moonmode_color])
+
+        lightgraph_overlay__hour_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('HOUR_COLOR', [100, 15, 15])
+        form_data['LIGHTGRAPH_OVERLAY__HOUR_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__hour_color])
+
+        lightgraph_overlay__border_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('BORDER_COLOR', [1, 1, 1])
+        form_data['LIGHTGRAPH_OVERLAY__BORDER_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__border_color])
+
+        lightgraph_overlay__now_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NOW_COLOR', [120, 120, 200])
+        form_data['LIGHTGRAPH_OVERLAY__NOW_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__now_color])
+
+        lightgraph_overlay__font_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('FONT_COLOR', [150, 150, 150])
+        form_data['LIGHTGRAPH_OVERLAY__FONT_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__font_color])
+
+
+        # Youtube
+        youtube_tags = self.indi_allsky_config.get('YOUTUBE', {}).get('TAGS', [])
+        form_data['YOUTUBE__TAGS_STR'] = ', '.join(youtube_tags)
+
+        form_data['YOUTUBE__REDIRECT_URI'] = url_for('indi_allsky.youtube_oauth2callback_view', _external=True)
+
+        try:
+            self._miscDb.getState('YOUTUBE_CREDENTIALS')
+            form_data['YOUTUBE__CREDS_STORED'] = True
+        except NoResultFound:
+            form_data['YOUTUBE__CREDS_STORED'] = False
+        except InvalidToken:
+            app.logger.error('Invalid Fernet decryption key')
+            form_data['YOUTUBE__CREDS_STORED'] = False
+        except ValueError as e:
+            app.logger.error('Invalid Fernet decryption key: %s', str(e))
+            form_data['YOUTUBE__CREDS_STORED'] = False
+
+
+        # FITS headers
+        fitsheaders = self.indi_allsky_config.get('FITSHEADERS', [])
+
+        try:
+            form_data['FITSHEADERS__0__KEY'] = str(fitsheaders[0][0]).upper()
+            form_data['FITSHEADERS__0__VAL'] = str(fitsheaders[0][1])
+        except IndexError:
+            form_data['FITSHEADERS__0__KEY'] = 'INSTRUME'
+            form_data['FITSHEADERS__0__VAL'] = 'indi-allsky'
+
+        try:
+            form_data['FITSHEADERS__1__KEY'] = str(fitsheaders[1][0]).upper()
+            form_data['FITSHEADERS__1__VAL'] = str(fitsheaders[1][1])
+        except IndexError:
+            form_data['FITSHEADERS__1__KEY'] = 'OBSERVER'
+            form_data['FITSHEADERS__1__VAL'] = ''
+
+        try:
+            form_data['FITSHEADERS__2__KEY'] = str(fitsheaders[2][0]).upper()
+            form_data['FITSHEADERS__2__VAL'] = str(fitsheaders[2][1])
+        except IndexError:
+            form_data['FITSHEADERS__2__KEY'] = 'SITE'
+            form_data['FITSHEADERS__2__VAL'] = ''
+
+        try:
+            form_data['FITSHEADERS__3__KEY'] = str(fitsheaders[3][0]).upper()
+            form_data['FITSHEADERS__3__VAL'] = str(fitsheaders[3][1])
+        except IndexError:
+            form_data['FITSHEADERS__3__KEY'] = 'OBJECT'
+            form_data['FITSHEADERS__3__VAL'] = ''
+
+        try:
+            form_data['FITSHEADERS__4__KEY'] = str(fitsheaders[4][0]).upper()
+            form_data['FITSHEADERS__4__VAL'] = str(fitsheaders[4][1])
+        except IndexError:
+            form_data['FITSHEADERS__4__KEY'] = 'NOTES'
+            form_data['FITSHEADERS__4__VAL'] = ''
+
+
+        # libcurl options as json text
+        filetransfer__libcurl_options = self.indi_allsky_config.get('FILETRANSFER', {}).get('LIBCURL_OPTIONS', {'VERBOSE' : 0})
+        form_data['FILETRANSFER__LIBCURL_OPTIONS'] = json.dumps(filetransfer__libcurl_options, indent=4)
+
+
+        # INDI config as json text
+        indi_config_defaults = self.indi_allsky_config.get('INDI_CONFIG_DEFAULTS', {})
+        form_data['INDI_CONFIG_DEFAULTS'] = json.dumps(indi_config_defaults, indent=4)
+
+        indi_config_day = self.indi_allsky_config.get('INDI_CONFIG_DAY', {})
+        form_data['INDI_CONFIG_DAY'] = json.dumps(indi_config_day, indent=4)
+
+
+        # populated from flask config
+        network_list = list()
+
+        network_list.extend(app.config.get('ADMIN_NETWORKS', []))
+
+        net_info = psutil.net_if_addrs()
+        for dev, addr_info in net_info.items():
+            if dev == 'lo':
+                # skip loopback
+                continue
+
+            for addr in addr_info:
+                if addr.family == socket.AF_INET:  # 2
+                    cidr = ipaddress.IPv4Network('0.0.0.0/{0:s}'.format(addr.netmask)).prefixlen
+                    network_cidr = '{0:s}/{1:d}'.format(addr.address, cidr)
+                elif addr.family == socket.AF_INET6:  # 10
+                    network_cidr = '{0:s}/{1:d}'.format(addr.address, 64)  # assume /64 for ipv6
+                elif addr.family == socket.AF_PACKET:  # 17
+                    continue
+                else:
+                    #app.logger.error('Unknown address family: %d', addr.family)
+                    continue
+
+
+                try:
+                    network = ipaddress.ip_network(network_cidr, strict=False)
+                    network_list.append('{0:s} [{1:s}]'.format(str(network), dev))
+                except ValueError:
+                    app.logger.error('Invalid network: %s', network_cidr)
+                    continue
+
+
+        admin_network_text = '\n'.join(network_list)
+        form_data['ADMIN_NETWORKS_FLASK'] = admin_network_text
+
+        context['form_config'] = IndiAllskyConfigForm(data=form_data)
+
+        # --- SHT4x last-regen timestamp (read-only display) ---
+        # Reads the same state file the sensor driver writes. The web process
+        # and sensor process share the disk, so this works when both run on the
+        # same host. Best-effort: any failure just shows "never / unknown".
+        context['sht4x_regen_last'] = self._get_sht4x_regen_last()
+
+        return context
+
+
+    def _get_sht4x_regen_last(self):
+        import os
+        import datetime
+
+        temp_sensor_config = self.indi_allsky_config.get('TEMP_SENSOR', {})
+
+        # the driver keys the state file by the sensor's i2c address. check the
+        # configured SHT4x slots (A..) for an i2c address to build the path.
+        state_dir = self.indi_allsky_config.get('IMAGE_FOLDER', '/var/tmp')
+
+        candidates = []
+        for slot in ('A', 'B', 'C', 'D', 'E'):
+            classname = temp_sensor_config.get('{0:s}_CLASSNAME'.format(slot), '')
+            if 'Sht4x' in classname or 'SHT4X' in classname.upper():
+                addr = temp_sensor_config.get('{0:s}_I2C_ADDRESS'.format(slot), '')
+                if addr:
+                    candidates.append(
+                        os.path.join(state_dir, '.sht4x_regen_{0:s}.ts'.format(addr.replace('0x', ''))))
+
+        # also try a default address file in case the slot lookup misses
+        candidates.append(os.path.join(state_dir, '.sht4x_regen_44.ts'))
+
+        for path in candidates:
+            try:
+                with open(path, 'r') as f:
+                    ts = float(f.read().strip())
+                dt = datetime.datetime.fromtimestamp(ts)
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+
+        return 'never / unknown'
+
+
+class AjaxConfigView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        form_config = IndiAllskyConfigForm(data=request.json)
+
+
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                form_errors = form_config.errors  # this must be a property
+                form_errors['form_global'] = ['You do not have permission to make configuration changes']
+                return jsonify(form_errors), 400
+
+
+        if not form_config.validate():
+            form_errors = form_config.errors  # this must be a property
+            form_errors['form_global'] = ['Please fix the errors above']
+            return jsonify(form_errors), 400
+
+
+        # form passed validation
+
+        if request.json.get('IMAGE_ASI676MC_REPAIR__ENABLE') and not _visible_asi676mc_cameras():
+            form_errors = {
+                'IMAGE_ASI676MC_REPAIR__ENABLE' : [
+                    'No local ASI676MC is available. Connect or select the '
+                    'camera, reload Image Settings, and try again.',
+                ],
+                'form_global' : [
+                    'Connect or select an ASI676MC, reload Image Settings, and '
+                    'then enable purple-frame handling.',
+                ],
+            }
+            return jsonify(form_errors), 400
+
+        if not self.indi_allsky_config:
+            return jsonify({}), 400
+
+
+        # sanity check
+        leaf_list = (
+            'WEBSITE',
+            'CCD_CONFIG',
+            'CAMERA_SQM',
+            'IMAGE_FILE_COMPRESSION',
+            'IMAGE_CIRCLE_MASK',
+            'FISH2PANO',
+            'TEXT_PROPERTIES',
+            'CARDINAL_DIRS',
+            'IMAGE_STRETCH',
+            'ORB_PROPERTIES',
+            'IMAGE_BORDER',
+            'FILETRANSFER',
+            'S3UPLOAD',
+            'MQTTPUBLISH',
+            'SYNCAPI',
+            'YOUTUBE',
+            'LIBCAMERA',
+            'PYCURL_CAMERA',
+            'ACCUM_CAMERA',
+            'TEST_CAMERA',
+            'VIRTUALSKY',
+            'CIRCULAR_DISPLAY',
+            'FOCUSER',
+            'DEW_HEATER',
+            'FAN',
+            'GENERIC_GPIO',
+            'MANUAL_GPIO',
+            'DEVICE',
+            'TEMP_SENSOR',
+            'THUMBNAILS',
+            'HEALTHCHECK',
+            'CHARTS',
+            'TIMELAPSE',
+            'MOON_OVERLAY',
+            'LIGHTGRAPH_OVERLAY',
+            'IMAGE_OVERLAY',
+            'ADSB',
+            'SATELLITE_TRACK',
+            'LONGTERM_KEOGRAM',
+            'REALTIME_KEOGRAM',
+            'STARTRAILS',
+        )
+
+        for leaf in leaf_list:
+            if not isinstance(self.indi_allsky_config.get(leaf), dict):
+                self.indi_allsky_config[leaf] = dict()
+
+
+        if not self.indi_allsky_config['CCD_CONFIG'].get('NIGHT'):
+            self.indi_allsky_config['CCD_CONFIG']['NIGHT'] = {}
+
+        if not self.indi_allsky_config['CCD_CONFIG'].get('MOONMODE'):
+            self.indi_allsky_config['CCD_CONFIG']['MOONMODE'] = {}
+
+        if not self.indi_allsky_config['CCD_CONFIG'].get('DAY'):
+            self.indi_allsky_config['CCD_CONFIG']['DAY'] = {}
+
+
+        if not self.indi_allsky_config.get('FITSHEADERS'):
+            self.indi_allsky_config['FITSHEADERS'] = [['', ''], ['', ''], ['', ''], ['', ''], ['', '']]
+
+
+        # update data
+        self.indi_allsky_config['CAMERA_INTERFACE']                     = str(request.json['CAMERA_INTERFACE'])
+        self.indi_allsky_config['INDI_SERVER']                          = str(request.json['INDI_SERVER'])
+        self.indi_allsky_config['INDI_PORT']                            = int(request.json['INDI_PORT'])
+        self.indi_allsky_config['INDI_CAMERA_NAME']                     = str(request.json['INDI_CAMERA_NAME'])
+        self.indi_allsky_config['WEBSITE']['TITLE']                     = str(request.json['WEBSITE__TITLE'])
+        self.indi_allsky_config['OWNER']                                = str(request.json['OWNER'])
+        self.indi_allsky_config['LENS_NAME']                            = str(request.json['LENS_NAME'])
+        self.indi_allsky_config['LENS_FOCAL_LENGTH']                    = float(request.json['LENS_FOCAL_LENGTH'])
+        self.indi_allsky_config['LENS_FOCAL_RATIO']                     = float(request.json['LENS_FOCAL_RATIO'])
+        self.indi_allsky_config['LENS_IMAGE_CIRCLE']                    = int(request.json['LENS_IMAGE_CIRCLE'])
+        self.indi_allsky_config['LENS_OFFSET_X']                        = int(request.json['LENS_OFFSET_X'])
+        self.indi_allsky_config['LENS_OFFSET_Y']                        = int(request.json['LENS_OFFSET_Y'])
+        self.indi_allsky_config['LENS_ALTITUDE']                        = float(request.json['LENS_ALTITUDE'])
+        self.indi_allsky_config['LENS_AZIMUTH']                         = float(request.json['LENS_AZIMUTH'])
+        self.indi_allsky_config['CCD_CONFIG']['NIGHT']['GAIN']          = float(round(float(request.json['CCD_CONFIG__NIGHT__GAIN']), 3))  # limit to 3 decimals
+        self.indi_allsky_config['CCD_CONFIG']['NIGHT']['BINNING']       = int(request.json['CCD_CONFIG__NIGHT__BINNING'])
+        self.indi_allsky_config['CCD_CONFIG']['MOONMODE']['GAIN']       = float(round(float(request.json['CCD_CONFIG__MOONMODE__GAIN']), 3))  # limit to 3 decimals
+        self.indi_allsky_config['CCD_CONFIG']['MOONMODE']['BINNING']    = int(request.json['CCD_CONFIG__MOONMODE__BINNING'])
+        self.indi_allsky_config['CCD_CONFIG']['DAY']['GAIN']            = float(round(float(request.json['CCD_CONFIG__DAY__GAIN']), 3))  # limit to 3 decimals
+        self.indi_allsky_config['CCD_CONFIG']['DAY']['BINNING']         = int(request.json['CCD_CONFIG__DAY__BINNING'])
+        self.indi_allsky_config['CCD_CONFIG']['EXPOSURE_CLASSNAME']     = str(request.json['CCD_CONFIG__EXPOSURE_CLASSNAME'])
+        self.indi_allsky_config['CCD_CONFIG']['AUTO_GAIN_LEVELS']       = int(request.json['CCD_CONFIG__AUTO_GAIN_LEVELS'])
+        self.indi_allsky_config['CCD_EXPOSURE_MAX']                     = float(round(float(request.json['CCD_EXPOSURE_MAX']), 6))
+        self.indi_allsky_config['CCD_EXPOSURE_DEF']                     = float(round(float(request.json['CCD_EXPOSURE_DEF']), 6))
+        self.indi_allsky_config['CCD_EXPOSURE_MIN']                     = float(round(float(request.json['CCD_EXPOSURE_MIN']), 6))
+        self.indi_allsky_config['CCD_EXPOSURE_MIN_DAY']                 = float(round(float(request.json['CCD_EXPOSURE_MIN_DAY']), 6))
+        self.indi_allsky_config['CCD_EXPOSURE_TIMEOUT']                 = int(request.json['CCD_EXPOSURE_TIMEOUT'])
+        self.indi_allsky_config['CCD_BIT_DEPTH']                        = int(request.json['CCD_BIT_DEPTH'])
+        self.indi_allsky_config['EXPOSURE_PERIOD']                      = float(request.json['EXPOSURE_PERIOD'])
+        self.indi_allsky_config['EXPOSURE_PERIOD_DAY']                  = float(request.json['EXPOSURE_PERIOD_DAY'])
+        self.indi_allsky_config['CAMERA_SQM']['ENABLE']                 = bool(request.json['CAMERA_SQM__ENABLE'])
+        self.indi_allsky_config['CAMERA_SQM']['ENABLE_DAY']             = bool(request.json['CAMERA_SQM__ENABLE_DAY'])
+        self.indi_allsky_config['CAMERA_SQM']['EXPOSURE']               = float(round(float(request.json['CAMERA_SQM__EXPOSURE']), 6))
+        self.indi_allsky_config['CAMERA_SQM']['GAIN']                   = float(round(float(request.json['CAMERA_SQM__GAIN']), 3))  # limit to 3 decimals
+        self.indi_allsky_config['CAMERA_SQM']['BINNING']                = int(request.json['CAMERA_SQM__BINNING'])
+        self.indi_allsky_config['CAMERA_SQM']['EXPOSURE_PERIOD']        = int(request.json['CAMERA_SQM__EXPOSURE_PERIOD'])
+        self.indi_allsky_config['CAMERA_SQM']['MAGNITUDE_OFFSET']       = float(request.json['CAMERA_SQM__MAGNITUDE_OFFSET'])
+        self.indi_allsky_config['FOCUS_MODE']                           = bool(request.json['FOCUS_MODE'])
+        self.indi_allsky_config['FOCUS_DELAY']                          = float(request.json['FOCUS_DELAY'])
+        self.indi_allsky_config['CFA_PATTERN']                          = str(request.json['CFA_PATTERN'])
+        self.indi_allsky_config['USE_NIGHT_COLOR']                      = bool(request.json['USE_NIGHT_COLOR'])
+        self.indi_allsky_config['SCNR_ALGORITHM']                       = str(request.json['SCNR_ALGORITHM'])
+        self.indi_allsky_config['SCNR_ALGORITHM_DAY']                   = str(request.json['SCNR_ALGORITHM_DAY'])
+        self.indi_allsky_config['SCNR_MTF_MIDTONES']                    = float(request.json['SCNR_MTF_MIDTONES'])
+        self.indi_allsky_config['SCNR_MTF_MIDTONES_DAY']                = float(request.json['SCNR_MTF_MIDTONES_DAY'])
+        self.indi_allsky_config['IMAGE_DENOISE']                        = str(request.json['IMAGE_DENOISE'])
+        self.indi_allsky_config['IMAGE_DENOISE_DAY']                    = str(request.json['IMAGE_DENOISE_DAY'])
+        self.indi_allsky_config['IMAGE_DENOISE_STRENGTH']               = int(request.json['IMAGE_DENOISE_STRENGTH'])
+        self.indi_allsky_config['IMAGE_DENOISE_STRENGTH_DAY']           = int(request.json['IMAGE_DENOISE_STRENGTH_DAY'])
+        self.indi_allsky_config['BILATERAL_SIGMA_COLOR']                = int(request.json['BILATERAL_SIGMA_COLOR'])
+        self.indi_allsky_config['BILATERAL_SIGMA_COLOR_DAY']            = int(request.json['BILATERAL_SIGMA_COLOR_DAY'])
+        self.indi_allsky_config['BILATERAL_SIGMA_SPACE']                = int(request.json['BILATERAL_SIGMA_SPACE'])
+        self.indi_allsky_config['BILATERAL_SIGMA_SPACE_DAY']            = int(request.json['BILATERAL_SIGMA_SPACE_DAY'])
+        self.indi_allsky_config['WBR_FACTOR']                           = float(request.json['WBR_FACTOR'])
+        self.indi_allsky_config['WBG_FACTOR']                           = float(request.json['WBG_FACTOR'])
+        self.indi_allsky_config['WBB_FACTOR']                           = float(request.json['WBB_FACTOR'])
+        self.indi_allsky_config['WBR_FACTOR_DAY']                       = float(request.json['WBR_FACTOR_DAY'])
+        self.indi_allsky_config['WBG_FACTOR_DAY']                       = float(request.json['WBG_FACTOR_DAY'])
+        self.indi_allsky_config['WBB_FACTOR_DAY']                       = float(request.json['WBB_FACTOR_DAY'])
+        self.indi_allsky_config['WBR_MTF_MIDTONES']                     = float(request.json['WBR_MTF_MIDTONES'])
+        self.indi_allsky_config['WBG_MTF_MIDTONES']                     = float(request.json['WBG_MTF_MIDTONES'])
+        self.indi_allsky_config['WBB_MTF_MIDTONES']                     = float(request.json['WBB_MTF_MIDTONES'])
+        self.indi_allsky_config['WBR_MTF_MIDTONES_DAY']                 = float(request.json['WBR_MTF_MIDTONES_DAY'])
+        self.indi_allsky_config['WBG_MTF_MIDTONES_DAY']                 = float(request.json['WBG_MTF_MIDTONES_DAY'])
+        self.indi_allsky_config['WBB_MTF_MIDTONES_DAY']                 = float(request.json['WBB_MTF_MIDTONES_DAY'])
+        self.indi_allsky_config['SATURATION_FACTOR']                    = float(request.json['SATURATION_FACTOR'])
+        self.indi_allsky_config['SATURATION_FACTOR_DAY']                = float(request.json['SATURATION_FACTOR_DAY'])
+        self.indi_allsky_config['GAMMA_CORRECTION']                     = float(request.json['GAMMA_CORRECTION'])
+        self.indi_allsky_config['GAMMA_CORRECTION_DAY']                 = float(request.json['GAMMA_CORRECTION_DAY'])
+        self.indi_allsky_config['SHARPEN_AMOUNT']                       = float(request.json['SHARPEN_AMOUNT'])
+        self.indi_allsky_config['SHARPEN_AMOUNT_DAY']                   = float(request.json['SHARPEN_AMOUNT_DAY'])
+        self.indi_allsky_config['CCD_COOLING']                          = bool(request.json['CCD_COOLING'])
+        self.indi_allsky_config['CCD_COOLING_DAY']                      = bool(request.json['CCD_COOLING_DAY'])
+        self.indi_allsky_config['CCD_TEMP']                             = float(request.json['CCD_TEMP'])
+        self.indi_allsky_config['CCD_TEMP_DAY']                         = float(request.json['CCD_TEMP_DAY'])
+        self.indi_allsky_config['AUTO_WB']                              = bool(request.json['AUTO_WB'])
+        self.indi_allsky_config['AUTO_WB_DAY']                          = bool(request.json['AUTO_WB_DAY'])
+        self.indi_allsky_config['TEMP_DISPLAY']                         = str(request.json['TEMP_DISPLAY'])
+        self.indi_allsky_config['PRESSURE_DISPLAY']                     = str(request.json['PRESSURE_DISPLAY'])
+        self.indi_allsky_config['WINDSPEED_DISPLAY']                    = str(request.json['WINDSPEED_DISPLAY'])
+        self.indi_allsky_config['GPS_ENABLE']                           = bool(request.json['GPS_ENABLE'])
+        self.indi_allsky_config['CCD_TEMP_SCRIPT']                      = str(request.json['CCD_TEMP_SCRIPT'])
+        self.indi_allsky_config['TARGET_ADU']                           = int(request.json['TARGET_ADU'])
+        self.indi_allsky_config['TARGET_ADU_DAY']                       = int(request.json['TARGET_ADU_DAY'])
+        self.indi_allsky_config['TARGET_ADU_DEV']                       = int(request.json['TARGET_ADU_DEV'])
+        self.indi_allsky_config['TARGET_ADU_DEV_DAY']                   = int(request.json['TARGET_ADU_DEV_DAY'])
+        self.indi_allsky_config['ADU_FOV_DIV']                          = int(request.json['ADU_FOV_DIV'])
+        self.indi_allsky_config['SQM_FOV_DIV']                          = int(request.json['SQM_FOV_DIV'])
+        self.indi_allsky_config['DETECT_STARS']                         = bool(request.json['DETECT_STARS'])
+        self.indi_allsky_config['DETECT_STARS_THOLD']                   = float(request.json['DETECT_STARS_THOLD'])
+        self.indi_allsky_config['DETECT_STARS_METHOD']                  = str(request.json['DETECT_STARS_METHOD'])
+        self.indi_allsky_config['DETECT_STARS_SEP_THOLD']               = float(request.json['DETECT_STARS_SEP_THOLD'])
+        self.indi_allsky_config['DETECT_STARS_SEP_MAX_RADIUS']          = int(request.json['DETECT_STARS_SEP_MAX_RADIUS'])
+        self.indi_allsky_config['DETECT_METEORS']                       = bool(request.json['DETECT_METEORS'])
+        self.indi_allsky_config['DETECT_METEORS_THOLD']                 = int(request.json['DETECT_METEORS_THOLD'])
+        self.indi_allsky_config['DETECT_MASK']                          = str(request.json['DETECT_MASK'])
+        self.indi_allsky_config['DETECT_DRAW']                          = bool(request.json['DETECT_DRAW'])
+        self.indi_allsky_config['LOGO_OVERLAY']                         = str(request.json['LOGO_OVERLAY'])
+        self.indi_allsky_config['HEALTHCHECK']['DISK_USAGE']            = float(request.json['HEALTHCHECK__DISK_USAGE'])
+        self.indi_allsky_config['HEALTHCHECK']['SWAP_USAGE']            = float(request.json['HEALTHCHECK__SWAP_USAGE'])
+        self.indi_allsky_config['LOCATION_NAME']                        = str(request.json['LOCATION_NAME'])
+        self.indi_allsky_config['LOCATION_LATITUDE']                    = float(round(float(request.json['LOCATION_LATITUDE']), 3))
+        self.indi_allsky_config['LOCATION_LONGITUDE']                   = float(round(float(request.json['LOCATION_LONGITUDE']), 3))
+        self.indi_allsky_config['LOCATION_ELEVATION']                   = int(request.json['LOCATION_ELEVATION'])
+        self.indi_allsky_config['TIMELAPSE_ENABLE']                     = bool(request.json['TIMELAPSE_ENABLE'])
+        self.indi_allsky_config['TIMELAPSE_SKIP_FRAMES']                = int(request.json['TIMELAPSE_SKIP_FRAMES'])
+        self.indi_allsky_config['TIMELAPSE']['PRE_PROCESSOR']           = str(request.json['TIMELAPSE__PRE_PROCESSOR'])
+        self.indi_allsky_config['TIMELAPSE']['PRE_PROCESSOR_DAY']       = str(request.json['TIMELAPSE__PRE_PROCESSOR_DAY'])
+        self.indi_allsky_config['TIMELAPSE']['IMAGE_CIRCLE']            = int(request.json['TIMELAPSE__IMAGE_CIRCLE'])
+        self.indi_allsky_config['TIMELAPSE']['KEOGRAM_RATIO']           = float(request.json['TIMELAPSE__KEOGRAM_RATIO'])
+        self.indi_allsky_config['TIMELAPSE']['PRE_SCALE']               = int(request.json['TIMELAPSE__PRE_SCALE'])
+        self.indi_allsky_config['TIMELAPSE']['FFMPEG_REPORT']           = bool(request.json['TIMELAPSE__FFMPEG_REPORT'])
+        self.indi_allsky_config['TIMELAPSE']['USE_NIGHT_CONFIG']        = bool(request.json['TIMELAPSE__USE_NIGHT_CONFIG'])
+        self.indi_allsky_config['CAPTURE_PAUSE']                        = bool(request.json['CAPTURE_PAUSE'])
+        self.indi_allsky_config['DAYTIME_CAPTURE']                      = bool(request.json['DAYTIME_CAPTURE'])
+        self.indi_allsky_config['DAYTIME_CAPTURE_SAVE']                 = bool(request.json['DAYTIME_CAPTURE_SAVE'])
+        self.indi_allsky_config['DAYTIME_TIMELAPSE']                    = bool(request.json['DAYTIME_TIMELAPSE'])
+        self.indi_allsky_config['DAYTIME_CONTRAST_ENHANCE']             = bool(request.json['DAYTIME_CONTRAST_ENHANCE'])
+        self.indi_allsky_config['NIGHT_CONTRAST_ENHANCE']               = bool(request.json['NIGHT_CONTRAST_ENHANCE'])
+        self.indi_allsky_config['CONTRAST_ENHANCE_16BIT']               = bool(request.json['CONTRAST_ENHANCE_16BIT'])
+        self.indi_allsky_config['CLAHE_CLIPLIMIT']                      = float(request.json['CLAHE_CLIPLIMIT'])
+        self.indi_allsky_config['CLAHE_GRIDSIZE']                       = int(request.json['CLAHE_GRIDSIZE'])
+        self.indi_allsky_config['NIGHT_SUN_ALT_DEG']                    = float(request.json['NIGHT_SUN_ALT_DEG'])
+        self.indi_allsky_config['NIGHT_MOONMODE_ALT_DEG']               = float(request.json['NIGHT_MOONMODE_ALT_DEG'])
+        self.indi_allsky_config['NIGHT_MOONMODE_PHASE']                 = float(request.json['NIGHT_MOONMODE_PHASE'])
+        self.indi_allsky_config['WEB_STATUS_TEMPLATE']                  = str(request.json['WEB_STATUS_TEMPLATE'])
+        self.indi_allsky_config['WEB_EXTRA_TEXT']                       = str(request.json['WEB_EXTRA_TEXT'])
+        self.indi_allsky_config['WEBSOCKET_API_KEY']                    = str(request.json.get('WEBSOCKET_API_KEY', '')).strip()
+        app.config['WEBSOCKET_API_KEY']                                 = self.indi_allsky_config['WEBSOCKET_API_KEY']
+        self.indi_allsky_config['WEB_NONLOCAL_IMAGES']                  = bool(request.json['WEB_NONLOCAL_IMAGES'])
+        self.indi_allsky_config['WEB_LOCAL_IMAGES_ADMIN']               = bool(request.json['WEB_LOCAL_IMAGES_ADMIN'])
+        self.indi_allsky_config['IMAGE_STRETCH']['CLASSNAME']           = str(request.json['IMAGE_STRETCH__CLASSNAME'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE1_GAMMA']         = float(request.json['IMAGE_STRETCH__MODE1_GAMMA'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE1_STDDEVS']       = float(request.json['IMAGE_STRETCH__MODE1_STDDEVS'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE2_SHADOWS']       = float(request.json['IMAGE_STRETCH__MODE2_SHADOWS'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE2_MIDTONES']      = float(request.json['IMAGE_STRETCH__MODE2_MIDTONES'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE2_HIGHLIGHTS']    = float(request.json['IMAGE_STRETCH__MODE2_HIGHLIGHTS'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE3_BLACK_CLIP']    = float(request.json['IMAGE_STRETCH__MODE3_BLACK_CLIP'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE3_SHADOWS']       = float(request.json['IMAGE_STRETCH__MODE3_SHADOWS'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE3_MIDTONES']      = float(request.json['IMAGE_STRETCH__MODE3_MIDTONES'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MODE3_HIGHLIGHTS']    = float(request.json['IMAGE_STRETCH__MODE3_HIGHLIGHTS'])
+        self.indi_allsky_config['IMAGE_STRETCH']['SPLIT']               = bool(request.json['IMAGE_STRETCH__SPLIT'])
+        self.indi_allsky_config['IMAGE_STRETCH']['MOONMODE']            = bool(request.json['IMAGE_STRETCH__MOONMODE'])
+        self.indi_allsky_config['IMAGE_STRETCH']['DAYTIME']             = bool(request.json['IMAGE_STRETCH__DAYTIME'])
+        self.indi_allsky_config['KEOGRAM_ANGLE']                        = float(request.json['KEOGRAM_ANGLE'])
+        self.indi_allsky_config['KEOGRAM_H_SCALE']                      = int(request.json['KEOGRAM_H_SCALE'])
+        self.indi_allsky_config['KEOGRAM_V_SCALE']                      = int(request.json['KEOGRAM_V_SCALE'])
+        self.indi_allsky_config['KEOGRAM_CROP_TOP']                     = int(request.json['KEOGRAM_CROP_TOP'])
+        self.indi_allsky_config['KEOGRAM_CROP_BOTTOM']                  = int(request.json['KEOGRAM_CROP_BOTTOM'])
+        self.indi_allsky_config['KEOGRAM_LABEL']                        = bool(request.json['KEOGRAM_LABEL'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['ENABLE']           = bool(request.json['LONGTERM_KEOGRAM__ENABLE'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['OFFSET_X']         = int(request.json['LONGTERM_KEOGRAM__OFFSET_X'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['OFFSET_Y']         = int(request.json['LONGTERM_KEOGRAM__OFFSET_Y'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['OPENCV_FONT_SCALE']    = float(request.json['LONGTERM_KEOGRAM__OPENCV_FONT_SCALE'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['PIL_FONT_SIZE']        = int(request.json['LONGTERM_KEOGRAM__PIL_FONT_SIZE'])
+        self.indi_allsky_config['LONGTERM_KEOGRAM']['MONTH_LABEL_TEMPLATE'] = str(request.json['LONGTERM_KEOGRAM__MONTH_LABEL_TEMPLATE'])
+        self.indi_allsky_config['REALTIME_KEOGRAM']['MAX_ENTRIES']      = int(request.json['REALTIME_KEOGRAM__MAX_ENTRIES'])
+        self.indi_allsky_config['REALTIME_KEOGRAM']['SAVE_INTERVAL']    = int(request.json['REALTIME_KEOGRAM__SAVE_INTERVAL'])
+        self.indi_allsky_config['REALTIME_KEOGRAM']['LABEL']            = bool(request.json['REALTIME_KEOGRAM__LABEL'])
+        self.indi_allsky_config['STARTRAILS_SUN_ALT_THOLD']             = float(request.json['STARTRAILS_SUN_ALT_THOLD'])
+        self.indi_allsky_config['STARTRAILS_MOONMODE_THOLD']            = bool(request.json['STARTRAILS_MOONMODE_THOLD'])
+        self.indi_allsky_config['STARTRAILS_MOON_ALT_THOLD']            = float(request.json['STARTRAILS_MOON_ALT_THOLD'])
+        self.indi_allsky_config['STARTRAILS_MOON_PHASE_THOLD']          = float(request.json['STARTRAILS_MOON_PHASE_THOLD'])
+        self.indi_allsky_config['STARTRAILS_MAX_ADU']                   = int(request.json['STARTRAILS_MAX_ADU'])
+        self.indi_allsky_config['STARTRAILS_MASK_THOLD']                = int(request.json['STARTRAILS_MASK_THOLD'])
+        self.indi_allsky_config['STARTRAILS_PIXEL_THOLD']               = float(request.json['STARTRAILS_PIXEL_THOLD'])
+        self.indi_allsky_config['STARTRAILS_MIN_STARS']                 = int(request.json['STARTRAILS_MIN_STARS'])
+        self.indi_allsky_config['STARTRAILS_TIMELAPSE']                 = bool(request.json['STARTRAILS_TIMELAPSE'])
+        self.indi_allsky_config['STARTRAILS_TIMELAPSE_MINFRAMES']       = int(request.json['STARTRAILS_TIMELAPSE_MINFRAMES'])
+        self.indi_allsky_config['STARTRAILS_USE_DB_DATA']               = bool(request.json['STARTRAILS_USE_DB_DATA'])
+        self.indi_allsky_config['STARTRAILS']['IMAGE_CIRCLE_MASK_ENABLE']   = bool(request.json['STARTRAILS__IMAGE_CIRCLE_MASK_ENABLE'])
+        self.indi_allsky_config['STARTRAILS']['IMAGE_CIRCLE_MASK_DIAMETER'] = int(request.json['STARTRAILS__IMAGE_CIRCLE_MASK_DIAMETER'])
+        self.indi_allsky_config['STARTRAILS']['IMAGE_CIRCLE_MASK_BLUR']     = int(request.json['STARTRAILS__IMAGE_CIRCLE_MASK_BLUR'])
+        self.indi_allsky_config['STARTRAILS']['IMAGE_CIRCLE_MASK_OPACITY']  = int(request.json['STARTRAILS__IMAGE_CIRCLE_MASK_OPACITY'])
+        asi676mc_repair_config = self.indi_allsky_config.setdefault('IMAGE_ASI676MC_REPAIR', {})
+        asi676mc_repair_enabled = bool(request.json['IMAGE_ASI676MC_REPAIR__ENABLE'])
+        asi676mc_repair_config['ENABLE']                      = asi676mc_repair_enabled
+        asi676mc_repair_config['EXCLUDE_ONLY']                = bool(request.json['IMAGE_ASI676MC_REPAIR__EXCLUDE_ONLY'])
+        asi676mc_repair_config['LOG_EVERY_FRAME']             = bool(request.json['IMAGE_ASI676MC_REPAIR__LOG_EVERY_FRAME'])
+        asi676mc_repair_config['GALLERY_ENABLE']              = bool(
+            asi676mc_repair_enabled
+            and request.json['IMAGE_ASI676MC_REPAIR__GALLERY_ENABLE']
+        )
+        asi676mc_repair_config['SAVE_DIAGNOSTIC_FITS']         = bool(request.json['IMAGE_ASI676MC_REPAIR__SAVE_DIAGNOSTIC_FITS'])
+        asi676mc_repair_config['SAVE_PRECEDING_FITS']          = bool(request.json['IMAGE_ASI676MC_REPAIR__SAVE_PRECEDING_FITS'])
+        asi676mc_repair_config['PURPLE_RATIO_THRESHOLD']      = float(request.json['IMAGE_ASI676MC_REPAIR__PURPLE_RATIO_THRESHOLD'])
+        asi676mc_repair_config['RED_SIDE_RATIO_THRESHOLD']    = float(request.json['IMAGE_ASI676MC_REPAIR__RED_SIDE_RATIO_THRESHOLD'])
+        asi676mc_repair_config['BLUE_SIDE_RATIO_THRESHOLD']   = float(request.json['IMAGE_ASI676MC_REPAIR__BLUE_SIDE_RATIO_THRESHOLD'])
+        asi676mc_repair_config['SAMPLE_STEP']                 = int(request.json['IMAGE_ASI676MC_REPAIR__SAMPLE_STEP'])
+        asi676mc_repair_config['SOURCE_SATURATION_THRESHOLD'] = int(request.json['IMAGE_ASI676MC_REPAIR__SOURCE_SATURATION_THRESHOLD'])
+        asi676mc_repair_config['GAIN_R']                      = float(request.json['IMAGE_ASI676MC_REPAIR__GAIN_R'])
+        asi676mc_repair_config['GAIN_G1']                     = float(request.json['IMAGE_ASI676MC_REPAIR__GAIN_G1'])
+        asi676mc_repair_config['GAIN_G2']                     = float(request.json['IMAGE_ASI676MC_REPAIR__GAIN_G2'])
+        asi676mc_repair_config['GAIN_B']                      = float(request.json['IMAGE_ASI676MC_REPAIR__GAIN_B'])
+        asi676mc_repair_config['HIGHLIGHT_BLEND_START_RATIO'] = float(request.json['IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_START_RATIO'])
+        asi676mc_repair_config['HIGHLIGHT_BLEND_END_RATIO']   = float(request.json['IMAGE_ASI676MC_REPAIR__HIGHLIGHT_BLEND_END_RATIO'])
+        asi676mc_repair_config['CHUNK_ROWS']                  = int(request.json['IMAGE_ASI676MC_REPAIR__CHUNK_ROWS'])
+        self.indi_allsky_config['IMAGE_CALIBRATE_DARK']                 = bool(request.json['IMAGE_CALIBRATE_DARK'])
+        self.indi_allsky_config['IMAGE_CALIBRATE_BPM']                  = bool(request.json['IMAGE_CALIBRATE_BPM'])
+        self.indi_allsky_config['IMAGE_CALIBRATE_FIX_HOLES']            = bool(request.json['IMAGE_CALIBRATE_FIX_HOLES'])
+        self.indi_allsky_config['IMAGE_CALIBRATE_HOLE_THOLD']           = int(request.json['IMAGE_CALIBRATE_HOLE_THOLD'])
+        self.indi_allsky_config['IMAGE_CALIBRATE_MANUAL_OFFSET']        = int(request.json['IMAGE_CALIBRATE_MANUAL_OFFSET'])
+        self.indi_allsky_config['IMAGE_SAVE_FITS_PRE_DARK']             = bool(request.json['IMAGE_SAVE_FITS_PRE_DARK'])
+        self.indi_allsky_config['PRIVACY_MODE']                         = bool(request.json['PRIVACY_MODE'])
+        self.indi_allsky_config['IMAGE_EXIF_PRIVACY']                   = bool(request.json['IMAGE_EXIF_PRIVACY'])
+        self.indi_allsky_config['IMAGE_FILE_TYPE']                      = str(request.json['IMAGE_FILE_TYPE'])
+        self.indi_allsky_config['IMAGE_FILE_COMPRESSION']['jpg']        = int(request.json['IMAGE_FILE_COMPRESSION__JPG'])
+        self.indi_allsky_config['IMAGE_FILE_COMPRESSION']['jpeg']       = int(request.json['IMAGE_FILE_COMPRESSION__JPG'])  # duplicate
+        self.indi_allsky_config['IMAGE_FILE_COMPRESSION']['png']        = int(request.json['IMAGE_FILE_COMPRESSION__PNG'])
+        #self.indi_allsky_config['IMAGE_FILE_COMPRESSION']['tif']        = int(request.json['IMAGE_FILE_COMPRESSION__TIF'])  # not used anymore
+        #self.indi_allsky_config['IMAGE_FILE_COMPRESSION']['tiff']       = int(request.json['IMAGE_FILE_COMPRESSION__TIF'])  # duplicate
+        self.indi_allsky_config['IMAGE_FOLDER']                         = str(request.json['IMAGE_FOLDER'])
+        self.indi_allsky_config['VARLIB_FOLDER']                        = str(request.json['VARLIB_FOLDER'])
+        self.indi_allsky_config['IMAGE_LABEL_TEMPLATE']                 = str(request.json['IMAGE_LABEL_TEMPLATE'])
+        self.indi_allsky_config['IMAGE_EXTRA_TEXT']                     = str(request.json['IMAGE_EXTRA_TEXT'])
+        self.indi_allsky_config['IMAGE_ROTATE']                         = str(request.json['IMAGE_ROTATE'])
+        self.indi_allsky_config['IMAGE_ROTATE_ANGLE']                   = int(request.json['IMAGE_ROTATE_ANGLE'])
+        self.indi_allsky_config['IMAGE_ROTATE_KEEP_SIZE']               = bool(request.json['IMAGE_ROTATE_KEEP_SIZE'])
+        #self.indi_allsky_config['IMAGE_ROTATE_WITH_OFFSET']             = bool(request.json['IMAGE_ROTATE_WITH_OFFSET'])
+        self.indi_allsky_config['IMAGE_FLIP_V']                         = bool(request.json['IMAGE_FLIP_V'])
+        self.indi_allsky_config['IMAGE_FLIP_H']                         = bool(request.json['IMAGE_FLIP_H'])
+        self.indi_allsky_config['IMAGE_SCALE']                          = int(request.json['IMAGE_SCALE'])
+        self.indi_allsky_config['IMAGE_COLORMAP']                       = str(request.json['IMAGE_COLORMAP'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['ENABLE']          = bool(request.json['IMAGE_CIRCLE_MASK__ENABLE'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['DIAMETER']        = int(request.json['IMAGE_CIRCLE_MASK__DIAMETER'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['OFFSET_X']        = int(request.json['IMAGE_CIRCLE_MASK__OFFSET_X'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['OFFSET_Y']        = int(request.json['IMAGE_CIRCLE_MASK__OFFSET_Y'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['BLUR']            = int(request.json['IMAGE_CIRCLE_MASK__BLUR'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['OPACITY']         = int(request.json['IMAGE_CIRCLE_MASK__OPACITY'])
+        self.indi_allsky_config['IMAGE_CIRCLE_MASK']['OUTLINE']         = bool(request.json['IMAGE_CIRCLE_MASK__OUTLINE'])
+        self.indi_allsky_config['IMAGE_CROP_IMAGE_CIRCLE']              = bool(request.json['IMAGE_CROP_IMAGE_CIRCLE'])
+        self.indi_allsky_config['FISH2PANO']['ENABLE']                  = bool(request.json['FISH2PANO__ENABLE'])
+        self.indi_allsky_config['FISH2PANO']['DIAMETER']                = int(request.json['FISH2PANO__DIAMETER'])
+        self.indi_allsky_config['FISH2PANO']['OFFSET_X']                = int(request.json['FISH2PANO__OFFSET_X'])
+        self.indi_allsky_config['FISH2PANO']['OFFSET_Y']                = int(request.json['FISH2PANO__OFFSET_Y'])
+        self.indi_allsky_config['FISH2PANO']['ROTATE_ANGLE']            = int(request.json['FISH2PANO__ROTATE_ANGLE'])
+        self.indi_allsky_config['FISH2PANO']['SCALE']                   = float(request.json['FISH2PANO__SCALE'])
+        self.indi_allsky_config['FISH2PANO']['MODULUS']                 = int(request.json['FISH2PANO__MODULUS'])
+        self.indi_allsky_config['FISH2PANO']['FLIP_H']                  = bool(request.json['FISH2PANO__FLIP_H'])
+        self.indi_allsky_config['FISH2PANO']['ENABLE_CARDINAL_DIRS']    = bool(request.json['FISH2PANO__ENABLE_CARDINAL_DIRS'])
+        self.indi_allsky_config['FISH2PANO']['DIRS_OFFSET_BOTTOM']      = int(request.json['FISH2PANO__DIRS_OFFSET_BOTTOM'])
+        self.indi_allsky_config['FISH2PANO']['OPENCV_FONT_SCALE']       = float(request.json['FISH2PANO__OPENCV_FONT_SCALE'])
+        self.indi_allsky_config['FISH2PANO']['PIL_FONT_SIZE']           = int(request.json['FISH2PANO__PIL_FONT_SIZE'])
+        self.indi_allsky_config['IMAGE_SAVE_FITS']                      = bool(request.json['IMAGE_SAVE_FITS'])
+        self.indi_allsky_config['IMAGE_SAVE_FITS_COMPRESSED']           = bool(request.json['IMAGE_SAVE_FITS_COMPRESSED'])
+        self.indi_allsky_config['IMAGE_SAVE_FITS_PERIOD']               = int(request.json['IMAGE_SAVE_FITS_PERIOD'])
+        self.indi_allsky_config['NIGHT_GRAYSCALE']                      = bool(request.json['NIGHT_GRAYSCALE'])
+        self.indi_allsky_config['DAYTIME_GRAYSCALE']                    = bool(request.json['DAYTIME_GRAYSCALE'])
+        self.indi_allsky_config['MOON_OVERLAY']['ENABLE']               = bool(request.json['MOON_OVERLAY__ENABLE'])
+        self.indi_allsky_config['MOON_OVERLAY']['X']                    = int(request.json['MOON_OVERLAY__X'])
+        self.indi_allsky_config['MOON_OVERLAY']['Y']                    = int(request.json['MOON_OVERLAY__Y'])
+        self.indi_allsky_config['MOON_OVERLAY']['SCALE']                = float(request.json['MOON_OVERLAY__SCALE'])
+        self.indi_allsky_config['MOON_OVERLAY']['DARK_SIDE_SCALE']      = float(request.json['MOON_OVERLAY__DARK_SIDE_SCALE'])
+        self.indi_allsky_config['MOON_OVERLAY']['FLIP_V']               = bool(request.json['MOON_OVERLAY__FLIP_V'])
+        self.indi_allsky_config['MOON_OVERLAY']['FLIP_H']               = bool(request.json['MOON_OVERLAY__FLIP_H'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['ENABLE']         = bool(request.json['LIGHTGRAPH_OVERLAY__ENABLE'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['GRAPH_HEIGHT']   = int(request.json['LIGHTGRAPH_OVERLAY__GRAPH_HEIGHT'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['GRAPH_BORDER']   = int(request.json['LIGHTGRAPH_OVERLAY__GRAPH_BORDER'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['Y']              = int(request.json['LIGHTGRAPH_OVERLAY__Y'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['OFFSET_X']       = int(request.json['LIGHTGRAPH_OVERLAY__OFFSET_X'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['SCALE']          = float(request.json['LIGHTGRAPH_OVERLAY__SCALE'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['NOW_MARKER_SIZE']  = int(request.json['LIGHTGRAPH_OVERLAY__NOW_MARKER_SIZE'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['OPACITY']        = int(request.json['LIGHTGRAPH_OVERLAY__OPACITY'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['PIL_FONT_SIZE']  = int(request.json['LIGHTGRAPH_OVERLAY__PIL_FONT_SIZE'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['OPENCV_FONT_SCALE'] = float(request.json['LIGHTGRAPH_OVERLAY__OPENCV_FONT_SCALE'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['LABEL']          = bool(request.json['LIGHTGRAPH_OVERLAY__LABEL'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['HOUR_LINES']     = bool(request.json['LIGHTGRAPH_OVERLAY__HOUR_LINES'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['ENABLE']              = bool(request.json['IMAGE_OVERLAY__ENABLE'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['LOAD_INTERVAL']       = int(request.json['IMAGE_OVERLAY__LOAD_INTERVAL'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_URL']               = str(request.json['IMAGE_OVERLAY__A_URL'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_IMAGE_FILE_TYPE']   = str(request.json['IMAGE_OVERLAY__A_IMAGE_FILE_TYPE'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_WIDTH']             = int(request.json['IMAGE_OVERLAY__A_WIDTH'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_HEIGHT']            = int(request.json['IMAGE_OVERLAY__A_HEIGHT'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_X']                 = int(request.json['IMAGE_OVERLAY__A_X'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_Y']                 = int(request.json['IMAGE_OVERLAY__A_Y'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_USERNAME']          = str(request.json['IMAGE_OVERLAY__A_USERNAME'])
+        self.indi_allsky_config['IMAGE_OVERLAY']['A_PASSWORD']          = str(request.json['IMAGE_OVERLAY__A_PASSWORD'])
+        self.indi_allsky_config['IMAGE_EXPORT_RAW']                     = str(request.json['IMAGE_EXPORT_RAW'])
+        self.indi_allsky_config['IMAGE_EXPORT_FOLDER']                  = str(request.json['IMAGE_EXPORT_FOLDER'])
+        self.indi_allsky_config['IMAGE_EXPORT_FLIP_V']                  = bool(request.json['IMAGE_EXPORT_FLIP_V'])
+        self.indi_allsky_config['IMAGE_EXPORT_FLIP_H']                  = bool(request.json['IMAGE_EXPORT_FLIP_H'])
+        self.indi_allsky_config['IMAGE_STACK_METHOD']                   = str(request.json['IMAGE_STACK_METHOD'])
+        self.indi_allsky_config['IMAGE_STACK_COUNT']                    = int(request.json['IMAGE_STACK_COUNT'])
+        self.indi_allsky_config['IMAGE_STACK_ALIGN']                    = bool(request.json['IMAGE_STACK_ALIGN'])
+        self.indi_allsky_config['IMAGE_ALIGN_DETECTSIGMA']              = int(request.json['IMAGE_ALIGN_DETECTSIGMA'])
+        self.indi_allsky_config['IMAGE_ALIGN_POINTS']                   = int(request.json['IMAGE_ALIGN_POINTS'])
+        self.indi_allsky_config['IMAGE_ALIGN_SOURCEMINAREA']            = int(request.json['IMAGE_ALIGN_SOURCEMINAREA'])
+        self.indi_allsky_config['IMAGE_STACK_SPLIT']                    = bool(request.json['IMAGE_STACK_SPLIT'])
+        self.indi_allsky_config['IMAGE_STACK_MOONMODE']                 = bool(request.json['IMAGE_STACK_MOONMODE'])
+        self.indi_allsky_config['IMAGE_STACK_DAY']                      = bool(request.json['IMAGE_STACK_DAY'])
+        self.indi_allsky_config['IMAGE_QUEUE_MAX']                      = int(request.json['IMAGE_QUEUE_MAX'])
+        self.indi_allsky_config['IMAGE_QUEUE_MIN']                      = int(request.json['IMAGE_QUEUE_MIN'])
+        self.indi_allsky_config['IMAGE_QUEUE_BACKOFF']                  = float(request.json['IMAGE_QUEUE_BACKOFF'])
+        self.indi_allsky_config['IMAGE_SAVE_HOOK_PRE']                  = str(request.json['IMAGE_SAVE_HOOK_PRE'])
+        self.indi_allsky_config['IMAGE_SAVE_HOOK_POST']                 = str(request.json['IMAGE_SAVE_HOOK_POST'])
+        self.indi_allsky_config['IMAGE_SAVE_HOOK_TIMEOUT']              = int(request.json['IMAGE_SAVE_HOOK_TIMEOUT'])
+        self.indi_allsky_config['CAPTURE_HOOK_PRE']                     = str(request.json['CAPTURE_HOOK_PRE'])
+        self.indi_allsky_config['CAPTURE_HOOK_TIMEOUT']                 = int(request.json['CAPTURE_HOOK_TIMEOUT'])
+        self.indi_allsky_config['BACKUP_DB_PERIOD_DAYS']                = int(request.json['BACKUP_DB_PERIOD_DAYS'])
+        self.indi_allsky_config['IMAGE_EXPIRE_DAYS']                    = int(request.json['IMAGE_EXPIRE_DAYS'])
+        self.indi_allsky_config['IMAGE_RAW_EXPIRE_DAYS']                = int(request.json['IMAGE_RAW_EXPIRE_DAYS'])
+        self.indi_allsky_config['IMAGE_FITS_EXPIRE_DAYS']               = int(request.json['IMAGE_FITS_EXPIRE_DAYS'])
+        self.indi_allsky_config['TIMELAPSE_EXPIRE_DAYS']                = int(request.json['TIMELAPSE_EXPIRE_DAYS'])
+        self.indi_allsky_config['TIMELAPSE_OVERWRITE']                  = bool(request.json['TIMELAPSE_OVERWRITE'])
+        self.indi_allsky_config['FFMPEG_FRAMERATE']                     = int(request.json['FFMPEG_FRAMERATE'])
+        self.indi_allsky_config['FFMPEG_FRAMERATE_DAY']                 = int(request.json['FFMPEG_FRAMERATE_DAY'])
+        self.indi_allsky_config['FFMPEG_BITRATE']                       = str(request.json['FFMPEG_BITRATE'])
+        self.indi_allsky_config['FFMPEG_BITRATE_DAY']                   = str(request.json['FFMPEG_BITRATE_DAY'])
+        self.indi_allsky_config['FFMPEG_VFSCALE']                       = str(request.json['FFMPEG_VFSCALE'])
+        self.indi_allsky_config['FFMPEG_VFSCALE_DAY']                   = str(request.json['FFMPEG_VFSCALE_DAY'])
+        self.indi_allsky_config['FFMPEG_VFSCALE_STARTRAIL']             = str(request.json['FFMPEG_VFSCALE_STARTRAIL'])
+        self.indi_allsky_config['FFMPEG_CODEC']                         = str(request.json['FFMPEG_CODEC'])
+        self.indi_allsky_config['FFMPEG_EXTRA_OPTIONS']                 = str(request.json['FFMPEG_EXTRA_OPTIONS'])
+        self.indi_allsky_config['FFMPEG_EXTRA_OPTIONS_DAY']             = str(request.json['FFMPEG_EXTRA_OPTIONS_DAY'])
+        self.indi_allsky_config['IMAGE_LABEL_SYSTEM']                   = str(request.json['IMAGE_LABEL_SYSTEM'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_FACE']         = str(request.json['TEXT_PROPERTIES__FONT_FACE'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_SCALE']        = float(request.json['TEXT_PROPERTIES__FONT_SCALE'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_THICKNESS']    = int(request.json['TEXT_PROPERTIES__FONT_THICKNESS'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_OUTLINE']      = bool(request.json['TEXT_PROPERTIES__FONT_OUTLINE'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_HEIGHT']       = int(request.json['TEXT_PROPERTIES__FONT_HEIGHT'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_X']            = int(request.json['TEXT_PROPERTIES__FONT_X'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_Y']            = int(request.json['TEXT_PROPERTIES__FONT_Y'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['PIL_FONT_FILE']     = str(request.json['TEXT_PROPERTIES__PIL_FONT_FILE'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['PIL_FONT_CUSTOM']   = str(request.json['TEXT_PROPERTIES__PIL_FONT_CUSTOM'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['PIL_FONT_SIZE']     = int(request.json['TEXT_PROPERTIES__PIL_FONT_SIZE'])
+        self.indi_allsky_config['CARDINAL_DIRS']['ENABLE']              = bool(request.json['CARDINAL_DIRS__ENABLE'])
+        self.indi_allsky_config['CARDINAL_DIRS']['SWAP_NS']             = bool(request.json['CARDINAL_DIRS__SWAP_NS'])
+        self.indi_allsky_config['CARDINAL_DIRS']['SWAP_EW']             = bool(request.json['CARDINAL_DIRS__SWAP_EW'])
+        self.indi_allsky_config['CARDINAL_DIRS']['CHAR_NORTH']          = str(request.json['CARDINAL_DIRS__CHAR_NORTH'])
+        self.indi_allsky_config['CARDINAL_DIRS']['CHAR_EAST']           = str(request.json['CARDINAL_DIRS__CHAR_EAST'])
+        self.indi_allsky_config['CARDINAL_DIRS']['CHAR_WEST']           = str(request.json['CARDINAL_DIRS__CHAR_WEST'])
+        self.indi_allsky_config['CARDINAL_DIRS']['CHAR_SOUTH']          = str(request.json['CARDINAL_DIRS__CHAR_SOUTH'])
+        self.indi_allsky_config['CARDINAL_DIRS']['DIAMETER']            = int(request.json['CARDINAL_DIRS__DIAMETER'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_X']            = int(request.json['CARDINAL_DIRS__OFFSET_X'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_Y']            = int(request.json['CARDINAL_DIRS__OFFSET_Y'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_TOP']          = int(request.json['CARDINAL_DIRS__OFFSET_TOP'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_LEFT']         = int(request.json['CARDINAL_DIRS__OFFSET_LEFT'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_RIGHT']        = int(request.json['CARDINAL_DIRS__OFFSET_RIGHT'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OFFSET_BOTTOM']       = int(request.json['CARDINAL_DIRS__OFFSET_BOTTOM'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OPENCV_FONT_SCALE']   = float(request.json['CARDINAL_DIRS__OPENCV_FONT_SCALE'])
+        self.indi_allsky_config['CARDINAL_DIRS']['PIL_FONT_SIZE']       = int(request.json['CARDINAL_DIRS__PIL_FONT_SIZE'])
+        self.indi_allsky_config['CARDINAL_DIRS']['OUTLINE_CIRCLE']      = bool(request.json['CARDINAL_DIRS__OUTLINE_CIRCLE'])
+        self.indi_allsky_config['ORB_PROPERTIES']['MODE']               = str(request.json['ORB_PROPERTIES__MODE'])
+        self.indi_allsky_config['ORB_PROPERTIES']['RADIUS']             = int(request.json['ORB_PROPERTIES__RADIUS'])
+        self.indi_allsky_config['ORB_PROPERTIES']['AZ_OFFSET']          = float(request.json['ORB_PROPERTIES__AZ_OFFSET'])
+        self.indi_allsky_config['ORB_PROPERTIES']['RETROGRADE']         = bool(request.json['ORB_PROPERTIES__RETROGRADE'])
+        self.indi_allsky_config['IMAGE_BORDER']['TOP']                  = int(request.json['IMAGE_BORDER__TOP'])
+        self.indi_allsky_config['IMAGE_BORDER']['LEFT']                 = int(request.json['IMAGE_BORDER__LEFT'])
+        self.indi_allsky_config['IMAGE_BORDER']['RIGHT']                = int(request.json['IMAGE_BORDER__RIGHT'])
+        self.indi_allsky_config['IMAGE_BORDER']['BOTTOM']               = int(request.json['IMAGE_BORDER__BOTTOM'])
+        self.indi_allsky_config['UPLOAD_WORKERS']                       = int(request.json['UPLOAD_WORKERS'])
+        self.indi_allsky_config['FILETRANSFER']['CLASSNAME']            = str(request.json['FILETRANSFER__CLASSNAME'])
+        self.indi_allsky_config['FILETRANSFER']['HOST']                 = str(request.json['FILETRANSFER__HOST'])
+        self.indi_allsky_config['FILETRANSFER']['PORT']                 = int(request.json['FILETRANSFER__PORT'])
+        self.indi_allsky_config['FILETRANSFER']['USERNAME']             = str(request.json['FILETRANSFER__USERNAME'])
+        self.indi_allsky_config['FILETRANSFER']['PASSWORD']             = str(request.json['FILETRANSFER__PASSWORD'])
+        self.indi_allsky_config['FILETRANSFER']['PRIVATE_KEY']          = str(request.json['FILETRANSFER__PRIVATE_KEY'])
+        self.indi_allsky_config['FILETRANSFER']['PUBLIC_KEY']           = str(request.json['FILETRANSFER__PUBLIC_KEY'])
+        self.indi_allsky_config['FILETRANSFER']['CONNECT_TIMEOUT']      = float(request.json['FILETRANSFER__CONNECT_TIMEOUT'])
+        self.indi_allsky_config['FILETRANSFER']['TIMEOUT']              = float(request.json['FILETRANSFER__TIMEOUT'])
+        self.indi_allsky_config['FILETRANSFER']['CERT_BYPASS']          = bool(request.json['FILETRANSFER__CERT_BYPASS'])
+        self.indi_allsky_config['FILETRANSFER']['ATOMIC_TRANSFERS']     = bool(request.json['FILETRANSFER__ATOMIC_TRANSFERS'])
+        self.indi_allsky_config['FILETRANSFER']['FORCE_IPV4']           = bool(request.json['FILETRANSFER__FORCE_IPV4'])
+        self.indi_allsky_config['FILETRANSFER']['FORCE_IPV6']           = bool(request.json['FILETRANSFER__FORCE_IPV6'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_IMAGE_NAME']        = str(request.json['FILETRANSFER__REMOTE_IMAGE_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_IMAGE_FOLDER']      = str(request.json['FILETRANSFER__REMOTE_IMAGE_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_PANORAMA_NAME']     = str(request.json['FILETRANSFER__REMOTE_PANORAMA_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_PANORAMA_FOLDER']   = str(request.json['FILETRANSFER__REMOTE_PANORAMA_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_METADATA_NAME']     = str(request.json['FILETRANSFER__REMOTE_METADATA_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_METADATA_FOLDER']   = str(request.json['FILETRANSFER__REMOTE_METADATA_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_RAW_NAME']          = str(request.json['FILETRANSFER__REMOTE_RAW_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_RAW_FOLDER']        = str(request.json['FILETRANSFER__REMOTE_RAW_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_FITS_NAME']         = str(request.json['FILETRANSFER__REMOTE_FITS_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_FITS_FOLDER']       = str(request.json['FILETRANSFER__REMOTE_FITS_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_VIDEO_NAME']        = str(request.json['FILETRANSFER__REMOTE_VIDEO_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_VIDEO_FOLDER']      = str(request.json['FILETRANSFER__REMOTE_VIDEO_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_MINI_VIDEO_NAME']   = str(request.json['FILETRANSFER__REMOTE_MINI_VIDEO_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_MINI_VIDEO_FOLDER'] = str(request.json['FILETRANSFER__REMOTE_MINI_VIDEO_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_KEOGRAM_NAME']      = str(request.json['FILETRANSFER__REMOTE_KEOGRAM_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_KEOGRAM_FOLDER']    = str(request.json['FILETRANSFER__REMOTE_KEOGRAM_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_STARTRAIL_NAME']    = str(request.json['FILETRANSFER__REMOTE_STARTRAIL_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_STARTRAIL_FOLDER']  = str(request.json['FILETRANSFER__REMOTE_STARTRAIL_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_STARTRAIL_VIDEO_NAME']   = str(request.json['FILETRANSFER__REMOTE_STARTRAIL_VIDEO_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_STARTRAIL_VIDEO_FOLDER'] = str(request.json['FILETRANSFER__REMOTE_STARTRAIL_VIDEO_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_PANORAMA_VIDEO_NAME']    = str(request.json['FILETRANSFER__REMOTE_PANORAMA_VIDEO_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_PANORAMA_VIDEO_FOLDER']  = str(request.json['FILETRANSFER__REMOTE_PANORAMA_VIDEO_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_REALTIME_KEOGRAM_NAME']  = str(request.json['FILETRANSFER__REMOTE_REALTIME_KEOGRAM_NAME'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_REALTIME_KEOGRAM_FOLDER'] = str(request.json['FILETRANSFER__REMOTE_REALTIME_KEOGRAM_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_ENDOFNIGHT_FOLDER']      = str(request.json['FILETRANSFER__REMOTE_ENDOFNIGHT_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_LATEST_FOLDER']          = str(request.json['FILETRANSFER__REMOTE_LATEST_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['REMOTE_DB_BACKUP_FOLDER']       = str(request.json['FILETRANSFER__REMOTE_DB_BACKUP_FOLDER'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_IMAGE']         = int(request.json['FILETRANSFER__UPLOAD_IMAGE'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_PANORAMA']      = int(request.json['FILETRANSFER__UPLOAD_PANORAMA'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_METADATA']      = bool(request.json['FILETRANSFER__UPLOAD_METADATA'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_VIDEO']         = bool(request.json['FILETRANSFER__UPLOAD_VIDEO'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_MINI_VIDEO']    = bool(request.json['FILETRANSFER__UPLOAD_MINI_VIDEO'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_RAW']           = bool(request.json['FILETRANSFER__UPLOAD_RAW'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_FITS']          = bool(request.json['FILETRANSFER__UPLOAD_FITS'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_KEOGRAM']       = bool(request.json['FILETRANSFER__UPLOAD_KEOGRAM'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_STARTRAIL']     = bool(request.json['FILETRANSFER__UPLOAD_STARTRAIL'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_STARTRAIL_VIDEO']  = bool(request.json['FILETRANSFER__UPLOAD_STARTRAIL_VIDEO'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_PANORAMA_VIDEO']   = bool(request.json['FILETRANSFER__UPLOAD_PANORAMA_VIDEO'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_REALTIME_KEOGRAM'] = int(request.json['FILETRANSFER__UPLOAD_REALTIME_KEOGRAM'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_ENDOFNIGHT']       = bool(request.json['FILETRANSFER__UPLOAD_ENDOFNIGHT'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_LATEST_IMAGE']     = bool(request.json['FILETRANSFER__UPLOAD_LATEST_IMAGE'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_LATEST_PANORAMA']  = bool(request.json['FILETRANSFER__UPLOAD_LATEST_PANORAMA'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_LATEST_RAW']       = bool(request.json['FILETRANSFER__UPLOAD_LATEST_RAW'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_LATEST_VIDEO']     = bool(request.json['FILETRANSFER__UPLOAD_LATEST_VIDEO'])
+        self.indi_allsky_config['FILETRANSFER']['UPLOAD_DB_BACKUP']        = bool(request.json['FILETRANSFER__UPLOAD_DB_BACKUP'])
+        self.indi_allsky_config['S3UPLOAD']['CLASSNAME']                = str(request.json['S3UPLOAD__CLASSNAME'])
+        self.indi_allsky_config['S3UPLOAD']['ENABLE']                   = bool(request.json['S3UPLOAD__ENABLE'])
+        self.indi_allsky_config['S3UPLOAD']['ACCESS_KEY']               = str(request.json['S3UPLOAD__ACCESS_KEY'])
+        self.indi_allsky_config['S3UPLOAD']['SECRET_KEY']               = str(request.json['S3UPLOAD__SECRET_KEY'])
+        self.indi_allsky_config['S3UPLOAD']['CREDS_FILE']               = str(request.json['S3UPLOAD__CREDS_FILE'])
+        self.indi_allsky_config['S3UPLOAD']['BUCKET']                   = str(request.json['S3UPLOAD__BUCKET'])
+        self.indi_allsky_config['S3UPLOAD']['REGION']                   = str(request.json['S3UPLOAD__REGION'])
+        self.indi_allsky_config['S3UPLOAD']['NAMESPACE']                = str(request.json['S3UPLOAD__NAMESPACE'])
+        self.indi_allsky_config['S3UPLOAD']['HOST']                     = str(request.json['S3UPLOAD__HOST'])
+        self.indi_allsky_config['S3UPLOAD']['ENDPOINT_URL']             = str(request.json['S3UPLOAD__ENDPOINT_URL'])
+        self.indi_allsky_config['S3UPLOAD']['PORT']                     = int(request.json['S3UPLOAD__PORT'])
+        self.indi_allsky_config['S3UPLOAD']['CONNECT_TIMEOUT']          = float(request.json['S3UPLOAD__CONNECT_TIMEOUT'])
+        self.indi_allsky_config['S3UPLOAD']['TIMEOUT']                  = float(request.json['S3UPLOAD__TIMEOUT'])
+        self.indi_allsky_config['S3UPLOAD']['URL_TEMPLATE']             = str(request.json['S3UPLOAD__URL_TEMPLATE'])
+        self.indi_allsky_config['S3UPLOAD']['STORAGE_CLASS']            = str(request.json['S3UPLOAD__STORAGE_CLASS'])
+        self.indi_allsky_config['S3UPLOAD']['ACL']                      = str(request.json['S3UPLOAD__ACL'])
+        self.indi_allsky_config['S3UPLOAD']['TLS']                      = bool(request.json['S3UPLOAD__TLS'])
+        self.indi_allsky_config['S3UPLOAD']['CERT_BYPASS']              = bool(request.json['S3UPLOAD__CERT_BYPASS'])
+        self.indi_allsky_config['S3UPLOAD']['UPLOAD_FITS']              = bool(request.json['S3UPLOAD__UPLOAD_FITS'])
+        self.indi_allsky_config['S3UPLOAD']['UPLOAD_RAW']               = bool(request.json['S3UPLOAD__UPLOAD_RAW'])
+        self.indi_allsky_config['MQTTPUBLISH']['ENABLE']                = bool(request.json['MQTTPUBLISH__ENABLE'])
+        self.indi_allsky_config['MQTTPUBLISH']['TRANSPORT']             = str(request.json['MQTTPUBLISH__TRANSPORT'])
+        self.indi_allsky_config['MQTTPUBLISH']['PROTOCOL']              = str(request.json['MQTTPUBLISH__PROTOCOL'])
+        self.indi_allsky_config['MQTTPUBLISH']['HOST']                  = str(request.json['MQTTPUBLISH__HOST'])
+        self.indi_allsky_config['MQTTPUBLISH']['PORT']                  = int(request.json['MQTTPUBLISH__PORT'])
+        self.indi_allsky_config['MQTTPUBLISH']['USERNAME']              = str(request.json['MQTTPUBLISH__USERNAME'])
+        self.indi_allsky_config['MQTTPUBLISH']['PASSWORD']              = str(request.json['MQTTPUBLISH__PASSWORD'])
+        self.indi_allsky_config['MQTTPUBLISH']['BASE_TOPIC']            = str(request.json['MQTTPUBLISH__BASE_TOPIC'])
+        self.indi_allsky_config['MQTTPUBLISH']['QOS']                   = int(request.json['MQTTPUBLISH__QOS'])
+        self.indi_allsky_config['MQTTPUBLISH']['TLS']                   = bool(request.json['MQTTPUBLISH__TLS'])
+        self.indi_allsky_config['MQTTPUBLISH']['CERT_BYPASS']           = bool(request.json['MQTTPUBLISH__CERT_BYPASS'])
+        self.indi_allsky_config['MQTTPUBLISH']['PUBLISH_IMAGE']         = bool(request.json['MQTTPUBLISH__PUBLISH_IMAGE'])
+        self.indi_allsky_config['SYNCAPI']['ENABLE']                    = bool(request.json['SYNCAPI__ENABLE'])
+        self.indi_allsky_config['SYNCAPI']['BASEURL']                   = str(request.json['SYNCAPI__BASEURL'])
+        self.indi_allsky_config['SYNCAPI']['USERNAME']                  = str(request.json['SYNCAPI__USERNAME'])
+        self.indi_allsky_config['SYNCAPI']['APIKEY']                    = str(request.json['SYNCAPI__APIKEY'])
+        self.indi_allsky_config['SYNCAPI']['CERT_BYPASS']               = bool(request.json['SYNCAPI__CERT_BYPASS'])
+        self.indi_allsky_config['SYNCAPI']['POST_S3']                   = bool(request.json['SYNCAPI__POST_S3'])
+        self.indi_allsky_config['SYNCAPI']['EMPTY_FILE']                = bool(request.json['SYNCAPI__EMPTY_FILE'])
+        self.indi_allsky_config['SYNCAPI']['UPLOAD_IMAGE']              = int(request.json['SYNCAPI__UPLOAD_IMAGE'])
+        self.indi_allsky_config['SYNCAPI']['UPLOAD_PANORAMA']           = int(request.json['SYNCAPI__UPLOAD_PANORAMA'])
+        #self.indi_allsky_config['SYNCAPI']['UPLOAD_VIDEO']              = bool(request.json['SYNCAPI__UPLOAD_VIDEO'])  # cannot be changed
+        self.indi_allsky_config['SYNCAPI']['CONNECT_TIMEOUT']           = float(request.json['SYNCAPI__CONNECT_TIMEOUT'])
+        self.indi_allsky_config['SYNCAPI']['TIMEOUT']                   = float(request.json['SYNCAPI__TIMEOUT'])
+        self.indi_allsky_config['ALLSKYMAP']['ENABLE']                  = bool(request.json['ALLSKYMAP__ENABLE'])
+        self.indi_allsky_config['ALLSKYMAP']['API_URL']                 = str(request.json['ALLSKYMAP__API_URL'])
+        self.indi_allsky_config['ALLSKYMAP']['API_KEY']                 = str(request.json['ALLSKYMAP__API_KEY'])
+        self.indi_allsky_config['ALLSKYMAP']['CAMERA_NAME']             = str(request.json['ALLSKYMAP__CAMERA_NAME'])
+        self.indi_allsky_config['ALLSKYMAP']['CAMERA_OWNER']            = str(request.json['ALLSKYMAP__CAMERA_OWNER'])
+        self.indi_allsky_config['ALLSKYMAP']['WEBSITE_URL']             = str(request.json['ALLSKYMAP__WEBSITE_URL'])
+        self.indi_allsky_config['ALLSKYMAP']['UPLOAD_IMAGE']            = bool(request.json['ALLSKYMAP__UPLOAD_IMAGE'])
+        self.indi_allsky_config['ALLSKYMAP']['INTERVAL']                = int(request.json['ALLSKYMAP__INTERVAL'])
+        self.indi_allsky_config['YOUTUBE']['ENABLE']                    = bool(request.json['YOUTUBE__ENABLE'])
+        self.indi_allsky_config['YOUTUBE']['SECRETS_FILE']              = str(request.json['YOUTUBE__SECRETS_FILE'])
+        self.indi_allsky_config['YOUTUBE']['PRIVACY_STATUS']            = str(request.json['YOUTUBE__PRIVACY_STATUS'])
+        self.indi_allsky_config['YOUTUBE']['TITLE_TEMPLATE']            = str(request.json['YOUTUBE__TITLE_TEMPLATE'])
+        self.indi_allsky_config['YOUTUBE']['DESCRIPTION_TEMPLATE']      = str(request.json['YOUTUBE__DESCRIPTION_TEMPLATE'])
+        self.indi_allsky_config['YOUTUBE']['CATEGORY']                  = int(request.json['YOUTUBE__CATEGORY'])
+        self.indi_allsky_config['YOUTUBE']['UPLOAD_VIDEO']              = bool(request.json['YOUTUBE__UPLOAD_VIDEO'])
+        self.indi_allsky_config['YOUTUBE']['UPLOAD_MINI_VIDEO']         = bool(request.json['YOUTUBE__UPLOAD_MINI_VIDEO'])
+        self.indi_allsky_config['YOUTUBE']['UPLOAD_STARTRAIL_VIDEO']    = bool(request.json['YOUTUBE__UPLOAD_STARTRAIL_VIDEO'])
+        self.indi_allsky_config['YOUTUBE']['UPLOAD_PANORAMA_VIDEO']     = bool(request.json['YOUTUBE__UPLOAD_PANORAMA_VIDEO'])
+        self.indi_allsky_config['FITSHEADERS'][0][0]                    = str(request.json['FITSHEADERS__0__KEY'])
+        self.indi_allsky_config['FITSHEADERS'][0][1]                    = str(request.json['FITSHEADERS__0__VAL'])
+        self.indi_allsky_config['FITSHEADERS'][1][0]                    = str(request.json['FITSHEADERS__1__KEY'])
+        self.indi_allsky_config['FITSHEADERS'][1][1]                    = str(request.json['FITSHEADERS__1__VAL'])
+        self.indi_allsky_config['FITSHEADERS'][2][0]                    = str(request.json['FITSHEADERS__2__KEY'])
+        self.indi_allsky_config['FITSHEADERS'][2][1]                    = str(request.json['FITSHEADERS__2__VAL'])
+        self.indi_allsky_config['FITSHEADERS'][3][0]                    = str(request.json['FITSHEADERS__3__KEY'])
+        self.indi_allsky_config['FITSHEADERS'][3][1]                    = str(request.json['FITSHEADERS__3__VAL'])
+        self.indi_allsky_config['FITSHEADERS'][4][0]                    = str(request.json['FITSHEADERS__4__KEY'])
+        self.indi_allsky_config['FITSHEADERS'][4][1]                    = str(request.json['FITSHEADERS__4__VAL'])
+        self.indi_allsky_config['LIBCAMERA']['IMAGE_FILE_TYPE']         = str(request.json['LIBCAMERA__IMAGE_FILE_TYPE'])
+        self.indi_allsky_config['LIBCAMERA']['IMAGE_FILE_TYPE_DAY']     = str(request.json['LIBCAMERA__IMAGE_FILE_TYPE_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['IMMEDIATE']               = bool(request.json['LIBCAMERA__IMMEDIATE'])
+        self.indi_allsky_config['LIBCAMERA']['IMMEDIATE_DAY']           = bool(request.json['LIBCAMERA__IMMEDIATE_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['AWB']                     = str(request.json['LIBCAMERA__AWB'])
+        self.indi_allsky_config['LIBCAMERA']['AWB_DAY']                 = str(request.json['LIBCAMERA__AWB_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['AWB_ENABLE']              = bool(request.json['LIBCAMERA__AWB_ENABLE'])
+        self.indi_allsky_config['LIBCAMERA']['AWB_ENABLE_DAY']          = bool(request.json['LIBCAMERA__AWB_ENABLE_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['CCM_DISABLE']             = bool(request.json['LIBCAMERA__CCM_DISABLE'])
+        self.indi_allsky_config['LIBCAMERA']['CCM_DISABLE_DAY']         = bool(request.json['LIBCAMERA__CCM_DISABLE_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['CAMERA_ID']               = int(request.json['LIBCAMERA__CAMERA_ID'])
+        self.indi_allsky_config['LIBCAMERA']['EXTRA_OPTIONS']           = str(request.json['LIBCAMERA__EXTRA_OPTIONS'])
+        self.indi_allsky_config['LIBCAMERA']['EXTRA_OPTIONS_DAY']       = str(request.json['LIBCAMERA__EXTRA_OPTIONS_DAY'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_TRANSPORT']          = str(request.json['LIBCAMERA__MQTT_TRANSPORT'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_PROTOCOL']           = str(request.json['LIBCAMERA__MQTT_PROTOCOL'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_HOST']               = str(request.json['LIBCAMERA__MQTT_HOST'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_PORT']               = int(request.json['LIBCAMERA__MQTT_PORT'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_USERNAME']           = str(request.json['LIBCAMERA__MQTT_USERNAME'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_PASSWORD']           = str(request.json['LIBCAMERA__MQTT_PASSWORD'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_QOS']                = int(request.json['LIBCAMERA__MQTT_QOS'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_TLS']                = bool(request.json['LIBCAMERA__MQTT_TLS'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_CERT_BYPASS']        = bool(request.json['LIBCAMERA__MQTT_CERT_BYPASS'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_EXPOSURE_TOPIC']     = str(request.json['LIBCAMERA__MQTT_EXPOSURE_TOPIC'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_IMAGE_TOPIC']        = str(request.json['LIBCAMERA__MQTT_IMAGE_TOPIC'])
+        self.indi_allsky_config['LIBCAMERA']['MQTT_METADATA_TOPIC']     = str(request.json['LIBCAMERA__MQTT_METADATA_TOPIC'])
+        self.indi_allsky_config['PYCURL_CAMERA']['URL']                 = str(request.json['PYCURL_CAMERA__URL'])
+        self.indi_allsky_config['PYCURL_CAMERA']['IMAGE_FILE_TYPE']     = str(request.json['PYCURL_CAMERA__IMAGE_FILE_TYPE'])
+        self.indi_allsky_config['PYCURL_CAMERA']['USERNAME']            = str(request.json['PYCURL_CAMERA__USERNAME'])
+        self.indi_allsky_config['PYCURL_CAMERA']['PASSWORD']            = str(request.json['PYCURL_CAMERA__PASSWORD'])
+        self.indi_allsky_config['ACCUM_CAMERA']['SUB_EXPOSURE_MAX']     = float(request.json['ACCUM_CAMERA__SUB_EXPOSURE_MAX'])
+        self.indi_allsky_config['ACCUM_CAMERA']['EVEN_EXPOSURES']       = bool(request.json['ACCUM_CAMERA__EVEN_EXPOSURES'])
+        self.indi_allsky_config['ACCUM_CAMERA']['CLAMP_16BIT']          = bool(request.json['ACCUM_CAMERA__CLAMP_16BIT'])
+        self.indi_allsky_config['TEST_CAMERA']['WIDTH']                 = int(request.json['TEST_CAMERA__WIDTH'])
+        self.indi_allsky_config['TEST_CAMERA']['HEIGHT']                = int(request.json['TEST_CAMERA__HEIGHT'])
+        self.indi_allsky_config['TEST_CAMERA']['IMAGE_CIRCLE_DIAMETER'] = int(request.json['TEST_CAMERA__IMAGE_CIRCLE_DIAMETER'])
+        self.indi_allsky_config['TEST_CAMERA']['IMAGE_CIRCLE_OFFSET_X'] = int(request.json['TEST_CAMERA__IMAGE_CIRCLE_OFFSET_X'])
+        self.indi_allsky_config['TEST_CAMERA']['IMAGE_CIRCLE_OFFSET_Y'] = int(request.json['TEST_CAMERA__IMAGE_CIRCLE_OFFSET_Y'])
+        self.indi_allsky_config['TEST_CAMERA']['ROTATING_STAR_COUNT']   = int(request.json['TEST_CAMERA__ROTATING_STAR_COUNT'])
+        self.indi_allsky_config['TEST_CAMERA']['ROTATING_STAR_FACTOR']  = float(request.json['TEST_CAMERA__ROTATING_STAR_FACTOR'])
+        self.indi_allsky_config['TEST_CAMERA']['BUBBLE_COUNT']          = int(request.json['TEST_CAMERA__BUBBLE_COUNT'])
+        self.indi_allsky_config['VIRTUALSKY']['MAGNITUDE']              = float(request.json['VIRTUALSKY__MAGNITUDE'])
+        self.indi_allsky_config['VIRTUALSKY']['CONSTELLATIONS']         = bool(request.json['VIRTUALSKY__CONSTELLATIONS'])
+        self.indi_allsky_config['VIRTUALSKY']['CONSTELLATIONLABELS']    = bool(request.json['VIRTUALSKY__CONSTELLATIONLABELS'])
+        self.indi_allsky_config['VIRTUALSKY']['SHOWSTARS']              = bool(request.json['VIRTUALSKY__SHOWSTARS'])
+        self.indi_allsky_config['VIRTUALSKY']['SHOWSTARLABELS']         = bool(request.json['VIRTUALSKY__SHOWSTARLABELS'])
+        self.indi_allsky_config['VIRTUALSKY']['SHOWPLANETS']            = bool(request.json['VIRTUALSKY__SHOWPLANETS'])
+        self.indi_allsky_config['VIRTUALSKY']['SHOWPLANETLABELS']       = bool(request.json['VIRTUALSKY__SHOWPLANETLABELS'])
+        self.indi_allsky_config['VIRTUALSKY']['IMAGE_CIRCLE_DIAMETER']  = int(request.json['VIRTUALSKY__IMAGE_CIRCLE_DIAMETER'])
+        self.indi_allsky_config['VIRTUALSKY']['LATITUDE_OFFSET']        = float(request.json['VIRTUALSKY__LATITUDE_OFFSET'])
+        self.indi_allsky_config['VIRTUALSKY']['LONGITUDE_OFFSET']       = float(request.json['VIRTUALSKY__LONGITUDE_OFFSET'])
+        self.indi_allsky_config['VIRTUALSKY']['OFFSET_X']               = int(request.json['VIRTUALSKY__OFFSET_X'])
+        self.indi_allsky_config['VIRTUALSKY']['OFFSET_Y']               = int(request.json['VIRTUALSKY__OFFSET_Y'])
+        #self.indi_allsky_config['VIRTUALSKY']['FLIP_NS']                = bool(request.json['VIRTUALSKY__FLIP_NS'])
+        #self.indi_allsky_config['VIRTUALSKY']['FLIP_EW']                = bool(request.json['VIRTUALSKY__FLIP_EW'])
+        self.indi_allsky_config['CIRCULAR_DISPLAY']['ENABLE']           = bool(request.json['CIRCULAR_DISPLAY__ENABLE'])
+        self.indi_allsky_config['CIRCULAR_DISPLAY']['RESOLUTION']       = int(request.json['CIRCULAR_DISPLAY__RESOLUTION'])
+        self.indi_allsky_config['CIRCULAR_DISPLAY']['IMAGE_CIRCLE_DIAMETER'] = int(request.json['CIRCULAR_DISPLAY__IMAGE_CIRCLE_DIAMETER'])
+        self.indi_allsky_config['FOCUSER']['CLASSNAME']                 = str(request.json['FOCUSER__CLASSNAME'])
+        self.indi_allsky_config['FOCUSER']['GPIO_PIN_1']                = str(request.json['FOCUSER__GPIO_PIN_1'])
+        self.indi_allsky_config['FOCUSER']['GPIO_PIN_2']                = str(request.json['FOCUSER__GPIO_PIN_2'])
+        self.indi_allsky_config['FOCUSER']['GPIO_PIN_3']                = str(request.json['FOCUSER__GPIO_PIN_3'])
+        self.indi_allsky_config['FOCUSER']['GPIO_PIN_4']                = str(request.json['FOCUSER__GPIO_PIN_4'])
+        self.indi_allsky_config['FOCUSER']['I2C_ADDRESS']               = str(request.json['FOCUSER__I2C_ADDRESS'])
+        self.indi_allsky_config['DEW_HEATER']['CLASSNAME']              = str(request.json['DEW_HEATER__CLASSNAME'])
+        self.indi_allsky_config['DEW_HEATER']['I2C_ADDRESS']            = str(request.json['DEW_HEATER__I2C_ADDRESS'])
+        self.indi_allsky_config['DEW_HEATER']['PIN_1']                  = str(request.json['DEW_HEATER__PIN_1'])
+        self.indi_allsky_config['DEW_HEATER']['INVERT_OUTPUT']          = bool(request.json['DEW_HEATER__INVERT_OUTPUT'])
+        self.indi_allsky_config['DEW_HEATER']['ENABLE_DAY']             = bool(request.json['DEW_HEATER__ENABLE_DAY'])
+        self.indi_allsky_config['DEW_HEATER']['LEVEL_DEF']              = int(request.json['DEW_HEATER__LEVEL_DEF'])
+        self.indi_allsky_config['DEW_HEATER']['THOLD_ENABLE']           = bool(request.json['DEW_HEATER__THOLD_ENABLE'])
+        self.indi_allsky_config['DEW_HEATER']['MANUAL_TARGET']          = float(request.json['DEW_HEATER__MANUAL_TARGET'])
+        self.indi_allsky_config['DEW_HEATER']['TEMP_USER_VAR_SLOT']     = str(request.json['DEW_HEATER__TEMP_USER_VAR_SLOT'])
+        self.indi_allsky_config['DEW_HEATER']['DEWPOINT_USER_VAR_SLOT'] = str(request.json['DEW_HEATER__DEWPOINT_USER_VAR_SLOT'])
+        self.indi_allsky_config['DEW_HEATER']['LEVEL_LOW']              = int(request.json['DEW_HEATER__LEVEL_LOW'])
+        self.indi_allsky_config['DEW_HEATER']['LEVEL_MED']              = int(request.json['DEW_HEATER__LEVEL_MED'])
+        self.indi_allsky_config['DEW_HEATER']['LEVEL_HIGH']             = int(request.json['DEW_HEATER__LEVEL_HIGH'])
+        self.indi_allsky_config['DEW_HEATER']['THOLD_DIFF_LOW']         = int(request.json['DEW_HEATER__THOLD_DIFF_LOW'])
+        self.indi_allsky_config['DEW_HEATER']['THOLD_DIFF_MED']         = int(request.json['DEW_HEATER__THOLD_DIFF_MED'])
+        self.indi_allsky_config['DEW_HEATER']['THOLD_DIFF_HIGH']        = int(request.json['DEW_HEATER__THOLD_DIFF_HIGH'])
+        self.indi_allsky_config['DEW_HEATER']['HOLD_SECONDS']           = int(request.json['DEW_HEATER__HOLD_SECONDS'])
+        self.indi_allsky_config['DEW_HEATER']['PWM_FREQUENCY']          = int(request.json['DEW_HEATER__PWM_FREQUENCY'])
+        self.indi_allsky_config['FAN']['CLASSNAME']                     = str(request.json['FAN__CLASSNAME'])
+        self.indi_allsky_config['FAN']['I2C_ADDRESS']                   = str(request.json['FAN__I2C_ADDRESS'])
+        self.indi_allsky_config['FAN']['PIN_1']                         = str(request.json['FAN__PIN_1'])
+        self.indi_allsky_config['FAN']['INVERT_OUTPUT']                 = bool(request.json['FAN__INVERT_OUTPUT'])
+        self.indi_allsky_config['FAN']['ENABLE_NIGHT']                  = bool(request.json['FAN__ENABLE_NIGHT'])
+        self.indi_allsky_config['FAN']['LEVEL_DEF']                     = int(request.json['FAN__LEVEL_DEF'])
+        self.indi_allsky_config['FAN']['THOLD_ENABLE']                  = bool(request.json['FAN__THOLD_ENABLE'])
+        self.indi_allsky_config['FAN']['TARGET']                        = float(request.json['FAN__TARGET'])
+        self.indi_allsky_config['FAN']['TEMP_USER_VAR_SLOT']            = str(request.json['FAN__TEMP_USER_VAR_SLOT'])
+        self.indi_allsky_config['FAN']['LEVEL_LOW']                     = int(request.json['FAN__LEVEL_LOW'])
+        self.indi_allsky_config['FAN']['LEVEL_MED']                     = int(request.json['FAN__LEVEL_MED'])
+        self.indi_allsky_config['FAN']['LEVEL_HIGH']                    = int(request.json['FAN__LEVEL_HIGH'])
+        self.indi_allsky_config['FAN']['THOLD_DIFF_LOW']                = int(request.json['FAN__THOLD_DIFF_LOW'])
+        self.indi_allsky_config['FAN']['THOLD_DIFF_MED']                = int(request.json['FAN__THOLD_DIFF_MED'])
+        self.indi_allsky_config['FAN']['THOLD_DIFF_HIGH']               = int(request.json['FAN__THOLD_DIFF_HIGH'])
+        self.indi_allsky_config['FAN']['HOLD_SECONDS']                  = int(request.json['FAN__HOLD_SECONDS'])
+        self.indi_allsky_config['FAN']['PWM_FREQUENCY']                 = int(request.json['FAN__PWM_FREQUENCY'])
+        self.indi_allsky_config['GENERIC_GPIO']['A_CLASSNAME']          = str(request.json['GENERIC_GPIO__A_CLASSNAME'])
+        self.indi_allsky_config['GENERIC_GPIO']['A_I2C_ADDRESS']        = str(request.json['GENERIC_GPIO__A_I2C_ADDRESS'])
+        self.indi_allsky_config['GENERIC_GPIO']['A_PIN_1']              = str(request.json['GENERIC_GPIO__A_PIN_1'])
+        self.indi_allsky_config['GENERIC_GPIO']['A_INVERT_OUTPUT']      = bool(request.json['GENERIC_GPIO__A_INVERT_OUTPUT'])
+        self.indi_allsky_config['MANUAL_GPIO']['A_CLASSNAME']           = str(request.json['MANUAL_GPIO__A_CLASSNAME'])
+        self.indi_allsky_config['MANUAL_GPIO']['A_PIN_1']               = str(request.json['MANUAL_GPIO__A_PIN_1'])
+        self.indi_allsky_config['MANUAL_GPIO']['A_PIN_2']               = str(request.json['MANUAL_GPIO__A_PIN_2'])
+        self.indi_allsky_config['MANUAL_GPIO']['A_PIN_3']               = str(request.json['MANUAL_GPIO__A_PIN_3'])
+        self.indi_allsky_config['DEVICE']['MQTT_TRANSPORT']             = str(request.json['DEVICE__MQTT_TRANSPORT'])
+        self.indi_allsky_config['DEVICE']['MQTT_PROTOCOL']              = str(request.json['DEVICE__MQTT_PROTOCOL'])
+        self.indi_allsky_config['DEVICE']['MQTT_HOST']                  = str(request.json['DEVICE__MQTT_HOST'])
+        self.indi_allsky_config['DEVICE']['MQTT_PORT']                  = int(request.json['DEVICE__MQTT_PORT'])
+        self.indi_allsky_config['DEVICE']['MQTT_USERNAME']              = str(request.json['DEVICE__MQTT_USERNAME'])
+        self.indi_allsky_config['DEVICE']['MQTT_PASSWORD']              = str(request.json['DEVICE__MQTT_PASSWORD'])
+        self.indi_allsky_config['DEVICE']['MQTT_QOS']                   = int(request.json['DEVICE__MQTT_QOS'])
+        self.indi_allsky_config['DEVICE']['MQTT_TLS']                   = bool(request.json['DEVICE__MQTT_TLS'])
+        self.indi_allsky_config['DEVICE']['MQTT_CERT_BYPASS']           = bool(request.json['DEVICE__MQTT_CERT_BYPASS'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_CLASSNAME']           = str(request.json['TEMP_SENSOR__A_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_LABEL']               = str(request.json['TEMP_SENSOR__A_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_PIN_1']               = str(request.json['TEMP_SENSOR__A_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_PIN_2']               = str(request.json['TEMP_SENSOR__A_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__A_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__A_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['A_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__A_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_CLASSNAME']           = str(request.json['TEMP_SENSOR__B_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_LABEL']               = str(request.json['TEMP_SENSOR__B_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_PIN_1']               = str(request.json['TEMP_SENSOR__B_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_PIN_2']               = str(request.json['TEMP_SENSOR__B_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__B_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__B_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['B_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__B_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_CLASSNAME']           = str(request.json['TEMP_SENSOR__C_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_LABEL']               = str(request.json['TEMP_SENSOR__C_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_PIN_1']               = str(request.json['TEMP_SENSOR__C_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_PIN_2']               = str(request.json['TEMP_SENSOR__C_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__C_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__C_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['C_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__C_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_CLASSNAME']           = str(request.json['TEMP_SENSOR__D_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_LABEL']               = str(request.json['TEMP_SENSOR__D_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_PIN_1']               = str(request.json['TEMP_SENSOR__D_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_PIN_2']               = str(request.json['TEMP_SENSOR__D_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__D_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__D_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['D_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__D_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_CLASSNAME']           = str(request.json['TEMP_SENSOR__E_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_LABEL']               = str(request.json['TEMP_SENSOR__E_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_PIN_1']               = str(request.json['TEMP_SENSOR__E_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_PIN_2']               = str(request.json['TEMP_SENSOR__E_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__E_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__E_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['E_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__E_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_CLASSNAME']           = str(request.json['TEMP_SENSOR__F_CLASSNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_LABEL']               = str(request.json['TEMP_SENSOR__F_LABEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_PIN_1']               = str(request.json['TEMP_SENSOR__F_PIN_1'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_PIN_2']               = str(request.json['TEMP_SENSOR__F_PIN_2'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_USER_VAR_SLOT']       = str(request.json['TEMP_SENSOR__F_USER_VAR_SLOT'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_I2C_ADDRESS']         = str(request.json['TEMP_SENSOR__F_I2C_ADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['F_TITLE_TEMPLATE']      = str(request.json['TEMP_SENSOR__F_TITLE_TEMPLATE'])
+        self.indi_allsky_config['TEMP_SENSOR']['FC37_ACTIVE_LOW']       = bool(request.json['TEMP_SENSOR__FC37_ACTIVE_LOW'])
+        self.indi_allsky_config['TEMP_SENSOR']['OPENWEATHERMAP_APIKEY'] = str(request.json['TEMP_SENSOR__OPENWEATHERMAP_APIKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['WUNDERGROUND_APIKEY']   = str(request.json['TEMP_SENSOR__WUNDERGROUND_APIKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['ASTROSPHERIC_APIKEY']   = str(request.json['TEMP_SENSOR__ASTROSPHERIC_APIKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['AMBIENTWEATHER_APIKEY']         = str(request.json['TEMP_SENSOR__AMBIENTWEATHER_APIKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['AMBIENTWEATHER_APPLICATIONKEY'] = str(request.json['TEMP_SENSOR__AMBIENTWEATHER_APPLICATIONKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['AMBIENTWEATHER_MACADDRESS']     = str(request.json['TEMP_SENSOR__AMBIENTWEATHER_MACADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['ECOWITT_APIKEY']         = str(request.json['TEMP_SENSOR__ECOWITT_APIKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['ECOWITT_APPLICATIONKEY'] = str(request.json['TEMP_SENSOR__ECOWITT_APPLICATIONKEY'])
+        self.indi_allsky_config['TEMP_SENSOR']['ECOWITT_MACADDRESS']     = str(request.json['TEMP_SENSOR__ECOWITT_MACADDRESS'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_TRANSPORT']        = str(request.json['TEMP_SENSOR__MQTT_TRANSPORT'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_PROTOCOL']         = str(request.json['TEMP_SENSOR__MQTT_PROTOCOL'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_HOST']             = str(request.json['TEMP_SENSOR__MQTT_HOST'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_PORT']             = int(request.json['TEMP_SENSOR__MQTT_PORT'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_USERNAME']         = str(request.json['TEMP_SENSOR__MQTT_USERNAME'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_PASSWORD']         = str(request.json['TEMP_SENSOR__MQTT_PASSWORD'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_TLS']              = bool(request.json['TEMP_SENSOR__MQTT_TLS'])
+        self.indi_allsky_config['TEMP_SENSOR']['MQTT_CERT_BYPASS']      = bool(request.json['TEMP_SENSOR__MQTT_CERT_BYPASS'])
+        self.indi_allsky_config['TEMP_SENSOR']['DHT_USE_PULSEIO']       = bool(request.json['TEMP_SENSOR__DHT_USE_PULSEIO'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT3X_HEATER_NIGHT']    = bool(request.json['TEMP_SENSOR__SHT3X_HEATER_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT3X_HEATER_DAY']      = bool(request.json['TEMP_SENSOR__SHT3X_HEATER_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_MODE_NIGHT']      = str(request.json['TEMP_SENSOR__SHT4X_MODE_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_MODE_DAY']        = str(request.json['TEMP_SENSOR__SHT4X_MODE_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_ENABLE']   = bool(request.json['TEMP_SENSOR__SHT4X_HEATER_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_MODE']     = str(request.json['TEMP_SENSOR__SHT4X_HEATER_MODE'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_COMMAND']  = str(request.json['TEMP_SENSOR__SHT4X_HEATER_COMMAND'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_INTERVAL_S'] = float(request.json['TEMP_SENSOR__SHT4X_HEATER_INTERVAL_S'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_EQUILIBRATION_S'] = float(request.json['TEMP_SENSOR__SHT4X_HEATER_EQUILIBRATION_S'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_PULSES']   = int(request.json['TEMP_SENSOR__SHT4X_HEATER_PULSES'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_MAX_DUTY'] = float(request.json['TEMP_SENSOR__SHT4X_HEATER_MAX_DUTY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_RH_ON']    = float(request.json['TEMP_SENSOR__SHT4X_HEATER_RH_ON'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_HEATER_RH_OFF']   = float(request.json['TEMP_SENSOR__SHT4X_HEATER_RH_OFF'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_ENABLE']    = bool(request.json['TEMP_SENSOR__SHT4X_REGEN_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_INTERVAL_DAYS'] = float(request.json['TEMP_SENSOR__SHT4X_REGEN_INTERVAL_DAYS'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_COMMAND']   = str(request.json['TEMP_SENSOR__SHT4X_REGEN_COMMAND'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_PULSES']    = int(request.json['TEMP_SENSOR__SHT4X_REGEN_PULSES'])
+        self.indi_allsky_config['TEMP_SENSOR']['SHT4X_REGEN_EQUILIBRATION_S'] = float(request.json['TEMP_SENSOR__SHT4X_REGEN_EQUILIBRATION_S'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI7021_HEATER_LEVEL_NIGHT'] = int(request.json['TEMP_SENSOR__SI7021_HEATER_LEVEL_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI7021_HEATER_LEVEL_DAY'] = int(request.json['TEMP_SENSOR__SI7021_HEATER_LEVEL_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['HTU31D_HEATER_NIGHT']   = bool(request.json['TEMP_SENSOR__HTU31D_HEATER_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['HTU31D_HEATER_DAY']     = bool(request.json['TEMP_SENSOR__HTU31D_HEATER_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['HDC302X_HEATER_NIGHT']  = str(request.json['TEMP_SENSOR__HDC302X_HEATER_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['HDC302X_HEATER_DAY']    = str(request.json['TEMP_SENSOR__HDC302X_HEATER_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2561_GAIN_NIGHT']    = int(request.json['TEMP_SENSOR__TSL2561_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2561_GAIN_DAY']      = int(request.json['TEMP_SENSOR__TSL2561_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2561_INT_NIGHT']     = int(request.json['TEMP_SENSOR__TSL2561_INT_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2561_INT_DAY']       = int(request.json['TEMP_SENSOR__TSL2561_INT_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2561_DISABLE_DAY']   = bool(request.json['TEMP_SENSOR__TSL2561_DISABLE_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2591_GAIN_NIGHT']    = str(request.json['TEMP_SENSOR__TSL2591_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2591_GAIN_DAY']      = str(request.json['TEMP_SENSOR__TSL2591_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2591_INT_NIGHT']     = str(request.json['TEMP_SENSOR__TSL2591_INT_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2591_INT_DAY']       = str(request.json['TEMP_SENSOR__TSL2591_INT_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['TSL2591_DISABLE_DAY']   = bool(request.json['TEMP_SENSOR__TSL2591_DISABLE_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['VEML7700_GAIN_NIGHT']   = str(request.json['TEMP_SENSOR__VEML7700_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['VEML7700_GAIN_DAY']     = str(request.json['TEMP_SENSOR__VEML7700_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['VEML7700_INT_NIGHT']    = str(request.json['TEMP_SENSOR__VEML7700_INT_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['VEML7700_INT_DAY']      = str(request.json['TEMP_SENSOR__VEML7700_INT_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_VIS_GAIN_NIGHT'] = str(request.json['TEMP_SENSOR__SI1145_VIS_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_VIS_GAIN_DAY']   = str(request.json['TEMP_SENSOR__SI1145_VIS_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_IR_GAIN_NIGHT']  = str(request.json['TEMP_SENSOR__SI1145_IR_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_IR_GAIN_DAY']    = str(request.json['TEMP_SENSOR__SI1145_IR_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_VIS_RANGE_HIGH_NIGHT'] = bool(request.json['TEMP_SENSOR__SI1145_VIS_RANGE_HIGH_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_IR_RANGE_HIGH_NIGHT']  = bool(request.json['TEMP_SENSOR__SI1145_IR_RANGE_HIGH_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_VIS_RANGE_HIGH_DAY']   = bool(request.json['TEMP_SENSOR__SI1145_VIS_RANGE_HIGH_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['SI1145_IR_RANGE_HIGH_DAY']    = bool(request.json['TEMP_SENSOR__SI1145_IR_RANGE_HIGH_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['LTR390_GAIN_NIGHT']     = str(request.json['TEMP_SENSOR__LTR390_GAIN_NIGHT'])
+        self.indi_allsky_config['TEMP_SENSOR']['LTR390_GAIN_DAY']       = str(request.json['TEMP_SENSOR__LTR390_GAIN_DAY'])
+        self.indi_allsky_config['TEMP_SENSOR']['INA3221_CH1_ENABLE']    = bool(request.json['TEMP_SENSOR__INA3221_CH1_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['INA3221_CH2_ENABLE']    = bool(request.json['TEMP_SENSOR__INA3221_CH2_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['INA3221_CH3_ENABLE']    = bool(request.json['TEMP_SENSOR__INA3221_CH3_ENABLE'])
+        self.indi_allsky_config['TEMP_SENSOR']['AS3935_OUTDOOR_MODE']   = bool(request.json['TEMP_SENSOR__AS3935_OUTDOOR_MODE'])
+        self.indi_allsky_config['TEMP_SENSOR']['AS3935_MASK_DISTURBER'] = bool(request.json['TEMP_SENSOR__AS3935_MASK_DISTURBER'])
+        self.indi_allsky_config['TEMP_SENSOR']['AS3935_NOISE_LEVEL']    = int(request.json['TEMP_SENSOR__AS3935_NOISE_LEVEL'])
+        self.indi_allsky_config['TEMP_SENSOR']['AS3935_SPIKE_REJECTION'] = int(request.json['TEMP_SENSOR__AS3935_SPIKE_REJECTION'])
+        self.indi_allsky_config['TEMP_SENSOR']['LUX_MAGNITUDE_OFFSET']  = float(request.json['TEMP_SENSOR__LUX_MAGNITUDE_OFFSET'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_1']              = str(request.json['CHARTS__CUSTOM_SLOT_1'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_1_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_1_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_2']              = str(request.json['CHARTS__CUSTOM_SLOT_2'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_2_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_2_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_3']              = str(request.json['CHARTS__CUSTOM_SLOT_3'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_3_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_3_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_4']              = str(request.json['CHARTS__CUSTOM_SLOT_4'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_4_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_4_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_5']              = str(request.json['CHARTS__CUSTOM_SLOT_5'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_5_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_5_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_6']              = str(request.json['CHARTS__CUSTOM_SLOT_6'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_6_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_6_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_7']              = str(request.json['CHARTS__CUSTOM_SLOT_7'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_7_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_7_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_8']              = str(request.json['CHARTS__CUSTOM_SLOT_8'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_8_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_8_MIN'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_9']              = str(request.json['CHARTS__CUSTOM_SLOT_9'])
+        self.indi_allsky_config['CHARTS']['CUSTOM_SLOT_9_MIN']          = float(request.json['CHARTS__CUSTOM_SLOT_9_MIN'])
+        self.indi_allsky_config['ADSB']['ENABLE']                       = bool(request.json['ADSB__ENABLE'])
+        self.indi_allsky_config['ADSB']['DUMP1090_URL']                 = str(request.json['ADSB__DUMP1090_URL'])
+        self.indi_allsky_config['ADSB']['USERNAME']                     = str(request.json['ADSB__USERNAME'])
+        self.indi_allsky_config['ADSB']['PASSWORD']                     = str(request.json['ADSB__PASSWORD'])
+        self.indi_allsky_config['ADSB']['CERT_BYPASS']                  = bool(request.json['ADSB__CERT_BYPASS'])
+        self.indi_allsky_config['ADSB']['ALT_DEG_MIN']                  = float(request.json['ADSB__ALT_DEG_MIN'])
+        self.indi_allsky_config['ADSB']['LABEL_ENABLE']                 = bool(request.json['ADSB__LABEL_ENABLE'])
+        self.indi_allsky_config['ADSB']['LABEL_LIMIT']                  = int(request.json['ADSB__LABEL_LIMIT'])
+        self.indi_allsky_config['ADSB']['AIRCRAFT_LABEL_TEMPLATE']      = str(request.json['ADSB__AIRCRAFT_LABEL_TEMPLATE'])
+        self.indi_allsky_config['ADSB']['IMAGE_LABEL_TEMPLATE_PREFIX']  = str(request.json['ADSB__IMAGE_LABEL_TEMPLATE_PREFIX'])
+        self.indi_allsky_config['SATELLITE_TRACK']['ENABLE']            = bool(request.json['SATELLITE_TRACK__ENABLE'])
+        self.indi_allsky_config['SATELLITE_TRACK']['DAYTIME_TRACK']     = bool(request.json['SATELLITE_TRACK__DAYTIME_TRACK'])
+        self.indi_allsky_config['SATELLITE_TRACK']['ALT_DEG_MIN']       = float(request.json['SATELLITE_TRACK__ALT_DEG_MIN'])
+        self.indi_allsky_config['SATELLITE_TRACK']['LABEL_ENABLE']      = bool(request.json['SATELLITE_TRACK__LABEL_ENABLE'])
+        self.indi_allsky_config['SATELLITE_TRACK']['LABEL_LIMIT']       = int(request.json['SATELLITE_TRACK__LABEL_LIMIT'])
+        self.indi_allsky_config['SATELLITE_TRACK']['SAT_LABEL_TEMPLATE'] = str(request.json['SATELLITE_TRACK__SAT_LABEL_TEMPLATE'])
+        self.indi_allsky_config['SATELLITE_TRACK']['IMAGE_LABEL_TEMPLATE_PREFIX']  = str(request.json['SATELLITE_TRACK__IMAGE_LABEL_TEMPLATE_PREFIX'])
+        self.indi_allsky_config['FILETRANSFER']['LIBCURL_OPTIONS']      = json.loads(str(request.json['FILETRANSFER__LIBCURL_OPTIONS']))
+        self.indi_allsky_config['INDI_CONFIG_DEFAULTS']                 = json.loads(str(request.json['INDI_CONFIG_DEFAULTS']))
+        self.indi_allsky_config['INDI_CONFIG_DAY']                      = json.loads(str(request.json['INDI_CONFIG_DAY']))
+        self.indi_allsky_config['ENCRYPT_PASSWORDS']                    = bool(request.json['ENCRYPT_PASSWORDS'])
+
+
+        ### never disable
+        #self.indi_allsky_config['THUMBNAILS']['IMAGES_AUTO']            = True
+
+
+        ### Not a config option
+        reload_on_save                                                  = bool(request.json['RELOAD_ON_SAVE'])
+        config_note                                                     = str(request.json['CONFIG_NOTE'])
+
+
+        # ADU_ROI
+        adu_roi_x1 = int(request.json['ADU_ROI_X1'])
+        adu_roi_y1 = int(request.json['ADU_ROI_Y1'])
+        adu_roi_x2 = int(request.json['ADU_ROI_X2'])
+        adu_roi_y2 = int(request.json['ADU_ROI_Y2'])
+
+        # the x2 and y2 values must be positive integers in order to be enabled and valid
+        if adu_roi_x2 and adu_roi_y2:
+            self.indi_allsky_config['ADU_ROI'] = [adu_roi_x1, adu_roi_y1, adu_roi_x2, adu_roi_y2]
+        else:
+            self.indi_allsky_config['ADU_ROI'] = []
+
+
+        # SQM_ROI
+        sqm_roi_x1 = int(request.json['SQM_ROI_X1'])
+        sqm_roi_y1 = int(request.json['SQM_ROI_Y1'])
+        sqm_roi_x2 = int(request.json['SQM_ROI_X2'])
+        sqm_roi_y2 = int(request.json['SQM_ROI_Y2'])
+
+        # the x2 and y2 values must be positive integers in order to be enabled and valid
+        if sqm_roi_x2 and sqm_roi_y2:
+            self.indi_allsky_config['SQM_ROI'] = [sqm_roi_x1, sqm_roi_y1, sqm_roi_x2, sqm_roi_y2]
+        else:
+            self.indi_allsky_config['SQM_ROI'] = []
+
+
+        # IMAGE_CROP_ROI
+        image_crop_roi_x1 = int(request.json['IMAGE_CROP_ROI_X1'])
+        image_crop_roi_y1 = int(request.json['IMAGE_CROP_ROI_Y1'])
+        image_crop_roi_x2 = int(request.json['IMAGE_CROP_ROI_X2'])
+        image_crop_roi_y2 = int(request.json['IMAGE_CROP_ROI_Y2'])
+
+        # the x2 and y2 values must be positive integers in order to be enabled and valid
+        if image_crop_roi_x2 and image_crop_roi_y2:
+            self.indi_allsky_config['IMAGE_CROP_ROI'] = [image_crop_roi_x1, image_crop_roi_y1, image_crop_roi_x2, image_crop_roi_y2]
+        else:
+            self.indi_allsky_config['IMAGE_CROP_ROI'] = []
+
+
+
+        # TEXT_PROPERTIES FONT_COLOR
+        font_color_str = str(request.json['TEXT_PROPERTIES__FONT_COLOR'])
+        self.indi_allsky_config['TEXT_PROPERTIES']['FONT_COLOR'] = [int(x) for x in font_color_str.split(',')]
+
+        # CARDINAL_DIRS FONT_COLOR
+        cardinal_dirs_color_str = str(request.json['CARDINAL_DIRS__FONT_COLOR'])
+        self.indi_allsky_config['CARDINAL_DIRS']['FONT_COLOR'] = [int(x) for x in cardinal_dirs_color_str.split(',')]
+
+        # ORB_PROPERTIES SUN_COLOR
+        sun_color_str = str(request.json['ORB_PROPERTIES__SUN_COLOR'])
+        self.indi_allsky_config['ORB_PROPERTIES']['SUN_COLOR'] = [int(x) for x in sun_color_str.split(',')]
+
+        # ORB_PROPERTIES MOON_COLOR
+        moon_color_str = str(request.json['ORB_PROPERTIES__MOON_COLOR'])
+        self.indi_allsky_config['ORB_PROPERTIES']['MOON_COLOR'] = [int(x) for x in moon_color_str.split(',')]
+
+        # IMAGE_BORDER COLOR
+        image_border__color_str = str(request.json['IMAGE_BORDER__COLOR'])
+        self.indi_allsky_config['IMAGE_BORDER']['COLOR'] = [int(x) for x in image_border__color_str.split(',')]
+
+        # LIGHTGRAPH COLORS
+        lightgraph_overlay__day_color_str = str(request.json['LIGHTGRAPH_OVERLAY__DAY_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['DAY_COLOR'] = [int(x) for x in lightgraph_overlay__day_color_str.split(',')]
+
+        lightgraph_overlay__dusk_color_str = str(request.json['LIGHTGRAPH_OVERLAY__DUSK_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['DUSK_COLOR'] = [int(x) for x in lightgraph_overlay__dusk_color_str.split(',')]
+
+        lightgraph_overlay__night_color_str = str(request.json['LIGHTGRAPH_OVERLAY__NIGHT_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['NIGHT_COLOR'] = [int(x) for x in lightgraph_overlay__night_color_str.split(',')]
+
+        lightgraph_overlay__moonmode_color_str = str(request.json['LIGHTGRAPH_OVERLAY__MOONMODE_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['MOONMODE_COLOR'] = [int(x) for x in lightgraph_overlay__moonmode_color_str.split(',')]
+
+        lightgraph_overlay__hour_color_str = str(request.json['LIGHTGRAPH_OVERLAY__HOUR_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['HOUR_COLOR'] = [int(x) for x in lightgraph_overlay__hour_color_str.split(',')]
+
+        lightgraph_overlay__border_color_str = str(request.json['LIGHTGRAPH_OVERLAY__BORDER_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['BORDER_COLOR'] = [int(x) for x in lightgraph_overlay__border_color_str.split(',')]
+
+        lightgraph_overlay__now_color_str = str(request.json['LIGHTGRAPH_OVERLAY__NOW_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['NOW_COLOR'] = [int(x) for x in lightgraph_overlay__now_color_str.split(',')]
+
+        lightgraph_overlay__font_color_str = str(request.json['LIGHTGRAPH_OVERLAY__FONT_COLOR'])
+        self.indi_allsky_config['LIGHTGRAPH_OVERLAY']['FONT_COLOR'] = [int(x) for x in lightgraph_overlay__font_color_str.split(',')]
+
+
+        # Youtube tags
+        youtube__tags_str = str(request.json['YOUTUBE__TAGS_STR'])
+        tags_set = set()
+        for tag in youtube__tags_str.split(','):
+            tag_s = tag.strip()
+
+            if tag_s:
+                tags_set.add(tag_s)
+
+        self.indi_allsky_config['YOUTUBE']['TAGS'] = list(tags_set)
+
+
+        # save new config
+        if not app.config['LOGIN_DISABLED']:
+            username = current_user.username
+        else:
+            username = 'system'
+
+
+        try:
+            self._indi_allsky_config_obj.save(username, config_note)
+            app.logger.info('Saved new config')
+        except ConfigSaveException as e:
+            error_data = {
+                'form_global' : [str(e)],
+            }
+            return jsonify(error_data), 400
+
+        # Check if Allsky Map reporting is enabled, and fire a test ping
+        ping_status_msg = ""
+        if self.indi_allsky_config.get('ALLSKYMAP', {}).get('ENABLE'):
+            from ..allsky_map import send_allsky_map_ping
+            success, msg = send_allsky_map_ping(self.indi_allsky_config, app.logger)
+            if success:
+                ping_status_msg = " | Allsky Map Ping: Success!"
+            else:
+                ping_status_msg = f" | Allsky Map Ping Warning: {msg}"
+
+        if reload_on_save:
+            self._miscDb.setState('STATUS', constants.STATUS_RELOADING)
+
+            task_reload = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.MAIN,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data={'action' : 'reload'},
+            )
+
+            db.session.add(task_reload)
+            db.session.commit()
+
+            message = {
+                'success-message' : f'Saved new config. Reloading indi-allsky service.{ping_status_msg}',
+            }
+        else:
+            message = {
+                'success-message' : f'Saved new config.{ping_status_msg}',
+            }
+
+        return jsonify(message)
+
+
+class AjaxAllskyMapRequestKeyView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                return jsonify({'error': 'You do not have permission to make configuration changes'}), 400
+
+        api_url = request.json.get('API_URL') if request.json else None
+        if not api_url:
+            api_url = self.indi_allsky_config.get('ALLSKYMAP', {}).get('API_URL', 'https://allsky-map.com')
+
+        from ..allsky_map import request_allsky_map_api_key
+        success, res = request_allsky_map_api_key(api_url, app.logger)
+
+        if success:
+            return jsonify({'success': True, 'api_key': res})
+        else:
+            return jsonify({'error': res}), 400
+
+
+class AjaxSetTimeView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        form_settime = IndiAllskySetDateTimeForm(data=request.json)
+
+
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                form_errors = form_settime.errors  # this must be a property
+                form_errors['form_settime_global'] = ['You do not have permission to make configuration changes']
+                return jsonify(form_errors), 400
+
+
+        if not form_settime.validate():
+            form_errors = form_settime.errors  # this must be a property
+            form_errors['form_settime_global'] = ['Please fix the errors above']
+            return jsonify(form_errors), 400
+
+
+        new_datetime_str = str(request.json['NEW_DATETIME'])
+
+        new_datetime = datetime.strptime(new_datetime_str, '%Y-%m-%dT%H:%M:%S').astimezone()
+
+        new_datetime_utc = new_datetime.astimezone(tz=timezone.utc)
+
+
+        #systemtime_utc = datetime.now(tz=timezone.utc)
+
+        #time_offset = systemtime_utc.timestamp() - new_datetime_utc.timestamp()
+        #app.logger.info('Time offset: %ds', int(time_offset))
+
+        #task_settime = IndiAllSkyDbTaskQueueTable(
+        #    queue=TaskQueueQueue.MAIN,
+        #    state=TaskQueueState.MANUAL,
+        #    priority=100,
+        #    data={
+        #        'action'      : 'settime',
+        #        'time_offset' : time_offset,
+        #    },
+        #)
+
+        #db.session.add(task_settime)
+        #db.session.commit()
+
+        # form passed validation
+
+
+        try:
+            self.setTimeSystemd(new_datetime_utc)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('DBus Error: %s', str(e))
+            errors = {
+                'form_settime_global' : ['DBus Error: {0:s}'.format(str(e))],
+            }
+            return jsonify(errors), 400
+
+
+        message = {
+            'success-message' : 'System time updated.',
+        }
+
+        return jsonify(message)
+
+
+    def setTimeSystemd(self, new_datetime_utc):
+        app.logger.warning('Setting system time to %s (UTC)', new_datetime_utc)
+
+        epoch = new_datetime_utc.timestamp() + 5  # add 5 due to sleep below
+        epoch_msec = epoch * 1000000
+
+        system_bus = dbus.SystemBus()
+        timedate1 = system_bus.get_object('org.freedesktop.timedate1', '/org/freedesktop/timedate1')
+        manager = dbus.Interface(timedate1, 'org.freedesktop.timedate1')
+
+        app.logger.warning('Disabling NTP time sync')
+        manager.SetNTP(False, False)  # disable time sync
+        time.sleep(5.0)  # give enough time for time sync to diable
+
+        r2 = manager.SetTime(epoch_msec, False, False)
+
+        return r2
+
+
+class AjaxSetTimezoneView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        form_timezone = IndiAllskySetTimezoneForm(data=request.json)
+
+
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                form_errors = form_timezone.errors  # this must be a property
+                form_errors['form_timezone_global'] = ['You do not have permission to make configuration changes']
+                return jsonify(form_errors), 400
+
+
+        if not form_timezone.validate():
+            form_errors = form_timezone.errors  # this must be a property
+            form_errors['form_timezone_global'] = ['Please fix the errors above']
+            return jsonify(form_errors), 400
+
+
+        new_timezone_str = str(request.json['NEW_TIMEZONE'])
+
+
+        try:
+            self.setTimezoneSystemd(new_timezone_str)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('DBus Error: %s', str(e))
+            errors = {
+                'form_timezone_global' : ['DBus Error: {0:s}'.format(str(e))],
+            }
+            return jsonify(errors), 400
+
+
+        message = {
+            'success-message' : 'System timezone updated.',
+        }
+
+        return jsonify(message)
+
+
+    def setTimezoneSystemd(self, new_timezone_str):
+        app.logger.warning('Setting system timezone to %s', new_timezone_str)
+
+
+        system_bus = dbus.SystemBus()
+        timedate1 = system_bus.get_object('org.freedesktop.timedate1', '/org/freedesktop/timedate1')
+        manager = dbus.Interface(timedate1, 'org.freedesktop.timedate1')
+
+        r2 = manager.SetTimezone(new_timezone_str, False)
+
+        return r2
+
+
+class ImageViewerView(FormView):
+    page_title = 'Image Viewer'
+    decorators = [login_optional_media]
+
+    def get_context(self):
+        context = super(ImageViewerView, self).get_context()
+
+        form_data = {
+            'CAMERA_ID'    : self.camera.id,
+            'YEAR_SELECT'  : None,
+            'MONTH_SELECT' : None,
+            'DAY_SELECT'   : None,
+            'HOUR_SELECT'  : None,
+            'FILTER_DETECTIONS' : None,
+        }
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        context['panorama__enable'] = int(self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE', 0))
+
+        context['form_viewer'] = IndiAllskyImageViewerPreload(
+            data=form_data,
+            camera_id=self.camera.id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+        context['form_image_exclude'] = IndiAllskyImageExcludeForm()
+
+        return context
+
+
+class AjaxImageViewerView(BaseView):
+    methods = ['POST']
+    decorators = [login_optional_media]
+
+    def __init__(self, **kwargs):
+        super(AjaxImageViewerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id  = int(request.json['CAMERA_ID'])
+        form_year  = int(request.json.get('YEAR_SELECT', 0))
+        form_month = int(request.json.get('MONTH_SELECT', 0))
+        form_day   = int(request.json.get('DAY_SELECT', 0))
+        form_hour  = int(request.json.get('HOUR_SELECT', -1))  # 0 is a real hour
+        form_filter_detections = bool(request.json.get('FILTER_DETECTIONS'))
+
+        self.cameraSetup(camera_id=camera_id)
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+        asi676mc_diagnostic_download_enabled = bool(
+            self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('ENABLE', False)
+            and asi676mc.camera_record_matches(self.camera)
+        )
+
+
+        if form_filter_detections:
+            # filter images that have a detection
+            form_viewer = IndiAllskyImageViewer(
+                data=request.json,
+                camera_id=camera_id,
+                detections_count=1,
+                asi676mc_diagnostic_download_enabled=asi676mc_diagnostic_download_enabled,
+                s3_prefix=self.s3_prefix,
+                local=local,
+            )
+        else:
+            form_viewer = IndiAllskyImageViewer(
+                data=request.json,
+                camera_id=camera_id,
+                detections_count=0,
+                asi676mc_diagnostic_download_enabled=asi676mc_diagnostic_download_enabled,
+                s3_prefix=self.s3_prefix,
+                local=local,
+            )
+
+
+        json_data = {}
+
+
+        if form_hour >= 0:
+            form_datetime = datetime.strptime('{0} {1} {2} {3}'.format(form_year, form_month, form_day, form_hour), '%Y %m %d %H')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+            hour = form_datetime.hour
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+        elif form_day:
+            form_datetime = datetime.strptime('{0} {1} {2}'.format(form_year, form_month, form_day), '%Y %m %d')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            if json_data['HOUR_SELECT']:
+                hour = json_data['HOUR_SELECT'][0][0]
+                json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+            else:
+                json_data['IMAGE_DATA'] = []
+
+        elif form_month:
+            form_datetime = datetime.strptime('{0} {1}'.format(form_year, form_month), '%Y %m')
+
+            year = form_datetime.year
+            month = form_datetime.month
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            if json_data['DAY_SELECT']:
+                day = json_data['DAY_SELECT'][0][0]
+                json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                if json_data['HOUR_SELECT']:
+                    hour = json_data['HOUR_SELECT'][0][0]
+                    json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                else:
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        elif form_year:
+            form_datetime = datetime.strptime('{0}'.format(form_year), '%Y')
+
+            year = form_datetime.year
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            if json_data['MONTH_SELECT']:
+                month = json_data['MONTH_SELECT'][0][0]
+                json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+                if json_data['DAY_SELECT']:
+                    day = json_data['DAY_SELECT'][0][0]
+                    json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                    if json_data['HOUR_SELECT']:
+                        hour = json_data['HOUR_SELECT'][0][0]
+                        json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                    else:
+                        json_data['HOUR_SELECT'] = []
+                        json_data['IMAGE_DATA'] = []
+                else:
+                    json_data['DAY_SELECT'] = []
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['MONTH_SELECT'] = []
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        else:
+            # this happens when filtering images on detections
+            json_data['YEAR_SELECT'] = form_viewer.getYears()
+
+            if not json_data['YEAR_SELECT']:
+                # No images returned
+                json_data['YEAR_SELECT'] = (('', None),)
+                json_data['MONTH_SELECT'] = (('', None),)
+                json_data['DAY_SELECT'] = (('', None),)
+                json_data['HOUR_SELECT'] = (('', None),)
+                json_data['IMG_SELECT'] = (('', None),)
+
+                return json_data
+
+
+            year = json_data['YEAR_SELECT'][0][0]
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            month = json_data['MONTH_SELECT'][0][0]
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            day = json_data['DAY_SELECT'][0][0]
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            hour = json_data['HOUR_SELECT'][0][0]
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+
+        return jsonify(json_data)
+
+
+class FitsImageViewerView(FormView):
+    page_title = 'FITS Image Viewer'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(FitsImageViewerView, self).get_context()
+
+        form_data = {
+            'CAMERA_ID'    : self.camera.id,
+            'YEAR_SELECT'  : None,
+            'MONTH_SELECT' : None,
+            'DAY_SELECT'   : None,
+            'HOUR_SELECT'  : None,
+        }
+
+
+        context['form_fits_viewer'] = IndiAllskyFitsImageViewerPreload(
+            data=form_data,
+            camera_id=self.camera.id,
+        )
+
+        return context
+
+
+class AjaxFitsImageViewerView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(AjaxFitsImageViewerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id  = int(request.json['CAMERA_ID'])
+        form_year  = int(request.json.get('YEAR_SELECT', 0))
+        form_month = int(request.json.get('MONTH_SELECT', 0))
+        form_day   = int(request.json.get('DAY_SELECT', 0))
+        form_hour  = int(request.json.get('HOUR_SELECT', -1))  # 0 is a real hour
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        form_viewer = IndiAllskyFitsImageViewer(
+            data=request.json,
+            camera_id=camera_id,
+        )
+
+
+        json_data = {}
+
+
+        if form_hour >= 0:
+            form_datetime = datetime.strptime('{0} {1} {2} {3}'.format(form_year, form_month, form_day, form_hour), '%Y %m %d %H')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+            hour = form_datetime.hour
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+        elif form_day:
+            form_datetime = datetime.strptime('{0} {1} {2}'.format(form_year, form_month, form_day), '%Y %m %d')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            if json_data['HOUR_SELECT']:
+                hour = json_data['HOUR_SELECT'][0][0]
+                json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+            else:
+                json_data['IMAGE_DATA'] = []
+
+        elif form_month:
+            form_datetime = datetime.strptime('{0} {1}'.format(form_year, form_month), '%Y %m')
+
+            year = form_datetime.year
+            month = form_datetime.month
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            if json_data['DAY_SELECT']:
+                day = json_data['DAY_SELECT'][0][0]
+                json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                if json_data['HOUR_SELECT']:
+                    hour = json_data['HOUR_SELECT'][0][0]
+                    json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                else:
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        elif form_year:
+            form_datetime = datetime.strptime('{0}'.format(form_year), '%Y')
+
+            year = form_datetime.year
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            if json_data['MONTH_SELECT']:
+                month = json_data['MONTH_SELECT'][0][0]
+                json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+                if json_data['DAY_SELECT']:
+                    day = json_data['DAY_SELECT'][0][0]
+                    json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                    if json_data['HOUR_SELECT']:
+                        hour = json_data['HOUR_SELECT'][0][0]
+                        json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                    else:
+                        json_data['HOUR_SELECT'] = []
+                        json_data['IMAGE_DATA'] = []
+                else:
+                    json_data['DAY_SELECT'] = []
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['MONTH_SELECT'] = []
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        else:
+            # this happens when filtering images on detections
+            json_data['YEAR_SELECT'] = form_viewer.getYears()
+
+            if not json_data['YEAR_SELECT']:
+                # No images returned
+                json_data['YEAR_SELECT'] = (('', None),)
+                json_data['MONTH_SELECT'] = (('', None),)
+                json_data['DAY_SELECT'] = (('', None),)
+                json_data['HOUR_SELECT'] = (('', None),)
+                json_data['IMG_SELECT'] = (('', None),)
+
+                return json_data
+
+
+            year = json_data['YEAR_SELECT'][0][0]
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            month = json_data['MONTH_SELECT'][0][0]
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            day = json_data['DAY_SELECT'][0][0]
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            hour = json_data['HOUR_SELECT'][0][0]
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+
+        return jsonify(json_data)
+
+
+class Fits2JpegView(BaseView):
+    methods = ['GET']  # this allows the output to be cached by the browser
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(Fits2JpegView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        import ctypes
+        import cv2
+        from astropy.io import fits
+        #from PIL import Image
+        from multiprocessing import Array
+
+        fits_id = int(request.args['id'])
+
+
+        table = IndiAllSkyDbFitsImageTable
+
+        try:
+            fits_entry = table.query\
+                .filter(table.id == fits_id)\
+                .one()
+        except NoResultFound:
+            return 'FITS not found', 404
+
+
+        self.cameraSetup(camera_id=fits_entry.camera_id)
+
+
+        filename_p = Path(fits_entry.getFilesystemPath())
+
+
+        p_config = self.indi_allsky_config.copy()
+
+
+        hdulist = fits.open(filename_p)
+
+        exposure = float(hdulist[0].header.get('EXPTIME', 0))
+        exposure_av = Array(ctypes.c_int32, [int(exposure * 1000000)])
+        gain = float(hdulist[0].header.get('GAIN', 0))
+        gain_av = Array(ctypes.c_int32, [int(gain * 1000)])
+        position_av = Array('f', [self.camera.latitude, self.camera.longitude, self.camera.elevation])
+        binning = int(hdulist[0].header.get('XBINNING', 1))
+        binning_av = Array('i', [binning])
+        sensors_temp_av = Array('f', [float(hdulist[0].header.get('CCD-TEMP', 0))])
+        sensors_user_av = Array('f', [float(hdulist[0].header.get('CCD-TEMP', 0)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        night_av = Array('i', [1, 0])  # using night values for processing
+        astro_av = Array('f', [0.0, 0.0, 0.0])
+
+        hdulist.close()
+
+        image_processor = ImageProcessor(
+            p_config,
+            position_av,
+            exposure_av,
+            gain_av,
+            binning_av,
+            sensors_temp_av,
+            sensors_user_av,
+            night_av,
+            astro_av,
+        )
+
+
+        processing_start = time.time()
+
+
+        # use mtime for date
+        image_date = datetime.fromtimestamp(filename_p.stat().st_mtime)
+
+
+        image_processor.update_astrometric_data(image_date)
+
+
+        image_processor.add(
+            filename_p,
+            exposure,
+            gain,
+            binning,
+            image_date,
+            0.0,
+            fits_entry.camera,
+        )
+
+
+        image_processor.debayer()  # populates self.opencv_data
+
+        image_processor.stack()  # populates self.image
+
+        image_processor.convert_16bit_to_8bit()
+
+
+        # verticle flip
+        if p_config.get('IMAGE_FLIP_V'):
+            image_processor.flip_v()
+
+        # horizontal flip
+        if p_config.get('IMAGE_FLIP_H'):
+            image_processor.flip_h()
+
+
+        image_processor.colorize()
+
+
+        processing_elapsed_s = time.time() - processing_start
+        app.logger.info('Image processed in %0.4f s', processing_elapsed_s)
+
+
+        image = image_processor.image
+
+
+        ### OpenCV
+        _, image_a = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, p_config['IMAGE_FILE_COMPRESSION']['jpg']])
+        image_buffer = io.BytesIO(image_a.tobytes())
+
+
+        ### pillow
+        #image_buffer = io.BytesIO()
+        #img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        #img.save(image_buffer, format='JPEG', quality=p_config['IMAGE_FILE_COMPRESSION']['jpg'])
+
+
+        return Response(image_buffer.getvalue(), mimetype='image/jpeg')
+
+
+class GalleryViewerView(FormView):
+    page_title = 'Gallery'
+    decorators = [login_optional_media]
+
+    def get_context(self):
+        context = super(GalleryViewerView, self).get_context()
+
+        context['asi676mc_repair_gallery_enabled'] = int(
+            self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('ENABLE', False)
+            and self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('GALLERY_ENABLE', True)
+            and asi676mc.camera_record_matches(self.camera)
+        )
+
+        form_data = {
+            'CAMERA_ID'    : self.camera.id,
+            'YEAR_SELECT'  : None,
+            'MONTH_SELECT' : None,
+            'DAY_SELECT'   : None,
+            'HOUR_SELECT'  : None,
+            'FILTER_DETECTIONS' : None,
+            'FILTER_ASI676MC_REPAIRED' : None,
+            'FILTER_ASI676MC_EXCLUDED' : None,
+            'FILTER_ASI676MC_FAILED' : None,
+        }
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        context['form_viewer'] = IndiAllskyGalleryViewerPreload(
+            data=form_data,
+            camera_id=self.camera.id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+        return context
+
+
+class AjaxGalleryViewerView(BaseView):
+    methods = ['POST']
+    decorators = [login_optional_media]
+
+    def __init__(self, **kwargs):
+        super(AjaxGalleryViewerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id  = int(request.json['CAMERA_ID'])
+        form_year  = int(request.json.get('YEAR_SELECT', 0))
+        form_month = int(request.json.get('MONTH_SELECT', 0))
+        form_day   = int(request.json.get('DAY_SELECT', 0))
+        form_hour  = int(request.json.get('HOUR_SELECT', -1))  # 0 is a real hour
+        form_filter_detections = bool(request.json.get('FILTER_DETECTIONS'))
+        form_filter_asi676mc_repaired_requested = bool(request.json.get('FILTER_ASI676MC_REPAIRED'))
+        form_filter_asi676mc_excluded_requested = bool(request.json.get('FILTER_ASI676MC_EXCLUDED'))
+        form_filter_asi676mc_failed_requested = bool(request.json.get('FILTER_ASI676MC_FAILED'))
+
+        self.cameraSetup(camera_id=camera_id)
+
+        asi676mc_repair_gallery_enabled = bool(
+            self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('ENABLE', False)
+            and self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}).get('GALLERY_ENABLE', True)
+            and asi676mc.camera_record_matches(self.camera)
+        )
+        # Gallery switches map only to model-specific audit statuses.  In
+        # particular, the excluded filter never consults the generic exclude
+        # flag, which users and unrelated processing paths may also set.
+        form_filter_asi676mc_statuses = []
+        if asi676mc_repair_gallery_enabled:
+            if form_filter_asi676mc_repaired_requested:
+                form_filter_asi676mc_statuses.append('repaired')
+            if form_filter_asi676mc_excluded_requested:
+                form_filter_asi676mc_statuses.append('excluded')
+            if form_filter_asi676mc_failed_requested:
+                form_filter_asi676mc_statuses.append('validation_failed')
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        if form_filter_detections:
+            # filter images that have a detection
+            form_viewer = IndiAllskyGalleryViewer(
+                data=request.json,
+                camera_id=camera_id,
+                detections_count=1,
+                asi676mc_statuses=form_filter_asi676mc_statuses,
+                s3_prefix=self.s3_prefix,
+                local=local,
+            )
+        else:
+            form_viewer = IndiAllskyGalleryViewer(
+                data=request.json,
+                camera_id=camera_id,
+                detections_count=0,
+                asi676mc_statuses=form_filter_asi676mc_statuses,
+                s3_prefix=self.s3_prefix,
+                local=local,
+            )
+
+
+        json_data = {}
+
+
+        if form_hour >= 0:
+            form_datetime = datetime.strptime('{0} {1} {2} {3}'.format(form_year, form_month, form_day, form_hour), '%Y %m %d %H')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+            hour = form_datetime.hour
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+        elif form_day:
+            form_datetime = datetime.strptime('{0} {1} {2}'.format(form_year, form_month, form_day), '%Y %m %d')
+
+            year = form_datetime.year
+            month = form_datetime.month
+            day = form_datetime.day
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            if json_data['HOUR_SELECT']:
+                hour = json_data['HOUR_SELECT'][0][0]
+                json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+            else:
+                json_data['IMAGE_DATA'] = []
+
+        elif form_month:
+            form_datetime = datetime.strptime('{0} {1}'.format(form_year, form_month), '%Y %m')
+
+            year = form_datetime.year
+            month = form_datetime.month
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            if json_data['DAY_SELECT']:
+                day = json_data['DAY_SELECT'][0][0]
+                json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                if json_data['HOUR_SELECT']:
+                    hour = json_data['HOUR_SELECT'][0][0]
+                    json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                else:
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        elif form_year:
+            form_datetime = datetime.strptime('{0}'.format(form_year), '%Y')
+
+            year = form_datetime.year
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            if json_data['MONTH_SELECT']:
+                month = json_data['MONTH_SELECT'][0][0]
+                json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+                if json_data['DAY_SELECT']:
+                    day = json_data['DAY_SELECT'][0][0]
+                    json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+                    if json_data['HOUR_SELECT']:
+                        hour = json_data['HOUR_SELECT'][0][0]
+                        json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+                    else:
+                        json_data['HOUR_SELECT'] = []
+                        json_data['IMAGE_DATA'] = []
+                else:
+                    json_data['DAY_SELECT'] = []
+                    json_data['HOUR_SELECT'] = []
+                    json_data['IMAGE_DATA'] = []
+            else:
+                json_data['MONTH_SELECT'] = []
+                json_data['DAY_SELECT'] = []
+                json_data['HOUR_SELECT'] = []
+                json_data['IMAGE_DATA'] = []
+
+        else:
+            # this happens when filtering images
+            json_data['YEAR_SELECT'] = form_viewer.getYears()
+
+            if not json_data['YEAR_SELECT']:
+                # No images returned
+                json_data['YEAR_SELECT'] = (('', None),)
+                json_data['MONTH_SELECT'] = (('', None),)
+                json_data['DAY_SELECT'] = (('', None),)
+                json_data['HOUR_SELECT'] = (('', None),)
+                json_data['IMG_SELECT'] = (('', None),)
+                json_data['IMAGE_DATA'] = []
+
+                return json_data
+
+
+            year = json_data['YEAR_SELECT'][0][0]
+
+            json_data['MONTH_SELECT'] = form_viewer.getMonths(year)
+            month = json_data['MONTH_SELECT'][0][0]
+
+            json_data['DAY_SELECT'] = form_viewer.getDays(year, month)
+            day = json_data['DAY_SELECT'][0][0]
+
+            json_data['HOUR_SELECT'] = form_viewer.getHours(year, month, day)
+            hour = json_data['HOUR_SELECT'][0][0]
+
+            json_data['IMAGE_DATA'] = form_viewer.getImages(year, month, day, hour)
+
+
+        return jsonify(json_data)
+
+
+class VideoViewerView(FormView):
+    page_title = 'Timelapse Viewer'
+    decorators = [login_optional_media]
+
+    def get_context(self):
+        context = super(VideoViewerView, self).get_context()
+
+        context['youtube__enable'] = int(self.indi_allsky_config.get('YOUTUBE', {}).get('ENABLE', 0))
+
+        form_data = {
+            'CAMERA_ID'    : self.camera.id,
+            'YEAR_SELECT'  : None,
+            'MONTH_SELECT' : None,
+        }
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        context['form_video_viewer'] = IndiAllskyVideoViewerPreload(
+            data=form_data,
+            camera_id=self.camera.id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+        return context
+
+
+class AjaxVideoViewerView(BaseView):
+    methods = ['POST']
+    decorators = [login_optional_media]
+
+    def __init__(self, **kwargs):
+        super(AjaxVideoViewerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id      = int(request.json['CAMERA_ID'])
+        form_year      = int(request.json.get('YEAR_SELECT', 0))
+        form_month     = int(request.json.get('MONTH_SELECT', 0))
+        form_timeofday = str(request.json.get('TIMEOFDAY_SELECT', ''))
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        form_video_viewer = IndiAllskyVideoViewer(
+            data=request.json,
+            camera_id=camera_id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+
+        json_data = {}
+
+        if form_month:
+            form_datetime = datetime.strptime('{0} {1}'.format(form_year, form_month), '%Y %m')
+
+            year = form_datetime.year
+            month = form_datetime.month
+
+            json_data['video_list'] = form_video_viewer.getVideos(year, month, form_timeofday)
+
+        elif form_year:
+            form_datetime = datetime.strptime('{0}'.format(form_year), '%Y')
+
+            year = form_datetime.year
+
+            json_data['MONTH_SELECT'] = form_video_viewer.getMonths(year)
+
+            if json_data['MONTH_SELECT']:
+                month = json_data['MONTH_SELECT'][0][0]
+                json_data['video_list'] = form_video_viewer.getVideos(year, month, form_timeofday)
+            else:
+                json_data['video_list'] = []
+        else:
+            # No entries in DB
+            json_data['MONTH_SELECT'] = (('', 'None'),)
+            json_data['video_list'] = tuple()
+
+
+        return jsonify(json_data)
+
+
+class MiniVideoViewerView(FormView):
+    page_title = 'Mini-Timelapse Viewer'
+    decorators = [login_optional_media]
+
+    def get_context(self):
+        context = super(MiniVideoViewerView, self).get_context()
+
+        context['youtube__enable'] = int(self.indi_allsky_config.get('YOUTUBE', {}).get('ENABLE', 0))
+        context['mini_video_delete_allowed'] = _can_save_standard_configuration()
+
+        form_data = {
+            'CAMERA_ID'    : self.camera.id,
+            'YEAR_SELECT'  : None,
+            'MONTH_SELECT' : None,
+        }
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        context['form_mini_video_viewer'] = IndiAllskyMiniVideoViewerPreload(
+            data=form_data,
+            camera_id=self.camera.id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+        return context
+
+
+class AjaxMiniVideoViewerView(BaseView):
+    methods = ['POST']
+    decorators = [login_optional_media]
+
+    def __init__(self, **kwargs):
+        super(AjaxMiniVideoViewerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id      = int(request.json['CAMERA_ID'])
+        form_year      = int(request.json.get('YEAR_SELECT') or 0)
+        form_month     = int(request.json.get('MONTH_SELECT') or 0)
+
+        self.cameraSetup(camera_id=camera_id)
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+
+        form_mini_video_viewer = IndiAllskyMiniVideoViewer(
+            data=request.json,
+            camera_id=camera_id,
+            s3_prefix=self.s3_prefix,
+            local=local,
+        )
+
+
+        json_data = {}
+
+        if form_month:
+            form_datetime = datetime.strptime('{0} {1}'.format(form_year, form_month), '%Y %m')
+
+            year = form_datetime.year
+            month = form_datetime.month
+
+            json_data['video_list'] = form_mini_video_viewer.getVideos(year, month)
+
+        elif form_year:
+            form_datetime = datetime.strptime('{0}'.format(form_year), '%Y')
+
+            year = form_datetime.year
+
+            json_data['MONTH_SELECT'] = form_mini_video_viewer.getMonths(year)
+
+            if json_data['MONTH_SELECT']:
+                month = json_data['MONTH_SELECT'][0][0]
+                json_data['video_list'] = form_mini_video_viewer.getVideos(year, month)
+            else:
+                json_data['video_list'] = tuple()
+        else:
+            # No entries in DB
+            json_data['MONTH_SELECT'] = (('', 'None'),)
+            json_data['video_list'] = tuple()
+
+        return jsonify(json_data)
+
+
+class AjaxMiniVideoDeleteView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def dispatch_request(self):
+        if not _can_save_standard_configuration():
+            json_data = {
+                'failure-message' : 'You do not have permission to delete mini timelapses.',
+            }
+            return jsonify(json_data), 403
+
+        request_data = request.get_json(silent=True) or {}
+        try:
+            camera_id = int(request_data['CAMERA_ID'])
+            video_id = int(request_data['VIDEO_ID'])
+        except (KeyError, TypeError, ValueError):
+            json_data = {
+                'failure-message' : 'Invalid mini timelapse deletion request.',
+            }
+            return jsonify(json_data), 400
+
+        try:
+            mini_video_entry = IndiAllSkyDbMiniVideoTable.query\
+                .join(IndiAllSkyDbMiniVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbMiniVideoTable.id == video_id,
+                        IndiAllSkyDbCameraTable.id == camera_id,
+                    )
+                )\
+                .one()
+        except NoResultFound:
+            json_data = {
+                'failure-message' : 'Mini timelapse not found.',
+            }
+            return jsonify(json_data), 404
+
+        mini_video_data = mini_video_entry.data if isinstance(mini_video_entry.data, dict) else {}
+        try:
+            generation_task_id = int(mini_video_data.get('generation_task_id') or 0)
+        except (TypeError, ValueError):
+            generation_task_id = 0
+        generation_task_created = str(mini_video_data.get('generation_task_created') or '')
+
+        if generation_task_id and generation_task_created:
+            active_task = IndiAllSkyDbTaskQueueTable.query\
+                .filter(IndiAllSkyDbTaskQueueTable.id == generation_task_id)\
+                .filter(IndiAllSkyDbTaskQueueTable.queue == TaskQueueQueue.VIDEO)\
+                .filter(
+                    IndiAllSkyDbTaskQueueTable.state.in_((
+                        TaskQueueState.QUEUED,
+                        TaskQueueState.RUNNING,
+                    ))
+                )\
+                .first()
+
+            if active_task and active_task.createDate.isoformat() == generation_task_created:
+                json_data = {
+                    'failure-message' : (
+                        'This mini timelapse is still being created. '
+                        'Try again when it is finished.'
+                    ),
+                }
+                return jsonify(json_data), 409
+
+        related_assets = {(mini_video_entry.__class__.__name__, mini_video_entry.id)}
+        if mini_video_entry.thumbnail_uuid:
+            thumbnail_id = db.session.query(IndiAllSkyDbThumbnailTable.id)\
+                .filter(IndiAllSkyDbThumbnailTable.uuid == mini_video_entry.thumbnail_uuid)\
+                .scalar()
+            if thumbnail_id:
+                related_assets.add((IndiAllSkyDbThumbnailTable.__name__, thumbnail_id))
+
+        active_upload_tasks = IndiAllSkyDbTaskQueueTable.query\
+            .filter(IndiAllSkyDbTaskQueueTable.queue == TaskQueueQueue.UPLOAD)\
+            .filter(
+                IndiAllSkyDbTaskQueueTable.state.in_((
+                    TaskQueueState.MANUAL,
+                    TaskQueueState.QUEUED,
+                    TaskQueueState.RUNNING,
+                ))
+            )
+        for upload_task in active_upload_tasks:
+            upload_data = upload_task.data if isinstance(upload_task.data, dict) else {}
+            try:
+                upload_asset = (str(upload_data.get('model')), int(upload_data.get('id')))
+            except (TypeError, ValueError):
+                continue
+            if upload_asset in related_assets:
+                json_data = {
+                    'failure-message' : (
+                        'This mini timelapse is still being uploaded. '
+                        'Try again when it is finished.'
+                    ),
+                }
+                return jsonify(json_data), 409
+
+        app.logger.info('Removing mini timelapse entry: %s', mini_video_entry.filename)
+
+        try:
+            mini_video_entry.deleteAsset()
+        except OSError as e:
+            app.logger.error('Cannot remove mini timelapse: %s', str(e))
+            json_data = {
+                'failure-message' : 'Unable to remove the mini timelapse file.',
+            }
+            return jsonify(json_data), 400
+
+        db.session.delete(mini_video_entry)
+        db.session.commit()
+
+        json_data = {
+            'success-message' : 'Mini timelapse deleted.',
+        }
+        return jsonify(json_data)
+
+
+class SystemInfoView(TemplateView):
+    page_title = 'System Info'
+    decorators = [login_required]
+
+    def get_context(self):
+        import sys
+        import platform
+        import astropy
+        import flask
+        import numpy
+        import cv2
+        import gunicorn
+        import cryptography
+
+        try:
+            import pycurl
+        except ImportError:
+            pycurl = None
+
+        try:
+            import paho.mqtt as paho_mqtt
+        except ImportError:
+            paho_mqtt = None
+
+        #try:
+        #    import PyIndi
+        #except ImportError:
+        #    PyIndi = None
+
+        try:
+            import skyfield
+        except ImportError:
+            skyfield = None
+
+        context = super(SystemInfoView, self).get_context()
+
+        context['release'] = str(__version__)
+
+        context['uptime_str'] = self.getUptime()
+
+        context['system_type'] = self.getSystemType()
+
+        context['cpu_count'] = self.getCpuCount()
+        context['cpu_usage'] = self.getCpuUsage()
+
+        load5, load10, load15 = self.getLoadAverage()
+        context['cpu_load5'] = load5
+        context['cpu_load10'] = load10
+        context['cpu_load15'] = load15
+
+        mem_total, mem_usage = self.getMemoryUsage()
+        context['mem_total'] = mem_total
+        context['mem_usage'] = mem_usage
+
+        swap_total, swap_usage = self.getSwapUsage()
+        context['swap_total'] = swap_total
+        context['swap_usage'] = swap_usage
+
+        context['fs_data'] = self.getAllFsUsage()
+
+        context['temp_list'] = self.getTemps()
+
+        context['fan_list'] = self.getFans()
+
+        context['net_list'] = self.getNetworkIps()
+
+        context['systemd_target'] = self.getSystemdTarget()
+
+        context['indiserver_service_activestate'], context['indiserver_service_unitstate'] = self.getSystemdUnitStatus(app.config['INDISERVER_SERVICE_NAME'])
+        context['indiserver_timer_activestate'], context['indiserver_timer_unitstate'] = self.getSystemdUnitStatus(app.config['INDISERVER_TIMER_NAME'])
+        context['indi_allsky_service_activestate'], context['indi_allsky_service_unitstate'] = self.getSystemdUnitStatus(app.config['ALLSKY_SERVICE_NAME'])
+        context['indi_allsky_timer_activestate'], context['indi_allsky_timer_unitstate'] = self.getSystemdUnitStatus(app.config['ALLSKY_TIMER_NAME'])
+        context['indiserver_next_trigger'] = self.getSystemdTimerTrigger(app.config['INDISERVER_TIMER_NAME'])
+        context['indi_allsky_next_trigger'] = self.getSystemdTimerTrigger(app.config['ALLSKY_TIMER_NAME'])
+        context['gunicorn_indi_allsky_service_activestate'], context['gunicorn_indi_allsky_service_unitstate'] = self.getSystemdUnitStatus(app.config['GUNICORN_SERVICE_NAME'])
+        context['gunicorn_indi_allsky_socket_activestate'], context['gunicorn_indi_allsky_socket_unitstate'] = self.getSystemdUnitStatus(app.config['GUNICORN_SOCKET_NAME'])
+
+        context['python_version'] = platform.python_version()
+        context['python_platform'] = platform.machine()
+
+        if sys.maxsize > 2147483648:
+            context['cpu_bits'] = 64
+        else:
+            context['cpu_bits'] = 32
+
+        context['gunicorn_version'] = str(getattr(gunicorn, '__version__', -1))
+        context['cryptography_version'] = str(getattr(cryptography, '__version__', -1))
+        context['cv2_version'] = str(getattr(cv2, '__version__', -1))
+        context['ephem_version'] = str(getattr(ephem, '__version__', -1))
+        context['numpy_version'] = str(getattr(numpy, '__version__', -1))
+        context['astropy_version'] = str(getattr(astropy, '__version__', -1))
+        context['flask_version'] = str(getattr(flask, '__version__', -1))
+        context['dbus_version'] = str(getattr(dbus, '__version__', -1))
+
+
+        if pycurl:
+            context['pycurl_version'] = str(getattr(pycurl, 'version', -1))
+        else:
+            context['pycurl_version'] = 'Not installed'
+
+        if paho_mqtt:
+            context['pahomqtt_version'] = str(getattr(paho_mqtt, '__version__', -1))
+        else:
+            context['pahomqtt_version'] = 'Not installed'
+
+        ### PyIndi no longer reports a version
+        #if PyIndi:
+        #    context['pyindi_version'] = '.'.join((
+        #        str(getattr(PyIndi, 'INDI_VERSION_MAJOR', -1)),
+        #        str(getattr(PyIndi, 'INDI_VERSION_MINOR', -1)),
+        #        str(getattr(PyIndi, 'INDI_VERSION_RELEASE', -1)),
+        #    ))
+        #else:
+        #    context['pyindi_version'] = 'Not installed'
+
+        if skyfield:
+            context['skyfield_version'] = str(getattr(skyfield, '__version__', -1))
+        else:
+            context['skyfield_version'] = 'Not installed'
+
+
+        context['now'] = self.camera_now
+        context['form_settime'] = IndiAllskySetDateTimeForm()
+
+
+        timedate1_dict = self.getSystemdTimeDate()
+        context['timedate1_dict'] = timedate1_dict
+
+
+        timezone_data = {
+            'NEW_TIMEZONE' : timedate1_dict['Timezone'],
+        }
+        context['form_timezone'] = IndiAllskySetTimezoneForm(data=timezone_data)
+
+
+        if self.camera.driver:
+            #app.logger.info('Current camera driver: %s', self.camera.driver)
+            if self.camera.driver == 'rpicam-still':
+                camera_driver = 'indi_simulator_ccd'
+            else:
+                camera_driver = self.camera.driver  # set the current camera driver as default
+        else:
+            camera_driver = 'indi_simulator_ccd'
+
+
+        indiserver_form_data = {
+            'CAMERA_SERVER_SELECT' : camera_driver,
+            'GPS_SERVER_SELECT'    : '',
+        }
+
+        form_indiserver_change = IndiAllskyIndiServerChangeForm(data=indiserver_form_data)
+
+        context['form_indiserver_change'] = form_indiserver_change
+
+
+        return context
+
+
+    def getUptime(self):
+        uptime_s = time.time() - psutil.boot_time()
+
+        days = int(uptime_s / 86400)
+        uptime_s -= (days * 86400)
+
+        hours = int(uptime_s / 3600)
+        uptime_s -= (hours * 3600)
+
+        minutes = int(uptime_s / 60)
+        uptime_s -= (minutes * 60)
+
+        #seconds = int(uptime_s)
+
+        uptime_str = '{0:d} days, {1:d}:{2:d}'.format(days, hours, minutes)
+
+        return uptime_str
+
+
+    def getSystemType(self):
+        # This is available for SBCs and systems using device trees
+        model_p = Path('/proc/device-tree/model')
+
+        try:
+            if model_p.exists():
+                with io.open(str(model_p), 'r') as f:
+                    system_type = f.readline()  # only first line
+            else:
+                return 'Generic PC'
+        except PermissionError as e:
+            app.logger.error('Permission error: %s', str(e))
+            return 'Unknown'
+
+
+        system_type = system_type.strip()
+
+
+        if not system_type:
+            return 'Unknown'
+
+
+        return str(system_type)
+
+
+    def getCpuCount(self):
+        return psutil.cpu_count()
+
+
+    def getCpuUsage(self):
+        c = psutil.cpu_times_percent()
+
+        cpu_percent = {
+            'user'    : c.user,
+            'system'  : c.system,
+            'idle'    : c.idle,
+            'nice'    : c.nice,
+            'iowait'  : c.iowait,
+            'irq'     : c.irq,
+            'softirq' : c.softirq,
+        }
+
+        return cpu_percent
+
+
+    def getLoadAverage(self):
+        return psutil.getloadavg()
+
+
+    def getMemoryUsage(self):
+        memory_info = psutil.virtual_memory()
+
+        memory_total = memory_info.total
+        #memory_free = memory_info.free
+
+        memory_percent = {
+            'user_percent'    : (memory_info.used / memory_total) * 100.0,
+            'cached_percent'  : (memory_info.cached / memory_total) * 100.0,
+        }
+
+        memory_total_mb = int(memory_total / 1024.0 / 1024.0)
+
+        #memory_percent = 100 - ((memory_free * 100) / memory_total)
+
+        return memory_total_mb, memory_percent
+
+
+    def getSwapUsage(self):
+        swap_info = psutil.swap_memory()
+
+        swap_total = int(swap_info[0] / 1024 / 1024)
+        swap_usage = swap_info[3]
+
+        return swap_total, swap_usage
+
+
+    def getAllFsUsage(self):
+        fs_list = psutil.disk_partitions(all=True)
+
+        fs_data = list()
+        for fs in fs_list:
+
+            skip = False
+            for p in ('/snap', '/sys', '/proc', '/run', '/dev'):
+                if fs.mountpoint.startswith(p + '/'):
+                    skip = True
+                    break
+                elif fs.mountpoint == p:
+                    skip = True
+                    break
+
+            if skip:
+                continue
+
+
+            try:
+                disk_usage = psutil.disk_usage(fs.mountpoint)
+            except PermissionError as e:
+                app.logger.error('PermissionError: %s', str(e))
+                continue
+
+            data = {
+                'total_mb'   : disk_usage.total / 1024.0 / 1024.0,
+                'mountpoint' : fs.mountpoint,
+                'percent'    : disk_usage.percent,
+            }
+
+            fs_data.append(data)
+
+        return fs_data
+
+
+    def getTemps(self):
+        temp_info = psutil.sensors_temperatures()
+
+        temp_list = list()
+        for t_key in sorted(temp_info):  # always return the keys in the same order
+            for i, t in enumerate(temp_info[t_key]):
+                temp_c = float(t.current)
+
+                if self.indi_allsky_config.get('TEMP_DISPLAY') == 'f':
+                    current_temp = (temp_c * 9.0 / 5.0) + 32
+                    temp_sys = 'F'
+                elif self.indi_allsky_config.get('TEMP_DISPLAY') == 'k':
+                    current_temp = temp_c + 273.15
+                    temp_sys = 'K'
+                else:
+                    current_temp = temp_c
+                    temp_sys = 'C'
+
+                # these names will match the mqtt topics
+                if not t.label:
+                    # use index for label name
+                    label = str(i)
+                else:
+                    label = t.label
+
+                topic = '{0:s}/{1:s}'.format(t_key, label)
+
+                # no spaces, etc in topics
+                topic_sub = re.sub(r'[#+\$\*\>\ ]', '_', topic)
+
+                temp_list.append({
+                    'name'   : topic_sub,
+                    'temp'   : current_temp,
+                    'sys'    : temp_sys,
+                })
+
+        return temp_list
+
+    def getFans(self):
+        fan_list = list()
+
+        # 1) Standard: psutil sensors_fans()
+        try:
+            fan_info = psutil.sensors_fans()
+        except Exception:
+            fan_info = dict()
+
+        for f_key in sorted(fan_info):  # stable ordering
+            for i, f in enumerate(fan_info[f_key]):
+                try:
+                    rpm = float(getattr(f, 'current', 0.0) or 0.0)
+                except Exception:
+                    rpm = 0.0
+
+                if not getattr(f, 'label', ''):
+                    label = str(i)
+                else:
+                    label = f.label
+
+                topic = '{0:s}/{1:s}'.format(f_key, label)
+                topic_sub = re.sub(r'[#+\$\*\>\ ]', '_', topic)
+
+                fan_list.append({
+                    'name' : topic_sub,
+                    'rpm'  : rpm,
+                })
+
+        # 2) Raspberry Pi 5 Active Cooler / fan connector fallback via sysfs
+        # Typical path: /sys/devices/platform/cooling_fan/hwmon/hwmon*/fan1_input
+        if not fan_list:
+            try:
+                base = Path('/sys/devices/platform/cooling_fan/hwmon')
+                for fan_input in base.glob('hwmon*/fan1_input'):
+                    try:
+                        rpm = float(int(fan_input.read_text().strip()))
+                        fan_list.append({
+                            'name' : 'cooling_fan/fan1',
+                            'rpm'  : rpm,
+                        })
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                pass
+
+        return fan_list
+
+    def getNetworkIps(self):
+        net_info = psutil.net_if_addrs()
+
+        net_list = list()
+        for dev, addr_info in net_info.items():
+            if dev == 'lo':
+                # skip loopback
+                continue
+
+
+            dev_info = {
+                'name'  : dev,
+                'inet4' : [],
+                'inet6' : [],
+            }
+
+            for addr in addr_info:
+                if addr.family == socket.AF_INET:
+                    cidr = ipaddress.IPv4Network('0.0.0.0/{0:s}'.format(addr.netmask)).prefixlen
+                    dev_info['inet4'].append('{0:s}/{1:d}'.format(addr.address, cidr))
+
+                elif addr.family == socket.AF_INET6:
+                    dev_info['inet6'].append('{0:s}'.format(addr.address))
+
+            net_list.append(dev_info)
+
+
+        return net_list
+
+
+    def getSystemdTarget(self):
+        try:
+            session_bus = dbus.SystemBus()
+        except dbus.exceptions.DBusException:
+            return 'D-Bus Unavailable'
+
+        systemd1 = session_bus.get_object('org.freedesktop.systemd1', '/org/freedesktop/systemd1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.systemd1.Manager')
+
+        try:
+            default_target = manager.GetDefaultTarget()
+        except dbus.exceptions.DBusException:
+            return 'D-Bus Exception'
+
+        return str(default_target)
+
+
+    def getSystemdTimeDate(self):
+        try:
+            session_bus = dbus.SystemBus()
+        except dbus.exceptions.DBusException:
+            # This happens in docker
+            timedate1_dict = {
+                'Timezone' : 'Unknown',
+                'CanNTP'   : False,
+                'NTP'      : False,
+                'NTPSynchronized' : False,
+                'LocalRTC' : False,
+                'TimeUSec' : 1,
+            }
+            return timedate1_dict
+
+
+        timedate1 = session_bus.get_object('org.freedesktop.timedate1', '/org/freedesktop/timedate1')
+        manager = dbus.Interface(timedate1, 'org.freedesktop.DBus.Properties')
+
+        timedate1_dict = dict()
+        timedate1_dict['Timezone'] = str(manager.Get('org.freedesktop.timedate1', 'Timezone'))
+        timedate1_dict['CanNTP'] = bool(manager.Get('org.freedesktop.timedate1', 'CanNTP'))
+        timedate1_dict['NTP'] = bool(manager.Get('org.freedesktop.timedate1', 'NTP'))
+        timedate1_dict['NTPSynchronized'] = bool(manager.Get('org.freedesktop.timedate1', 'NTPSynchronized'))
+        timedate1_dict['LocalRTC'] = bool(manager.Get('org.freedesktop.timedate1', 'LocalRTC'))
+        timedate1_dict['TimeUSec'] = int(manager.Get('org.freedesktop.timedate1', 'TimeUSec'))
+
+        #app.logger.info('timedate1: %s', timedate1_dict)
+
+        return timedate1_dict
+
+
+class TaskQueueView(TemplateView):
+    page_title = 'Task Queue'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(TaskQueueView, self).get_context()
+
+        state_list = (
+            TaskQueueState.MANUAL,
+            TaskQueueState.QUEUED,
+            TaskQueueState.RUNNING,
+            TaskQueueState.SUCCESS,
+            TaskQueueState.FAILED,
+        )
+
+        exclude_queues = (
+            TaskQueueQueue.IMAGE,
+            TaskQueueQueue.UPLOAD,
+        )
+
+        camera_now_minus_3d = self.camera_now - timedelta(days=3)
+
+        tasks = IndiAllSkyDbTaskQueueTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbTaskQueueTable.createDate > camera_now_minus_3d,
+                    IndiAllSkyDbTaskQueueTable.state.in_(state_list),
+                    ~IndiAllSkyDbTaskQueueTable.queue.in_(exclude_queues),
+                )
+            )\
+            .order_by(IndiAllSkyDbTaskQueueTable.createDate.desc())
+
+
+        task_list = list()
+        for task in tasks:
+            if task.data:
+                task_data = task.data
+            else:
+                task_data = {}
+
+            t = {
+                'id'         : task.id,
+                'createDate' : task.createDate,
+                'queue'      : task.queue.name,
+                'state'      : task.state.name,
+                'action'     : task_data.get('action', 'MISSING'),
+                'result'     : task.result,
+            }
+
+            task_list.append(t)
+
+        context['task_list'] = task_list
+
+        return context
+
+
+class AjaxSystemInfoView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        form_system = IndiAllskySystemInfoForm(data=request.json)
+
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                form_errors = form_system.errors  # this must be a property
+                form_errors['form_global'] = ['You do not have permission to make configuration changes']
+                return jsonify(form_errors), 400
+
+
+        if not form_system.validate():
+            form_errors = form_system.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        camera_id = int(request.json['CAMERA_ID'])
+        service = request.json['SERVICE_HIDDEN']
+        command = request.json['COMMAND_HIDDEN']
+
+        self.cameraSetup(camera_id=camera_id)
+
+        if service == app.config['INDISERVER_SERVICE_NAME']:
+            if command == 'stop':
+                r = self.stopSystemdUnit(app.config['INDISERVER_SERVICE_NAME'])
+            elif command == 'start':
+                r = self.startSystemdUnit(app.config['INDISERVER_SERVICE_NAME'])
+            #elif command == 'disable':
+            #    r = self.disableSystemdUnit(app.config['INDISERVER_SERVICE_NAME'])
+            #elif command == 'enable':
+            #    r = self.enableSystemdUnit(app.config['INDISERVER_SERVICE_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+        elif service == app.config['ALLSKY_SERVICE_NAME']:
+            if command == 'hup':
+                self._miscDb.setState('STATUS', constants.STATUS_RELOADING)
+
+                task_reload = IndiAllSkyDbTaskQueueTable(
+                    queue=TaskQueueQueue.MAIN,
+                    state=TaskQueueState.MANUAL,
+                    priority=100,
+                    data={'action' : 'reload'},
+                )
+
+                db.session.add(task_reload)
+                db.session.commit()
+
+                r = 'Submitted reload task'
+
+                #r = self.hupSystemdUnit(app.config['ALLSKY_SERVICE_NAME'])
+            elif command == 'stop':
+                r = self.stopSystemdUnit(app.config['ALLSKY_SERVICE_NAME'])
+            elif command == 'start':
+                r = self.startSystemdUnit(app.config['ALLSKY_SERVICE_NAME'])
+            #elif command == 'disable':
+            #    r = self.disableSystemdUnit(app.config['ALLSKY_SERVICE_NAME'])
+            #elif command == 'enable':
+            #    r = self.enableSystemdUnit(app.config['ALLSKY_SERVICE_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+        elif service == app.config['INDISERVER_TIMER_NAME']:
+            if command == 'disable':
+                r = self.disableSystemdUnit(app.config['INDISERVER_TIMER_NAME'])
+            elif command == 'enable':
+                r = self.enableSystemdUnit(app.config['INDISERVER_TIMER_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+        elif service == app.config['ALLSKY_TIMER_NAME']:
+            if command == 'disable':
+                r = self.disableSystemdUnit(app.config['ALLSKY_TIMER_NAME'])
+            elif command == 'enable':
+                r = self.enableSystemdUnit(app.config['ALLSKY_TIMER_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+        elif service == app.config['GUNICORN_SERVICE_NAME']:
+            if command == 'stop':
+                r = self.stopSystemdUnit(app.config['GUNICORN_SERVICE_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+        elif service == app.config['UPGRADE_ALLSKY_SERVICE_NAME']:
+            if command == 'start':
+                fs_list = psutil.disk_partitions(all=True)
+                for fs in fs_list:
+                    if fs.mountpoint not in ('/', '/var'):
+                        continue
+
+                    try:
+                        disk_usage = psutil.disk_usage(fs.mountpoint)
+                    except PermissionError as e:
+                        app.logger.error('PermissionError: %s', str(e))
+                        continue
+
+
+                    fs_free_mb = disk_usage.total / 1024.0 / 1024.0
+                    if fs_free_mb < 1000:
+                        errors_data = {
+                            'COMMAND_HIDDEN' : ['Not enough available space on {0:s} filesystem'.format(fs.mountpoint)],
+                        }
+                        return jsonify(errors_data), 400
+
+                r = self.startSystemdUnit(app.config['UPGRADE_ALLSKY_SERVICE_NAME'])
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+        elif service == 'system':
+            if command == 'reboot':
+                # allowing rebooting from non-admin networks for now
+                try:
+                    r = self.rebootSystemd()
+                except dbus.exceptions.DBusException as e:
+                    json_data = {
+                        'form_global' : [str(e)],
+                    }
+                    return jsonify(json_data), 400
+            elif command == 'poweroff':
+                if not self.verify_admin_network():
+                    json_data = {
+                        'form_global' : ['Request not from admin network (flask.json)'],
+                    }
+                    return jsonify(json_data), 400
+
+                try:
+                    r = self.poweroffSystemd()
+                except dbus.exceptions.DBusException as e:
+                    json_data = {
+                        'form_global' : [str(e)],
+                    }
+                    return jsonify(json_data), 400
+            elif command == 'validate_db':
+                message_list = self.validateDbEntries()
+
+                json_data = {
+                    'success-message' : ''.join(message_list),
+                }
+                return jsonify(json_data)
+            elif command == 'backup_db':
+                task_backup_db = IndiAllSkyDbTaskQueueTable(
+                    queue=TaskQueueQueue.VIDEO,
+                    state=TaskQueueState.MANUAL,
+                    priority=100,
+                    data={
+                        'action' : 'backupDatabase',
+                        'kwargs' : {},
+                    },
+                )
+
+                db.session.add(task_backup_db)
+                db.session.commit()
+
+
+                message_list = ['Submitted backup task']
+
+                json_data = {
+                    'success-message' : ''.join(message_list),
+                }
+                return jsonify(json_data)
+            elif command == 'expire_data':
+                task_expire = IndiAllSkyDbTaskQueueTable(
+                    queue=TaskQueueQueue.VIDEO,
+                    state=TaskQueueState.MANUAL,
+                    priority=100,
+                    data={
+                        'action' : 'expireData',
+                        'kwargs' : {
+                            'camera_id' : camera_id,
+                        },
+                    },
+                )
+
+                db.session.add(task_expire)
+                db.session.commit()
+
+                message_list = ['Submitted expire task']
+
+                json_data = {
+                    'success-message' : ''.join(message_list),
+                }
+                return jsonify(json_data)
+            elif command == 'flush_images':
+                if not self.verify_admin_network():
+                    json_data = {
+                        'form_global' : ['Request not from admin network (flask.json)'],
+                    }
+                    return jsonify(json_data), 400
+
+                image_count = self.flushImages(camera_id)
+
+                json_data = {
+                    'success-message' : '{0:d} Images Deleted'.format(image_count),
+                }
+                return jsonify(json_data)
+            elif command == 'flush_16min_images':
+                if not self.verify_admin_network():
+                    json_data = {
+                        'form_global' : ['Request not from admin network (flask.json)'],
+                    }
+                    return jsonify(json_data), 400
+
+                image_count = self.flush16MinutesImages(camera_id)
+
+                json_data = {
+                    'success-message' : '{0:d} Images Deleted'.format(image_count),
+                }
+                return jsonify(json_data)
+            elif command == 'flush_timelapses':
+                if not self.verify_admin_network():
+                    json_data = {
+                        'form_global' : ['Request not from admin network (flask.json)'],
+                    }
+                    return jsonify(json_data), 400
+
+
+                file_count = self.flushTimelapses(camera_id)
+
+                json_data = {
+                    'success-message' : '{0:d} Files Deleted'.format(file_count),
+                }
+                return jsonify(json_data)
+            elif command == 'flush_daytime':
+                if not self.verify_admin_network():
+                    json_data = {
+                        'form_global' : ['Request not from admin network (flask.json)'],
+                    }
+                    return jsonify(json_data), 400
+
+
+                file_count = self.flushDaytime(camera_id)
+
+                json_data = {
+                    'success-message' : '{0:d} Files Deleted'.format(file_count),
+                }
+                return jsonify(json_data)
+
+            else:
+                errors_data = {
+                    'COMMAND_HIDDEN' : ['Unhandled command'],
+                }
+                return jsonify(errors_data), 400
+
+
+        else:
+            errors_data = {
+                'SERVICE_HIDDEN' : ['Unhandled service'],
+            }
+            return jsonify(errors_data), 400
+
+
+        app.logger.info('Command return: %s', str(r))
+
+        json_data = {
+            'success-message' : 'Job submitted',
+        }
+
+        return jsonify(json_data)
+
+
+    def rebootSystemd(self):
+        system_bus = dbus.SystemBus()
+        systemd1 = system_bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.login1.Manager')
+        r = manager.Reboot(False)
+
+        return r
+
+
+    def poweroffSystemd(self):
+        system_bus = dbus.SystemBus()
+        systemd1 = system_bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.login1.Manager')
+        r = manager.PowerOff(False)
+
+        return r
+
+
+    def flushImages(self, camera_id):
+        ### Images
+        image_query = IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        ### FITS Images
+        fits_image_query = IndiAllSkyDbFitsImageTable.query\
+            .join(IndiAllSkyDbFitsImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbFitsImageTable.createDate.asc())
+
+
+        ### RAW Images
+        raw_image_query = IndiAllSkyDbRawImageTable.query\
+            .join(IndiAllSkyDbRawImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbRawImageTable.createDate.asc())
+
+
+        ### Panorama Images
+        panorama_image_query = IndiAllSkyDbPanoramaImageTable.query\
+            .join(IndiAllSkyDbPanoramaImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc())
+
+
+        ### Getting IDs first then deleting each file is faster than deleting all files with
+        ### thumbnails with a single query.  Deleting associated thumbnails causes sqlalchemy
+        ### to recache after every delete which cause a 1-5 second lag for each delete
+
+
+        asset_lists = [
+            (image_query, IndiAllSkyDbImageTable),
+            (fits_image_query, IndiAllSkyDbFitsImageTable),
+            (raw_image_query, IndiAllSkyDbRawImageTable),
+            (panorama_image_query, IndiAllSkyDbPanoramaImageTable),
+        ]
+
+
+        delete_count = 0
+        for asset_list, asset_table in asset_lists:
+            while True:
+                id_list = [entry.id for entry in asset_list.limit(500)]
+
+                if not id_list:
+                    break
+
+                delete_count += self._deleteAssets(asset_table, id_list)
+
+
+        return delete_count
+
+
+    def flush16MinutesImages(self, camera_id):
+        now = datetime.now()
+        now_minus_x_minutes = now - timedelta(minutes=16)
+
+        ### Images
+        image_query_16 = IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbImageTable.createDate >= now_minus_x_minutes)\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        ### Getting IDs first then deleting each file is faster than deleting all files with
+        ### thumbnails with a single query.  Deleting associated thumbnails causes sqlalchemy
+        ### to recache after every delete which cause a 1-5 second lag for each delete
+
+
+        asset_lists = [
+            (image_query_16, IndiAllSkyDbImageTable),
+        ]
+
+
+        delete_count = 0
+        for asset_list, asset_table in asset_lists:
+            while True:
+                id_list = [entry.id for entry in asset_list.limit(500)]
+
+                if not id_list:
+                    break
+
+                delete_count += self._deleteAssets(asset_table, id_list)
+
+
+        return delete_count
+
+
+    def flushTimelapses(self, camera_id):
+        video_query = IndiAllSkyDbVideoTable.query\
+            .join(IndiAllSkyDbVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbVideoTable.createDate.asc())
+
+        mini_video_query = IndiAllSkyDbMiniVideoTable.query\
+            .join(IndiAllSkyDbMiniVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbMiniVideoTable.createDate.asc())
+
+        keogram_query = IndiAllSkyDbKeogramTable.query\
+            .join(IndiAllSkyDbKeogramTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbKeogramTable.createDate.asc())
+
+        startrail_query = IndiAllSkyDbStarTrailsTable.query\
+            .join(IndiAllSkyDbStarTrailsTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbStarTrailsTable.createDate.asc())
+
+        startrail_video_query = IndiAllSkyDbStarTrailsVideoTable.query\
+            .join(IndiAllSkyDbStarTrailsVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbStarTrailsVideoTable.createDate.asc())
+
+        panorama_video_query = IndiAllSkyDbPanoramaVideoTable.query\
+            .join(IndiAllSkyDbPanoramaVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbPanoramaVideoTable.createDate.asc())
+
+
+        ### Getting IDs first then deleting each file is faster than deleting all files with
+        ### thumbnails with a single query.  Deleting associated thumbnails causes sqlalchemy
+        ### to recache after every delete which cause a 1-5 second lag for each delete
+
+
+        asset_lists = [
+            (video_query, IndiAllSkyDbVideoTable),
+            (mini_video_query, IndiAllSkyDbMiniVideoTable),
+            (keogram_query, IndiAllSkyDbKeogramTable),
+            (startrail_query, IndiAllSkyDbStarTrailsTable),
+            (startrail_video_query, IndiAllSkyDbStarTrailsVideoTable),
+            (panorama_video_query, IndiAllSkyDbPanoramaVideoTable),
+        ]
+
+
+        delete_count = 0
+        for asset_list, asset_table in asset_lists:
+            while True:
+                id_list = [entry.id for entry in asset_list.limit(500)]
+
+                if not id_list:
+                    break
+
+                delete_count += self._deleteAssets(asset_table, id_list)
+
+
+        return delete_count
+
+
+    def flushDaytime(self, camera_id):
+        ### Images
+        image_query = IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbImageTable.night == sa_false())\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        ### FITS Images
+        fits_image_query = IndiAllSkyDbFitsImageTable.query\
+            .join(IndiAllSkyDbFitsImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbFitsImageTable.night == sa_false())\
+            .order_by(IndiAllSkyDbFitsImageTable.createDate.asc())
+
+
+        ### RAW Images
+        raw_image_query = IndiAllSkyDbRawImageTable.query\
+            .join(IndiAllSkyDbRawImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbRawImageTable.night == sa_false())\
+            .order_by(IndiAllSkyDbRawImageTable.createDate.asc())
+
+
+        ### Panorama Images
+        panorama_image_query = IndiAllSkyDbPanoramaImageTable.query\
+            .join(IndiAllSkyDbPanoramaImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbPanoramaImageTable.night == sa_false())\
+            .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc())
+
+
+        ### Timelapses
+        video_query = IndiAllSkyDbVideoTable.query\
+            .join(IndiAllSkyDbVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbVideoTable.night == sa_false())\
+            .order_by(IndiAllSkyDbVideoTable.createDate.asc())
+
+        ### Not flushing daytime mini timelapses
+
+        ### Keograms
+        keogram_query = IndiAllSkyDbKeogramTable.query\
+            .join(IndiAllSkyDbKeogramTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbKeogramTable.night == sa_false())\
+            .order_by(IndiAllSkyDbKeogramTable.createDate.asc())
+
+
+        ### Panorama Videos
+        panorama_video_query = IndiAllSkyDbPanoramaVideoTable.query\
+            .join(IndiAllSkyDbPanoramaVideoTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbPanoramaVideoTable.night == sa_false())\
+            .order_by(IndiAllSkyDbPanoramaVideoTable.createDate.asc())
+
+        ## no startrails
+        ## no startrail videos
+
+
+        ### Getting IDs first then deleting each file is faster than deleting all files with
+        ### thumbnails with a single query.  Deleting associated thumbnails causes sqlalchemy
+        ### to recache after every delete which cause a 1-5 second lag for each delete
+
+
+        asset_lists = [
+            (image_query, IndiAllSkyDbImageTable),
+            (fits_image_query, IndiAllSkyDbFitsImageTable),
+            (raw_image_query, IndiAllSkyDbRawImageTable),
+            (panorama_image_query, IndiAllSkyDbPanoramaImageTable),
+            (video_query, IndiAllSkyDbVideoTable),
+            (keogram_query, IndiAllSkyDbKeogramTable),
+            (panorama_video_query, IndiAllSkyDbPanoramaVideoTable),
+        ]
+
+
+        delete_count = 0
+        for asset_list, asset_table in asset_lists:
+            while True:
+                id_list = [entry.id for entry in asset_list.limit(500)]
+
+                if not id_list:
+                    break
+
+                delete_count += self._deleteAssets(asset_table, id_list)
+
+
+        return delete_count
+
+
+    def _deleteAssets(self, table, entry_id_list):
+        delete_count = 0
+        for entry_id in entry_id_list:
+            entry = table.query\
+                .filter(table.id == entry_id)\
+                .one()
+
+            app.logger.info('Removing %s entry: %s', entry.__class__.__name__, entry.filename)
+
+            try:
+                entry.deleteAsset()
+            except OSError as e:
+                app.logger.error('Cannot remove file: %s', str(e))
+                continue
+
+            db.session.delete(entry)
+            db.session.commit()
+
+            delete_count += 1
+
+        return delete_count
+
+
+    def validateDbEntries(self):
+        message_list = list()
+
+        ### Images
+        image_entries = IndiAllSkyDbImageTable.query\
+            .filter(IndiAllSkyDbImageTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        image_entries_count = image_entries.count()
+        message_list.append('<p>Images: {0:d}</p>'.format(image_entries_count))
+
+        app.logger.info('Searching %d images...', image_entries_count)
+        image_notfound_list = list()
+        for i in image_entries:
+            if not i.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', i.filename)
+                image_notfound_list.append(i)
+
+
+        ### FITS Images
+        fits_image_entries = IndiAllSkyDbFitsImageTable.query\
+            .filter(IndiAllSkyDbFitsImageTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbFitsImageTable.createDate.asc())
+
+
+        fits_image_entries_count = fits_image_entries.count()
+        message_list.append('<p>FITS Images: {0:d}</p>'.format(fits_image_entries_count))
+
+        app.logger.info('Searching %d fits images...', fits_image_entries_count)
+        fits_image_notfound_list = list()
+        for i in fits_image_entries:
+            if not i.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', i.filename)
+                fits_image_notfound_list.append(i)
+
+
+        ### Raw Images
+        raw_image_entries = IndiAllSkyDbRawImageTable.query\
+            .filter(IndiAllSkyDbRawImageTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbRawImageTable.createDate.asc())
+
+
+        raw_image_entries_count = raw_image_entries.count()
+        message_list.append('<p>RAW Images: {0:d}</p>'.format(raw_image_entries_count))
+
+        app.logger.info('Searching %d raw images...', raw_image_entries_count)
+        raw_image_notfound_list = list()
+        for i in raw_image_entries:
+            if not i.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', i.filename)
+                raw_image_notfound_list.append(i)
+
+
+        ### Panorama Images
+        panorama_image_entries = IndiAllSkyDbPanoramaImageTable.query\
+            .filter(IndiAllSkyDbPanoramaImageTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc())
+
+
+        panorama_image_entries_count = panorama_image_entries.count()
+        message_list.append('<p>Panorama Images: {0:d}</p>'.format(panorama_image_entries_count))
+
+        app.logger.info('Searching %d panorama images...', panorama_image_entries_count)
+        panorama_image_notfound_list = list()
+        for i in panorama_image_entries:
+            if not i.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', i.filename)
+                panorama_image_notfound_list.append(i)
+
+
+        ### Bad Pixel Maps
+        badpixelmap_entries = IndiAllSkyDbBadPixelMapTable.query\
+            .order_by(IndiAllSkyDbBadPixelMapTable.createDate.asc())
+        # fixme - need deal with non-local installs
+
+
+        badpixelmap_entries_count = badpixelmap_entries.count()
+        message_list.append('<p>Bad pixel maps: {0:d}</p>'.format(badpixelmap_entries_count))
+
+        app.logger.info('Searching %d bad pixel maps...', badpixelmap_entries_count)
+        badpixelmap_notfound_list = list()
+        for b in badpixelmap_entries:
+            if not b.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', b.filename)
+                badpixelmap_notfound_list.append(b)
+
+
+        ### Dark frames
+        darkframe_entries = IndiAllSkyDbDarkFrameTable.query\
+            .order_by(IndiAllSkyDbDarkFrameTable.createDate.asc())
+        # fixme - need deal with non-local installs
+
+
+        darkframe_entries_count = darkframe_entries.count()
+        message_list.append('<p>Dark Frames: {0:d}</p>'.format(darkframe_entries_count))
+
+        app.logger.info('Searching %d dark frames...', darkframe_entries_count)
+        darkframe_notfound_list = list()
+        for d in darkframe_entries:
+            if not d.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', d.filename)
+                darkframe_notfound_list.append(d)
+
+
+        ### Videos
+        video_entries = IndiAllSkyDbVideoTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbVideoTable.success == sa_true(),
+                    IndiAllSkyDbVideoTable.s3_key == sa_null(),
+                )
+            )\
+            .order_by(IndiAllSkyDbVideoTable.createDate.asc())
+
+        video_entries_count = video_entries.count()
+        message_list.append('<p>Timelapses: {0:d}</p>'.format(video_entries_count))
+
+        app.logger.info('Searching %d videos...', video_entries_count)
+        video_notfound_list = list()
+        for v in video_entries:
+            if not v.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', v.filename)
+                video_notfound_list.append(v)
+
+
+        ### Mini Videos
+        mini_video_entries = IndiAllSkyDbMiniVideoTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbMiniVideoTable.success == sa_true(),
+                    IndiAllSkyDbMiniVideoTable.s3_key == sa_null(),
+                )
+            )\
+            .order_by(IndiAllSkyDbMiniVideoTable.createDate.asc())
+
+        mini_video_entries_count = mini_video_entries.count()
+        message_list.append('<p>Mini Timelapses: {0:d}</p>'.format(mini_video_entries_count))
+
+        app.logger.info('Searching %d mini videos...', mini_video_entries_count)
+        mini_video_notfound_list = list()
+        for m in mini_video_entries:
+            if not m.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', m.filename)
+                mini_video_notfound_list.append(m)
+
+
+        ### Keograms
+        keogram_entries = IndiAllSkyDbKeogramTable.query\
+            .filter(IndiAllSkyDbKeogramTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbKeogramTable.createDate.asc())
+
+        keogram_entries_count = keogram_entries.count()
+        message_list.append('<p>Keograms: {0:d}</p>'.format(keogram_entries_count))
+
+        app.logger.info('Searching %d keograms...', keogram_entries_count)
+        keogram_notfound_list = list()
+        for k in keogram_entries:
+            if not k.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', k.filename)
+                keogram_notfound_list.append(k)
+
+
+        ### Startrails
+        startrail_entries = IndiAllSkyDbStarTrailsTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbStarTrailsTable.success == sa_true(),
+                    IndiAllSkyDbStarTrailsTable.s3_key == sa_null(),
+                )
+            )\
+            .order_by(IndiAllSkyDbStarTrailsTable.createDate.asc())
+
+        startrail_entries_count = startrail_entries.count()
+        message_list.append('<p>Star trails: {0:d}</p>'.format(startrail_entries_count))
+
+        app.logger.info('Searching %d star trails...', startrail_entries_count)
+        startrail_notfound_list = list()
+        for s in startrail_entries:
+            if not s.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', s.filename)
+                startrail_notfound_list.append(s)
+
+
+        ### Startrail videos
+        startrail_video_entries = IndiAllSkyDbStarTrailsVideoTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbStarTrailsVideoTable.success == sa_true(),
+                    IndiAllSkyDbStarTrailsVideoTable.s3_key == sa_null(),
+                )
+            )\
+            .order_by(IndiAllSkyDbStarTrailsVideoTable.createDate.asc())
+
+        startrail_video_entries_count = startrail_video_entries.count()
+        message_list.append('<p>Star trail timelapses: {0:d}</p>'.format(startrail_video_entries_count))
+
+        app.logger.info('Searching %d star trail timelapses...', startrail_video_entries_count)
+        startrail_video_notfound_list = list()
+        for s in startrail_video_entries:
+            if not s.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', s.filename)
+                startrail_video_notfound_list.append(s)
+
+
+        ### Panorama videos
+        panorama_video_entries = IndiAllSkyDbPanoramaVideoTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbPanoramaVideoTable.success == sa_true(),
+                    IndiAllSkyDbPanoramaVideoTable.s3_key == sa_null(),
+                )
+            )\
+            .order_by(IndiAllSkyDbPanoramaVideoTable.createDate.asc())
+
+        panorama_video_entries_count = panorama_video_entries.count()
+        message_list.append('<p>Panorama timelapses: {0:d}</p>'.format(panorama_video_entries_count))
+
+        app.logger.info('Searching %d panorama timelapses...', panorama_video_entries_count)
+        panorama_video_notfound_list = list()
+        for p in panorama_video_entries:
+            if not p.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', p.filename)
+                panorama_video_notfound_list.append(p)
+
+
+        ### Thumbnails
+        thumbnail_entries = IndiAllSkyDbThumbnailTable.query\
+            .filter(IndiAllSkyDbThumbnailTable.s3_key == sa_null())\
+            .order_by(IndiAllSkyDbThumbnailTable.createDate.asc())
+
+        thumbnail_entries_count = thumbnail_entries.count()
+        message_list.append('<p>Thumbnails: {0:d}</p>'.format(thumbnail_entries_count))
+
+        app.logger.info('Searching %d thumbnails...', thumbnail_entries_count)
+        thumbnail_notfound_list = list()
+        for t in thumbnail_entries:
+            if not t.validateFile():
+                #logger.warning('Entry not found on filesystem: %s', t.filename)
+                thumbnail_notfound_list.append(t)
+
+
+
+        app.logger.warning('Images not found: %d', len(image_notfound_list))
+        app.logger.warning('FITS Images not found: %d', len(fits_image_notfound_list))
+        app.logger.warning('RAW Images not found: %d', len(raw_image_notfound_list))
+        app.logger.warning('Panorama Images not found: %d', len(panorama_image_notfound_list))
+        app.logger.warning('Bad pixel maps not found: %d', len(badpixelmap_notfound_list))
+        app.logger.warning('Dark frames not found: %d', len(darkframe_notfound_list))
+        app.logger.warning('Videos not found: %d', len(video_notfound_list))
+        app.logger.warning('Mini Videos not found: %d', len(mini_video_notfound_list))
+        app.logger.warning('Keograms not found: %d', len(keogram_notfound_list))
+        app.logger.warning('Star trails not found: %d', len(startrail_notfound_list))
+        app.logger.warning('Star trail timelapses not found: %d', len(startrail_video_notfound_list))
+        app.logger.warning('Panorama timelapses not found: %d', len(panorama_video_notfound_list))
+        app.logger.warning('Thumbnails not found: %d', len(thumbnail_notfound_list))
+
+
+        ### DELETE ###
+        message_list.append('<p>Removed {0:d} missing image entries</p>'.format(len(image_notfound_list)))
+        [db.session.delete(i) for i in image_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing FITS image entries</p>'.format(len(fits_image_notfound_list)))
+        [db.session.delete(i) for i in fits_image_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing RAW image entries</p>'.format(len(raw_image_notfound_list)))
+        [db.session.delete(i) for i in raw_image_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing panorama image entries</p>'.format(len(panorama_image_notfound_list)))
+        [db.session.delete(i) for i in panorama_image_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing bad pixel map entries</p>'.format(len(badpixelmap_notfound_list)))
+        [db.session.delete(b) for b in badpixelmap_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing dark frame entries</p>'.format(len(darkframe_notfound_list)))
+        [db.session.delete(d) for d in darkframe_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing video entries</p>'.format(len(video_notfound_list)))
+        [db.session.delete(v) for v in video_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing mini video entries</p>'.format(len(mini_video_notfound_list)))
+        [db.session.delete(m) for m in mini_video_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing keogram entries</p>'.format(len(keogram_notfound_list)))
+        [db.session.delete(k) for k in keogram_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing star trail entries</p>'.format(len(startrail_notfound_list)))
+        [db.session.delete(s) for s in startrail_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing star trail timelapse entries</p>'.format(len(startrail_video_notfound_list)))
+        [db.session.delete(sv) for sv in startrail_video_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing panorama timelapse entries</p>'.format(len(panorama_video_notfound_list)))
+        [db.session.delete(p) for p in panorama_video_notfound_list]
+
+
+        message_list.append('<p>Removed {0:d} missing thumbnail entries</p>'.format(len(thumbnail_notfound_list)))
+        [db.session.delete(t) for t in thumbnail_notfound_list]
+
+
+        # finalize transaction
+        db.session.commit()
+
+        return message_list
+
+
+class AjaxSystemStatsView(SystemInfoView):
+    methods = ['GET']
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(AjaxSystemStatsView, self).__init__(template_name=None, **kwargs)
+
+    def dispatch_request(self):
+        context = self.get_context()
+
+        now_dt = context.get('now')
+        now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S') if now_dt else ''
+        now_date = now_dt.strftime('%m / %d / %Y') if now_dt else ''
+        now_time = now_dt.strftime('%I : %M : %S %P') if now_dt else ''
+
+        data = {
+            'cpu_usage': context.get('cpu_usage'),
+            'cpu_count': context.get('cpu_count'),
+            'cpu_load5': context.get('cpu_load5'),
+            'cpu_load10': context.get('cpu_load10'),
+            'cpu_load15': context.get('cpu_load15'),
+            'mem_total': context.get('mem_total'),
+            'mem_usage': context.get('mem_usage'),
+            'swap_total': context.get('swap_total'),
+            'swap_usage': context.get('swap_usage'),
+            'fs_data': context.get('fs_data'),
+            'uptime_str': context.get('uptime_str'),
+            'temp_list': context.get('temp_list'),
+            'fan_list': context.get('fan_list'),
+            'now': now_str,
+            'now_date': now_date,
+            'now_time': now_time,
+        }
+        return jsonify(data)
+
+
+class AjaxIndiServerChangeView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        import shutil
+
+        form_indiserver_change = IndiAllskyIndiServerChangeForm(data=request.json)
+
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                form_errors = form_indiserver_change.errors  # this must be a property
+                form_errors['form_global'] = ['You do not have permission to make configuration changes']
+                return jsonify(form_errors), 400
+
+
+        if not form_indiserver_change.validate():
+            form_errors = form_indiserver_change.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        camera_server = str(request.json['CAMERA_SERVER_SELECT'])
+        gps_server = str(request.json['GPS_SERVER_SELECT'])
+        restart_indiserver = bool(request.json['RESTART_INDISERVER'])
+
+
+        # find the indiserver
+        if Path('/usr/local/bin/indiserver').exists():
+            indiserver_p = Path('/usr/local/bin/indiserver')
+        elif Path('/usr/bin/indiserver').exists():
+            indiserver_p = Path('/usr/bin/indiserver')
+        else:
+            which_indiserver = shutil.which('indiserver')
+
+            if which_indiserver:
+                indiserver_p = Path(which_indiserver)
+            else:
+                raise Exception('indiserver not found')
+
+
+        allsky_directory_p = Path(__file__).parent.parent.parent.absolute()
+
+
+        with io.open(str(allsky_directory_p.joinpath('service', 'indiserver.service')), 'r') as f_service_tmpl:
+            service_tmpl = f_service_tmpl.read()
+
+
+        service_tmpl = service_tmpl.replace('%ALLSKY_DIRECTORY%', str(allsky_directory_p))\
+            .replace('%INDI_DRIVER_PATH%', str(indiserver_p.parent.absolute()))\
+            .replace('%INDI_PORT%', str(self.indi_allsky_config.get('INDI_PORT', 7624)))\
+            .replace('%INDI_CCD_DRIVER%', camera_server)\
+            .replace('%INDI_GPS_DRIVER%', gps_server)\
+            .replace('%INDISERVER_USER%', os.getlogin())
+
+
+        indiserver_service_p = Path(os.environ.get('HOME', '/home/{0:s}'.format(os.getlogin()))).joinpath('.config', 'systemd', 'user', app.config['INDISERVER_SERVICE_NAME'])
+
+        with io.open(str(indiserver_service_p), 'w') as f_indiserver_service:
+            f_indiserver_service.write(service_tmpl)
+
+
+        indiserver_service_p.chmod(0o644)
+
+
+        self.reloadSystemdUnits()
+
+
+        success_message = 'Reconfigure completed.'
+
+
+        if restart_indiserver:
+            self.restartSystemdUnit(app.config['INDISERVER_SERVICE_NAME'])
+            success_message += ' Restart complete'
+
+
+        return jsonify({'success-message' : success_message})
+
+
+    def reloadSystemdUnits(self, bus_type=dbus.SessionBus):
+        try:
+            bus = bus_type()
+        except dbus.exceptions.DBusException:
+            # This happens in docker
+            return 'D-Bus Unavailable', 'D-Bus Unavailable'
+
+        systemd1 = bus.get_object('org.freedesktop.systemd1', '/org/freedesktop/systemd1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.systemd1.Manager')
+
+        try:
+            manager.Reload()
+        except dbus.exceptions.DBusException:
+            return 'UNKNOWN', 'UNKNOWN'
+
+
+class TimelapseGeneratorView(TemplateView):
+    page_title = 'Generate'
+    decorators = [login_required]
+
+
+    def get_context(self):
+        context = super(TimelapseGeneratorView, self).get_context()
+
+        form_data = {
+            'CAMERA_ID' : self.camera.id,
+        }
+
+        context['form_timelapsegen'] = IndiAllskyTimelapseGeneratorForm(
+            data=form_data,
+            camera_id=self.camera.id,
+        )
+
+        # Lookup tasks
+        state_list = (
+            TaskQueueState.MANUAL,
+            TaskQueueState.QUEUED,
+            TaskQueueState.RUNNING,
+            TaskQueueState.SUCCESS,
+            TaskQueueState.FAILED,
+        )
+
+        queue_list = (
+            TaskQueueQueue.VIDEO,
+        )
+
+        camera_now_minus_12h = self.camera_now - timedelta(hours=12)
+
+        tasks_q = IndiAllSkyDbTaskQueueTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbTaskQueueTable.createDate > camera_now_minus_12h,
+                    IndiAllSkyDbTaskQueueTable.state.in_(state_list),
+                    IndiAllSkyDbTaskQueueTable.queue.in_(queue_list),
+                )
+            )\
+            .order_by(IndiAllSkyDbTaskQueueTable.createDate.desc())
+
+
+        task_list = list()
+        for task in tasks_q:
+            if task.data:
+                task_data = task.data
+            else:
+                task_data = {}
+
+            t = {
+                'id'         : task.id,
+                'createDate' : task.createDate,
+                'queue'      : task.queue.name,
+                'action'     : task_data.get('action', 'MISSING'),
+                'state'      : task.state.name,
+                'result'     : task.result,
+            }
+
+            task_list.append(t)
+
+        context['task_list'] = task_list
+
+
+        return context
+
+
+class AjaxTimelapseGeneratorView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxTimelapseGeneratorView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            json_data = {
+                'form_global' : ['User does not have permission to generate content'],
+            }
+            return jsonify(json_data), 400
+
+
+        camera_id = int(request.json['CAMERA_ID'])
+
+        form_timelapsegen = IndiAllskyTimelapseGeneratorForm(data=request.json, camera_id=camera_id)
+
+        if not form_timelapsegen.validate():
+            form_errors = form_timelapsegen.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        if not self.verify_admin_network():
+            json_data = {
+                'form_global' : ['Request not from admin network (flask.json)'],
+            }
+            return jsonify(json_data), 400
+
+
+        action = request.json['ACTION_SELECT']
+        day_select_str = request.json['DAY_SELECT']
+
+        day_str, night_str = day_select_str.split('_')
+
+        day_date = datetime.strptime(day_str, '%Y-%m-%d').date()
+
+        if night_str == 'night':
+            night = True
+        else:
+            night = False
+
+
+        camera = IndiAllSkyDbCameraTable.query\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .one()
+
+
+        if action == 'delete_video_k_st_p':
+            video_entry = IndiAllSkyDbVideoTable.query\
+                .join(IndiAllSkyDbVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbVideoTable.dayDate == day_date,
+                        IndiAllSkyDbVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+            keogram_entry = IndiAllSkyDbKeogramTable.query\
+                .join(IndiAllSkyDbKeogramTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbKeogramTable.dayDate == day_date,
+                        IndiAllSkyDbKeogramTable.night == night,
+                    )
+                )\
+                .first()
+
+            startrail_entry = IndiAllSkyDbStarTrailsTable.query\
+                .join(IndiAllSkyDbStarTrailsTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbStarTrailsTable.dayDate == day_date,
+                        IndiAllSkyDbStarTrailsTable.night == night,
+                    )
+                )\
+                .first()
+
+            startrail_video_entry = IndiAllSkyDbStarTrailsVideoTable.query\
+                .join(IndiAllSkyDbStarTrailsVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbStarTrailsVideoTable.dayDate == day_date,
+                        IndiAllSkyDbStarTrailsVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+            panorama_video_entry = IndiAllSkyDbPanoramaVideoTable.query\
+                .join(IndiAllSkyDbPanoramaVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbPanoramaVideoTable.dayDate == day_date,
+                        IndiAllSkyDbPanoramaVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+
+            if video_entry:
+                video_entry.deleteAsset()
+                db.session.delete(video_entry)
+                db.session.commit()
+
+            if keogram_entry:
+                keogram_entry.deleteAsset()
+                db.session.delete(keogram_entry)
+                db.session.commit()
+
+            if startrail_entry:
+                startrail_entry.deleteAsset()
+                db.session.delete(startrail_entry)
+                db.session.commit()
+
+            if startrail_video_entry:
+                startrail_video_entry.deleteAsset()
+                db.session.delete(startrail_video_entry)
+                db.session.commit()
+
+            if panorama_video_entry:
+                panorama_video_entry.deleteAsset()
+                db.session.delete(panorama_video_entry)
+                db.session.commit()
+
+
+            message = {
+                'success-message' : 'Files deleted',
+            }
+
+            return jsonify(message)
+
+
+        elif action == 'delete_video':
+            video_entry = IndiAllSkyDbVideoTable.query\
+                .join(IndiAllSkyDbVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbVideoTable.dayDate == day_date,
+                        IndiAllSkyDbVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+            if video_entry:
+                video_entry.deleteAsset()
+                db.session.delete(video_entry)
+                db.session.commit()
+
+
+            message = {
+                'success-message' : 'Timelapse deleted',
+            }
+
+            return jsonify(message)
+
+        elif action == 'delete_panorama_video':
+            panorama_video_entry = IndiAllSkyDbPanoramaVideoTable.query\
+                .join(IndiAllSkyDbPanoramaVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbPanoramaVideoTable.dayDate == day_date,
+                        IndiAllSkyDbPanoramaVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+            if panorama_video_entry:
+                panorama_video_entry.deleteAsset()
+                db.session.delete(panorama_video_entry)
+                db.session.commit()
+
+
+            message = {
+                'success-message' : 'Panorama Timelapse deleted',
+            }
+
+            return jsonify(message)
+
+        if action == 'delete_k_st':
+            keogram_entry = IndiAllSkyDbKeogramTable.query\
+                .join(IndiAllSkyDbKeogramTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbKeogramTable.dayDate == day_date,
+                        IndiAllSkyDbKeogramTable.night == night,
+                    )
+                )\
+                .first()
+
+            startrail_entry = IndiAllSkyDbStarTrailsTable.query\
+                .join(IndiAllSkyDbStarTrailsTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbStarTrailsTable.dayDate == day_date,
+                        IndiAllSkyDbStarTrailsTable.night == night,
+                    )
+                )\
+                .first()
+
+            startrail_video_entry = IndiAllSkyDbStarTrailsVideoTable.query\
+                .join(IndiAllSkyDbStarTrailsVideoTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbStarTrailsVideoTable.dayDate == day_date,
+                        IndiAllSkyDbStarTrailsVideoTable.night == night,
+                    )
+                )\
+                .first()
+
+
+            if keogram_entry:
+                keogram_entry.deleteAsset()
+                db.session.delete(keogram_entry)
+                db.session.commit()
+
+            if startrail_entry:
+                startrail_entry.deleteAsset()
+                db.session.delete(startrail_entry)
+                db.session.commit()
+
+            if startrail_video_entry:
+                startrail_video_entry.deleteAsset()
+                db.session.delete(startrail_video_entry)
+                db.session.commit()
+
+
+            message = {
+                'success-message' : 'Keogram/Star Trails deleted',
+            }
+
+            return jsonify(message)
+
+
+        elif action == 'generate_video_k_st':
+            timespec = day_date.strftime('%Y%m%d')
+
+            if night:
+                timeofday_str = 'night'
+            else:
+                timeofday_str = 'day'
+
+
+            app.logger.warning('Generating %s time timelapse for %s camera %d', timeofday_str, timespec, camera.id)
+
+            jobdata_video = {
+                'action' : 'generateVideo',
+                'kwargs' : {
+                    'timespec'    : timespec,
+                    'night'       : night,
+                    'camera_id'   : camera.id,
+                },
+            }
+
+            jobdata_kst = {
+                'action' : 'generateKeogramStarTrails',
+                'kwargs' : {
+                    'timespec'    : timespec,
+                    'night'       : night,
+                    'camera_id'   : camera.id,
+                },
+            }
+
+
+            task_video = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata_video,
+            )
+            task_kst = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata_kst,
+            )
+
+
+            db.session.add(task_kst)  # keogram/st first
+            db.session.add(task_video)
+
+
+            if self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE'):
+                jobdata_panorama_video = {
+                    'action' : 'generatePanoramaVideo',
+                    'kwargs' : {
+                        'timespec'    : timespec,
+                        'night'       : night,
+                        'camera_id'   : camera.id,
+                    },
+                }
+
+                task_panorama_video = IndiAllSkyDbTaskQueueTable(
+                    queue=TaskQueueQueue.VIDEO,
+                    state=TaskQueueState.MANUAL,
+                    priority=100,
+                    data=jobdata_panorama_video,
+                )
+
+                db.session.add(task_panorama_video)
+
+
+            db.session.commit()
+
+            message = {
+                'success-message' : 'Job submitted',
+            }
+
+            return jsonify(message)
+
+
+        elif action == 'generate_video':
+            timespec = day_date.strftime('%Y%m%d')
+
+            if night:
+                timeofday_str = 'night'
+            else:
+                timeofday_str = 'day'
+
+
+            app.logger.warning('Generating %s time timelapse for %s camera %d', timeofday_str, timespec, camera.id)
+
+            jobdata = {
+                'action' : 'generateVideo',
+                'kwargs' : {
+                    'timespec'    : timespec,
+                    'night'       : night,
+                    'camera_id'   : camera.id,
+                },
+            }
+
+            task = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata,
+            )
+            db.session.add(task)
+            db.session.commit()
+
+            message = {
+                'success-message' : 'Job submitted',
+            }
+
+            return jsonify(message)
+
+        elif action == 'generate_panorama_video':
+            if not self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE'):
+                message = {
+                    'success-message' : 'Panoramas disabled',
+                }
+
+                return jsonify(message)
+
+
+            timespec = day_date.strftime('%Y%m%d')
+
+            if night:
+                timeofday_str = 'night'
+            else:
+                timeofday_str = 'day'
+
+
+            app.logger.warning('Generating %s time panorama timelapse for %s camera %d', timeofday_str, timespec, camera.id)
+
+            jobdata = {
+                'action' : 'generatePanoramaVideo',
+                'kwargs' : {
+                    'timespec'    : timespec,
+                    'night'       : night,
+                    'camera_id'   : camera.id,
+                },
+            }
+
+            task = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata,
+            )
+            db.session.add(task)
+            db.session.commit()
+
+            message = {
+                'success-message' : 'Job submitted',
+            }
+
+            return jsonify(message)
+
+        elif action == 'generate_k_st':
+            timespec = day_date.strftime('%Y%m%d')
+
+            if night:
+                timeofday_str = 'night'
+            else:
+                timeofday_str = 'day'
+
+
+            app.logger.warning('Generating %s time timelapse for %s camera %d', timeofday_str, timespec, camera.id)
+
+            jobdata = {
+                'action' : 'generateKeogramStarTrails',
+                'kwargs' : {
+                    'timespec'    : timespec,
+                    'night'       : night,
+                    'camera_id'   : camera.id,
+                },
+            }
+
+            task = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata,
+            )
+            db.session.add(task)
+            db.session.commit()
+
+            message = {
+                'success-message' : 'Job submitted',
+            }
+
+            return jsonify(message)
+
+        elif action == 'upload_endofnight':
+            app.logger.warning('Uploading end of night data for camera %d', camera.id)
+
+            jobdata = {
+                'action' : 'uploadAllskyEndOfNight',
+                'kwargs' : {
+                    'night'     : True,
+                    'camera_id' : camera.id,
+                },
+            }
+
+            task = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.VIDEO,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data=jobdata,
+            )
+            db.session.add(task)
+            db.session.commit()
+
+            message = {
+                'success-message' : 'Job submitted',
+            }
+
+            return jsonify(message)
+
+        if action == 'delete_images':
+            image_list = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbImageTable.dayDate == day_date,
+                        IndiAllSkyDbImageTable.night == night,
+                    )
+                )\
+                .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+            panorama_list = IndiAllSkyDbPanoramaImageTable.query\
+                .join(IndiAllSkyDbPanoramaImageTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera.id,
+                        IndiAllSkyDbPanoramaImageTable.dayDate == day_date,
+                        IndiAllSkyDbPanoramaImageTable.night == night,
+                    )
+                )\
+                .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc())
+
+
+            ### Getting IDs first then deleting each file is faster than deleting all files with
+            ### thumbnails with a single query.  Deleting associated thumbnails causes sqlalchemy
+            ### to recache after every delete which cause a 1-5 second lag for each delete
+
+            image_id_list = list()
+            for entry in image_list:
+                image_id_list.append(entry.id)
+
+            panorama_image_id_list = list()
+            for entry in panorama_list:
+                panorama_image_id_list.append(entry.id)
+
+
+            delete_count = self._deleteAssets(IndiAllSkyDbImageTable, image_id_list)
+            delete_count += self._deleteAssets(IndiAllSkyDbPanoramaImageTable, panorama_image_id_list)
+
+
+            message = {
+                'success-message' : '{0:d} images deleted'.format(delete_count),
+            }
+            return jsonify(message)
+        else:
+            # this should never happen
+            message = {
+                'failure-message' : 'Invalid'
+            }
+            return jsonify(message), 400
+
+
+    def _deleteAssets(self, table, entry_id_list):
+        delete_count = 0
+        for entry_id in entry_id_list:
+            entry = table.query\
+                .filter(table.id == entry_id)\
+                .one()
+
+            app.logger.info('Removing old %s entry: %s', entry.__class__.__name__, entry.filename)
+
+            try:
+                entry.deleteAsset()
+            except OSError as e:
+                app.logger.error('Cannot remove file: %s', str(e))
+                continue
+
+            db.session.delete(entry)
+            db.session.commit()
+
+            delete_count += 1
+
+        return delete_count
+
+
+class FocusView(TemplateView):
+    page_title = 'Focus'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(FocusView, self).get_context()
+
+        context['form_focus'] = IndiAllskyFocusForm()
+
+        context['focuser_device'] = int(bool(self.indi_allsky_config.get('FOCUSER', {}).get('CLASSNAME')))
+        context['form_focuscontroller'] = IndiAllskyFocusControllerForm()
+
+        return context
+
+
+class JsonFocusView(JsonView):
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(JsonFocusView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        import cv2
+        from ..stars import IndiAllSkyStars
+
+        zoom = int(request.args.get('zoom', 2))
+        x_offset = int(request.args.get('x_offset', 0))
+        y_offset = int(request.args.get('y_offset', 0))
+
+
+        sqm_mask = {
+            1 : None,  # assume bin 1
+        }
+
+        stars_detect_o = IndiAllSkyStars(self.indi_allsky_config, mask=sqm_mask)
+
+
+        json_data = dict()
+        json_data['focus_mode'] = self.indi_allsky_config.get('FOCUS_MODE', False)
+
+        image_dir = Path(self.indi_allsky_config['IMAGE_FOLDER']).absolute()
+        latest_image_p = image_dir.joinpath('latest.{0:s}'.format(self.indi_allsky_config['IMAGE_FILE_TYPE']))
+        #latest_image_p = image_dir.joinpath('focus.fit')
+        #latest_image_p = image_dir.joinpath('focus.png')
+
+
+        if not latest_image_p.exists():
+            app.logger.error('Latest image does not exist')
+            return jsonify({}), 400
+
+
+        #focus_start = time.time()
+
+        if latest_image_p.suffix in ('.jpg', '.jpeg'):
+            import simplejpeg
+
+            try:
+                with io.open(str(latest_image_p), 'rb') as f_img:
+                    image_data = simplejpeg.decode_jpeg(f_img.read(), colorspace='BGR')
+            except ValueError:
+                app.logger.error('Unable to read %s', latest_image_p)
+                return jsonify({}), 400
+
+        elif latest_image_p.suffix in ('.png',):
+            # opencv is faster than Pillow with PNG
+            # PNG encoding is very slow on Raspberry Pi
+            image_data = cv2.imread(str(latest_image_p), cv2.IMREAD_COLOR)
+
+            if isinstance(image_data, type(None)):
+                app.logger.error('Unable to read %s', latest_image_p)
+                return jsonify({}), 400
+        elif latest_image_p.suffix in ('.fit', '.fits'):
+            import numpy
+            from astropy.io import fits
+
+            try:
+                hdulist = fits.open(latest_image_p)
+            except OSError:
+                app.logger.error('Unable to read %s', latest_image_p)
+                return jsonify({}), 400
+
+            # data should be RGB
+            image_data = numpy.swapaxes(hdulist[0].data, 0, 2)
+            image_data = numpy.swapaxes(image_data, 0, 1)
+            image_data = cv2.cvtColor(image_data, cv2.COLOR_RGB2BGR)
+
+        else:
+            # Pillow supports remaining image types
+            import numpy
+            import PIL
+            from PIL import Image
+
+            try:
+                with Image.open(str(latest_image_p)) as img_pil:
+                    image_data = cv2.cvtColor(numpy.array(img_pil), cv2.COLOR_RGB2BGR)
+            except PIL.UnidentifiedImageError:
+                app.logger.error('Unable to read %s', latest_image_p)
+                return jsonify({}), 400
+
+
+        stars = stars_detect_o.detectObjects(image_data, 1)  # assume bin 1
+
+
+        image_height, image_width = image_data.shape[:2]
+
+        ### get ROI based on zoom
+        x1 = int((image_width / 2) - (image_width / zoom) + x_offset)
+        y1 = int((image_height / 2) - (image_height / zoom) - y_offset)
+        x2 = int((image_width / 2) + (image_width / zoom) + x_offset)
+        y2 = int((image_height / 2) + (image_height / zoom) - y_offset)
+
+        image_roi = image_data[
+            y1:y2,
+            x1:x2,
+        ]
+
+
+        ### OpenCV
+        _, json_image = cv2.imencode('.jpg', image_roi, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        #_, json_image = cv2.imencode('.png', image_roi, [cv2.IMWRITE_PNG_COMPRESSION, 5])
+        json_image_buffer = io.BytesIO(json_image.tobytes())
+
+
+        ### pillow
+        #from PIL import Image
+        #json_image_buffer = io.BytesIO()
+        #img = Image.fromarray(cv2.cvtColor(image_roi, cv2.COLOR_BGR2RGB))
+        #img.save(json_image_buffer, format='JPEG', quality=90)
+        #img.save(json_image_buffer, format='PNG', compress_level=5)
+
+
+        json_image_b64 = base64.b64encode(json_image_buffer.getvalue())
+
+        json_data['image_b64'] = json_image_b64.decode('utf-8')
+
+
+        ### Blur detection
+        #vl_start = time.time()
+
+        ### determine variance of laplacian
+        blur_score = cv2.Laplacian(image_roi, cv2.CV_32F).var()
+        json_data['blur_score'] = float(blur_score)
+        json_data['star_count'] = len(stars)
+
+        #vl_elapsed_s = time.time() - vl_start
+        #app.logger.info('Variance of laplacien in %0.4f s', vl_elapsed_s)
+
+        #focus_elapsed_s = time.time() - focus_start
+        #app.logger.info('Focus processing in %0.4f s', focus_elapsed_s)
+
+        return jsonify(json_data)
+
+
+class AjaxFocusControllerView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxFocusControllerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        from ..focuser import IndiAllSkyFocuserInterface
+        from ..devices.exceptions import DeviceControlException
+
+
+        if not current_user.is_admin:
+            json_data = {
+                'focuser_error' : ['User does not have permission to adjust focus'],
+            }
+            return jsonify(json_data), 400
+
+
+        form_focuscontroller = IndiAllskyFocusControllerForm(data=request.json)
+
+
+        if not form_focuscontroller.validate():
+            form_errors = form_focuscontroller.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        if not self.verify_admin_network():
+            json_data = {
+                'focuser_error' : ['Request not from admin network (flask.json)'],
+            }
+            return jsonify(json_data), 400
+
+
+        direction = str(request.json['DIRECTION'])
+        degrees = int(request.json['STEP_DEGREES'])
+
+        app.logger.info('Focusing: {0:s}', direction)
+
+        try:
+            focuser_interface = IndiAllSkyFocuserInterface(self.indi_allsky_config)
+        except SystemError as e:
+            json_data = {
+                'focuser_error' : ['Error initializing focuser: {0:s}'.format(str(e))],
+            }
+            return jsonify(json_data), 400
+        except ValueError as e:
+            json_data = {
+                'focuser_error' : ['Error initializing focuser: {0:s}'.format(str(e))],
+            }
+            return jsonify(json_data), 400
+        except DeviceControlException as e:
+            json_data = {
+                'focuser_error' : ['Error initializing focuser: {0:s}'.format(str(e))],
+            }
+            return jsonify(json_data), 400
+
+
+        try:
+            steps_offset = focuser_interface.move(direction, degrees)
+        except DeviceControlException as e:
+            json_data = {
+                'focuser_error' : ['Error moving focuser: {0:s}'.format(str(e))],
+            }
+            return jsonify(json_data), 400
+
+
+        # cleanup
+        focuser_interface.deinit()
+
+
+        r = {
+            'steps' : steps_offset,
+        }
+
+        return jsonify(r)
+
+
+class AjaxLensSolverView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    # Single-flight guard around the CPU-bound scipy fit. PRECONDITION: per-process lock,
+    # only effective while gunicorn.conf.py runs ONE worker -- more workers defeat it silently.
+    _solve_lock = threading.Lock()
+
+    # advisory hint on the 429 response only, not a correctness guarantee
+    LOCK_RETRY_AFTER_S = 10
+
+
+    def dispatch_request(self):
+        action = str(request.json.get('action', ''))
+
+        if action == 'solve':
+            return self.solve()
+        elif action == 'save':
+            return self.save()
+
+        return jsonify({'success': False, 'message': 'Unknown action'}), 400
+
+
+    def solve(self):
+        values, error = parseSolverRequestValues(request.json)
+        if error:
+            return jsonify({'success': False, 'message': error}), 400
+
+        try:
+            camera_id = int(request.json['camera_id'])
+            timestamp = int(request.json['timestamp'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'success': False, 'message': 'camera_id and timestamp required'}), 400
+
+        # explicit check: an unknown camera_id would otherwise fall through to a FakeCamera (lat/long 0.0) and solve silently wrong
+        camera = IndiAllSkyDbCameraTable.query\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .first()
+        if not camera:
+            return jsonify({'success': False, 'message': 'Unknown camera'}), 400
+
+        # pre-set self.camera so cameraSetup() reuses this row instead of re-querying
+        self.camera = camera
+        self.cameraSetup(camera_id=camera_id)
+
+        # resolve by exact camera + timestamp (NEVER "latest"); a huge int can raise OverflowError/OSError, not just ValueError
+        try:
+            ts_dt = datetime.fromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return jsonify({'success': False, 'message': 'Invalid timestamp'}), 400
+        ts_dt_end = ts_dt + timedelta(seconds=1)
+
+        image_entry = IndiAllSkyDbImageTable.query\
+            .filter(IndiAllSkyDbImageTable.camera_id == camera_id)\
+            .filter(IndiAllSkyDbImageTable.createDate >= ts_dt)\
+            .filter(IndiAllSkyDbImageTable.createDate < ts_dt_end)\
+            .first()
+
+        if not image_entry:
+            return jsonify({'success': False, 'message': 'Image not found for timestamp'}), 400
+
+        image_file = image_entry.getFilesystemPath()
+        if not image_file.exists():
+            return jsonify({'success': False, 'message': 'Image file missing from filesystem'}), 400
+
+        # same lat/long the VirtualSky page renders with (incl. privacy rounding)
+        latitude, longitude = self.getCameraPrivacyLatLong(self.camera)
+
+        # identical effective-time computation to VirtualSkyView.get_context
+        obstime_unix = timestamp - self.camera_time_offset
+
+        solver = IndiAllSkyLensSolver(self.indi_allsky_config)
+
+        if not self._solve_lock.acquire(blocking=False):
+            return jsonify({
+                'success': False,
+                'message': 'A lens solve is already in progress -- please wait and try again.',
+            }), 429, {'Retry-After': str(self.LOCK_RETRY_AFTER_S)}
+
+        try:
+            result = solver.solve(image_file, latitude, longitude, obstime_unix, values)
+        except Exception:  # noqa: BLE001
+            # never return a raw exception string to the client
+            app.logger.exception('Lens solver failed')
+            return jsonify({'success': False, 'message': 'Solver error -- check server logs'}), 500
+        finally:
+            self._solve_lock.release()
+
+        return jsonify(result)
+
+
+    def save(self):
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                return jsonify({'success': False, 'message': 'You do not have permission to make configuration changes'}), 403
+
+        values, error = parseSolverRequestValues(request.json)
+        if error:
+            return jsonify({'success': False, 'message': error}), 400
+
+        reload_on_save = bool(request.json.get('RELOAD_ON_SAVE', False))
+
+        applySolvedValuesToConfig(self.indi_allsky_config, values)
+
+        # do NOT reassign `self._indi_allsky_config_obj.config = self.indi_allsky_config` here:
+        # the setter rebuilds `_config` as a new OrderedDict, breaking the object identity the
+        # in-place mutation above relies on -- later mutations would be silently discarded.
+        if not app.config['LOGIN_DISABLED']:
+            username = current_user.username
+        else:
+            username = 'system'
+
+        try:
+            self._indi_allsky_config_obj.save(username, 'Lens solver calibration')
+        except ConfigSaveException as e:
+            error_data = {
+                'form_global': [str(e)],
+            }
+            return jsonify(error_data), 400
+
+        message = 'Saved lens calibration to config. Note: saving Azimuth Angle also moves the cardinal-direction (N/E/S/W) labels burned into future images.'
+
+        if reload_on_save:
+            self._miscDb.setState('STATUS', constants.STATUS_RELOADING)
+
+            task_reload = IndiAllSkyDbTaskQueueTable(
+                queue=TaskQueueQueue.MAIN,
+                state=TaskQueueState.MANUAL,
+                priority=100,
+                data={'action': 'reload'},
+            )
+            db.session.add(task_reload)
+            db.session.commit()
+
+            message += ' Reloading indi-allsky service.'
+        else:
+            message += ' Values become page defaults after the next service reload.'
+
+        return jsonify({'success': True, 'message': message})
+
+
+class ManualGpioView(TemplateView):
+    decorators = [login_required]
+    page_title = 'Manual GPIO'
+
+
+    def get_context(self):
+        context = super(ManualGpioView, self).get_context()
+
+        from ..devices import generic as indi_allsky_gpio
+        from ..devices.exceptions import DeviceControlException
+
+
+        gpio_class_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_CLASSNAME')
+        pin_1_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_1', '-1')
+        pin_2_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_2', '-1')
+        pin_3_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_3', '-1')
+
+
+        context['pin_names'] = [pin_1_str, pin_2_str, pin_3_str]
+
+        if not gpio_class_str:
+            context['gpio_class'] = ''
+            context['pin_states'] = [-1, -1, -1]
+
+            return context
+
+
+        try:
+            gpio_class = getattr(indi_allsky_gpio, gpio_class_str)
+        except AttributeError:
+            context['gpio_class'] = ''
+            context['pin_states'] = [-1, -1, -1]
+
+            return context
+
+
+        pin_states = [None, None, None]
+
+        try:
+            pin_1 = gpio_class(self.indi_allsky_config, pin_1_name=pin_1_str)
+            pin_states[0] = int(pin_1.state)
+            #pin_1.deinit()  # deinit returns pin to default state
+        except DeviceControlException:
+            pin_states[0] = -1
+
+
+        try:
+            pin_2 = gpio_class(self.indi_allsky_config, pin_1_name=pin_2_str)
+            pin_states[1] = int(pin_2.state)
+            #pin_2.deinit()  # deinit returns pin to default state
+        except DeviceControlException:
+            pin_states[1] = -1
+
+
+        try:
+            pin_3 = gpio_class(self.indi_allsky_config, pin_1_name=pin_3_str)
+            pin_states[2] = int(pin_3.state)
+            #pin_3.deinit()  # deinit returns pin to default state
+        except DeviceControlException:
+            pin_states[2] = -1
+
+
+        context['gpio_class'] = gpio_class_str
+        context['pin_states'] = pin_states
+
+        return context
+
+
+class AjaxManualGpioView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        if not app.config['LOGIN_DISABLED']:
+            if not current_user.is_admin:
+                message = {
+                    'failure-message' : 'User is not an admin',
+                }
+                return jsonify({}), 400
+
+
+        from ..devices import generic as indi_allsky_gpio
+
+
+        pin_id = int(request.json['PIN_ID'])
+        new_pin_state = request.json['NEW_PIN_STATE']
+
+
+        gpio_class_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_CLASSNAME')
+        if not gpio_class_str:
+            message = {
+                'failure-message' : 'Manual GPIO not configured',
+            }
+            return jsonify(message), 400
+
+        try:
+            gpio_class = getattr(indi_allsky_gpio, gpio_class_str)
+        except AttributeError:
+            message = {
+                'failure-message' : 'Invalid GPIO class',
+            }
+            return jsonify(), 400
+
+
+        pin_str = self.indi_allsky_config.get('MANUAL_GPIO', {}).get('A_PIN_{0:d}'.format(pin_id))
+        if not pin_str:
+            message = {
+                'failure-message' : 'Unknown pin'
+            }
+            return jsonify({}), 400
+
+
+        pin = gpio_class(self.indi_allsky_config, pin_1_name=pin_str)
+        pin.state = new_pin_state
+
+        time.sleep(0.5)
+
+        message = {
+            'success-message' : 'Pin configured',
+            'pin_name' : pin_str,
+            'pin_id' : pin_id,
+            'pin_state' : pin.state,
+        }
+
+
+        #pin.deinit()  # deinit returns pin to default state
+
+        return jsonify(message)
+
+
+class Asi676mcCalibrationView(TemplateView):
+    """Authenticated landing page for both calibration evidence sources."""
+
+    page_title = 'Fix ASI676MC purple frames'
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def get_context(self):
+        """Build camera choices, capture guidance, and browser limits."""
+        context = super(Asi676mcCalibrationView, self).get_context()
+        supported_cameras = _visible_asi676mc_cameras()
+        supported_ids = {camera.id for camera in supported_cameras}
+        selected_camera = (
+            self.camera
+            if self.camera.id in supported_ids
+            else supported_cameras[0]
+        )
+        calibration_form = IndiAllskyAsi676mcCalibrationForm(
+            data={
+                'CAMERA_ID': selected_camera.id,
+                'MAX_PAIR_SECONDS': 90.0,
+                'DATABASE_GROUP_LIMIT': 20,
+            },
+        )
+        calibration_form.CAMERA_ID.choices = [
+            (
+                camera.id,
+                '{0} ({1})'.format(
+                    camera.friendlyName or camera.name,
+                    _camera_identity(camera)['name'],
+                ),
+            )
+            for camera in supported_cameras
+        ]
+        calibration_form.CAMERA_ID.data = selected_camera.id
+        context['form_calibration'] = calibration_form
+        context['calibration_camera_count'] = len(supported_cameras)
+        context['calibration_can_save_config'] = (
+            _can_save_standard_configuration()
+        )
+        context['capture_guidance'] = (
+            asi676mc_calibration.capture_configuration_guidance(
+                self.indi_allsky_config,
+            )
+        )
+        # Mirror the server's hard upload limits so the browser can reject an
+        # oversized selection before spending minutes transferring it. The
+        # upload endpoint still enforces the same limits independently.
+        context['calibration_upload_limits'] = {
+            'file_count': asi676mc_calibration.MAX_FILE_COUNT,
+            'file_bytes': asi676mc_calibration.MAX_FILE_BYTES,
+            'session_bytes': asi676mc_calibration.MAX_SESSION_BYTES,
+        }
+        context['calibration_database_limits'] = {
+            'minimum': asi676mc_calibration.DATABASE_GROUP_MIN,
+            'maximum': asi676mc_calibration.DATABASE_GROUP_MAX,
+        }
+        return context
+
+
+class AjaxAsi676mcCalibrationSessionView(BaseView):
+    """Create one private upload session for the authorized user."""
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self):
+        """Create a camera-bound private upload session."""
+        request_data = request.get_json(silent=True) or {}
+        camera = _supported_asi676mc_camera(request_data.get('camera_id'))
+        if camera is None:
+            return jsonify({
+                'error': 'Select a currently available local ASI676MC camera.',
+            }), 400
+        try:
+            manifest = asi676mc_calibration.create_session(
+                _calibration_owner(),
+                camera_identity=_camera_identity(camera),
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            app.logger.warning(
+                'Unable to create ASI676MC calibration session: %s',
+                str(error),
+            )
+            return jsonify({
+                'error': str(error),
+            }), 400
+        except OSError:
+            app.logger.exception('Unable to create ASI676MC calibration session')
+            return jsonify({
+                'error': (
+                    'The calibration files could not be prepared. Free some '
+                    'disk space and try again.'
+                ),
+            }), 500
+        return jsonify({'session_id': manifest['session_id']})
+
+
+class AjaxAsi676mcCalibrationUploadView(BaseView):
+    """Accept one file from a browser multi-selection.
+
+    The page calls this endpoint sequentially for every selected file.  Users
+    still select the complete collection in one action, while each HTTP request
+    remains small enough to retry and report accurately.
+    """
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Store one validated FITS in an owned staging session."""
+        try:
+            entry, manifest = asi676mc_calibration.store_upload(
+                session_id,
+                _calibration_owner(),
+                request.files.get('file'),
+            )
+        except asi676mc_calibration.CalibrationUploadError as error:
+            # Upload validation errors describe a file/count/size choice that
+            # the user can correct, so keep the useful detail while making
+            # it read as a complete UI sentence.
+            error_message = str(error)
+            error_message = error_message[:1].upper() + error_message[1:]
+            if not error_message.endswith(('.', '!', '?')):
+                error_message += '.'
+            return jsonify({'error': error_message}), 400
+        except asi676mc_calibration.CalibrationSessionError as error:
+            app.logger.info(
+                'ASI676MC calibration upload session is unavailable: %s',
+                error,
+            )
+            return jsonify({
+                'error': (
+                    'This upload session is no longer available. Select the '
+                    'FITS collection and start the upload again.'
+                ),
+            }), 400
+        except OSError:
+            app.logger.exception('Unable to store uploaded calibration FITS')
+            return jsonify({
+                'error': (
+                    'The uploaded FITS could not be saved temporarily. Free '
+                    'some disk space, cancel this upload, and try again.'
+                ),
+            }), 500
+
+        return jsonify({
+            'file': entry,
+            'file_count': len(manifest['files']),
+            'total_bytes': manifest['total_bytes'],
+        })
+
+
+class AjaxAsi676mcCalibrationDatabaseView(BaseView):
+    """Queue one background search across the complete retained FITS archive."""
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self):
+        """Validate the request and queue cancellable database discovery."""
+        request_data = request.get_json(silent=True) or {}
+        session_id = str(request_data.get('session_id') or '')
+        owner = _calibration_owner()
+        try:
+            camera_id = int(request_data.get('camera_id'))
+            target_groups = int(request_data.get('target_groups', 20))
+            max_pair_seconds = float(
+                request_data.get('max_pair_seconds', 90.0)
+            )
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': (
+                    'Enter a valid number of frame groups and a valid maximum gap.'
+                ),
+            }), 400
+
+        if (
+            target_groups < asi676mc_calibration.DATABASE_GROUP_MIN
+            or target_groups > asi676mc_calibration.DATABASE_GROUP_MAX
+        ):
+            return jsonify({
+                'error': (
+                    'Choose between {0} and {1} frame groups.'
+                ).format(
+                    asi676mc_calibration.DATABASE_GROUP_MIN,
+                    asi676mc_calibration.DATABASE_GROUP_MAX,
+                ),
+            }), 400
+        if (
+            not math.isfinite(max_pair_seconds)
+            or max_pair_seconds <= 0
+            or max_pair_seconds > 3600
+        ):
+            return jsonify({
+                'error': (
+                    'The maximum gap must be between 1 and 3600 seconds.'
+                ),
+            }), 400
+
+        camera = _supported_asi676mc_camera(camera_id)
+        if camera is None:
+            return jsonify({
+                'error': (
+                    'The selected camera is no longer available. Reload this '
+                    'page, select an available ASI676MC, and start again.'
+                ),
+            }), 404
+
+        try:
+            search_manifest = (
+                asi676mc_calibration.database_search_checkpoint(
+                    session_id,
+                    owner,
+                )
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            return jsonify({'error': str(error)}), 409
+        bound_camera = search_manifest.get('camera') or {}
+        try:
+            bound_camera_id = int(bound_camera.get('id'))
+        except (TypeError, ValueError):
+            bound_camera_id = -1
+        if (
+            bound_camera_id != camera.id
+            or not bound_camera.get('uuid')
+            or not camera.uuid
+            or str(camera.uuid) != str(bound_camera.get('uuid') or '')
+        ):
+            return jsonify({
+                'error': (
+                    'The ASI676MC selected for this saved-FITS search has '
+                    'changed. Cancel this run and start again.'
+                ),
+            }), 409
+
+        try:
+            retention_days = int(
+                self.indi_allsky_config.get('IMAGE_FITS_EXPIRE_DAYS', 10)
+            )
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': (
+                    'FITS retention is invalid. Correct it in Image Settings '
+                    'before searching saved FITS. Manual upload is still available.'
+                ),
+            }), 400
+        if retention_days < 1:
+            return jsonify({
+                'error': (
+                    'FITS retention must be at least 1 day before saved FITS '
+                    'can be searched. Manual upload is still available.'
+                ),
+            }), 400
+
+        # Match the existing expireData policy, which expires by dayDate rather
+        # than by an exact timestamp. This includes the complete oldest day
+        # that indi-allsky itself still considers inside retention.
+        retention_cutoff = (
+            datetime.now() - timedelta(days=retention_days)
+        ).date()
+        # The browser request only binds the full-retention search. Database
+        # enumeration, legacy FITS inspection, population discovery, and final
+        # evidence staging all run in the cancellable background worker.
+        source_details = {
+            'kind': 'database',
+            'selection_mode': 'background_full_retention',
+            'camera_id': camera.id,
+            'camera_uuid': str(camera.uuid),
+            'camera_name': _camera_identity(camera)['name'],
+            'retention_days': retention_days,
+            'retention_cutoff': retention_cutoff.isoformat(),
+            'requested_group_count': target_groups,
+            'initial_scan_file_count': 0,
+            'selected_file_count': 0,
+            'available_file_count': 0,
+            'full_retention_exhaustive': True,
+        }
+        try:
+            settings = asi676mc.normalize_settings(
+                self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {})
+            )
+        except (OverflowError, TypeError, ValueError):
+            return jsonify({
+                'error': (
+                    'The current ASI676MC repair settings are invalid. Restore '
+                    'the defaults or correct the highlighted fields in Image '
+                    'Settings, then try again.'
+                ),
+            }), 400
+
+        task = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.VIDEO,
+            state=TaskQueueState.MANUAL,
+            priority=200,
+            data={
+                'action': 'generateAsi676mcCalibration',
+                'kwargs': {'session_id': session_id},
+            },
+        )
+        db.session.add(task)
+        try:
+            db.session.flush()
+            manifest = asi676mc_calibration.mark_queued(
+                session_id,
+                owner,
+                task.id,
+                max_pair_seconds,
+                settings,
+                config_id=self.indi_allsky_config_id,
+                source_details=source_details,
+            )
+            db.session.commit()
+        except asi676mc_calibration.CalibrationSessionError as error:
+            db.session.rollback()
+            try:
+                asi676mc_calibration.cancel_session(
+                    session_id,
+                    owner,
+                )
+            except (OSError, asi676mc_calibration.CalibrationSessionError):
+                app.logger.exception(
+                    'Unable to clean rejected database calibration session'
+                )
+            return jsonify({'error': str(error)}), 400
+        except (OSError, ValueError, SQLAlchemyError):
+            db.session.rollback()
+            app.logger.exception('Unable to queue database FITS calibration')
+            try:
+                asi676mc_calibration.mark_failed(
+                    session_id,
+                    owner,
+                    'unable to queue the database calibration job',
+                )
+            except (OSError, asi676mc_calibration.CalibrationSessionError):
+                app.logger.exception(
+                    'Unable to mark database calibration session failed'
+                )
+            return jsonify({
+                'error': (
+                    'Calibration could not start because the service is '
+                    'unavailable. Wait a minute and try again. If this repeats, '
+                    'restart indi-allsky.'
+                ),
+            }), 500
+
+        return jsonify({
+            'session_id': session_id,
+            'task_id': task.id,
+            'status': manifest['status'],
+            'discovery': source_details,
+        })
+
+
+class AjaxAsi676mcCalibrationCancelView(BaseView):
+    """Cancel an upload, saved-FITS search, or background calibration."""
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Cancel an owned input session or background calibration."""
+        try:
+            manifest = asi676mc_calibration.cancel_session(
+                session_id,
+                _calibration_owner(),
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            return jsonify({'error': str(error)}), 409
+        except OSError:
+            app.logger.exception('Unable to cancel ASI676MC calibration')
+            return jsonify({
+                'error': (
+                    'Cancellation could not be confirmed. Try again. Any '
+                    'temporary FITS will be removed automatically later.'
+                ),
+            }), 500
+
+        return jsonify({
+            'session_id': session_id,
+            'status': manifest['status'],
+            'sources_deleted_utc': manifest.get('sources_deleted_utc'),
+        })
+
+
+class AjaxAsi676mcCalibrationStartView(BaseView):
+    """Freeze an upload session and enqueue its CPU-heavy calibration job."""
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Freeze a manual upload and enqueue its background analysis."""
+        request_data = request.get_json(silent=True) or {}
+        try:
+            max_pair_seconds = float(request_data.get('max_pair_seconds', 90.0))
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': 'Enter a valid maximum gap between matching frames.',
+            }), 400
+        if (
+            not math.isfinite(max_pair_seconds)
+            or max_pair_seconds <= 0
+            or max_pair_seconds > 3600
+        ):
+            return jsonify({
+                'error': (
+                    'The maximum gap must be between 1 and 3600 seconds.'
+                ),
+            }), 400
+
+        try:
+            _session_dir, upload_manifest = asi676mc_calibration.get_session(
+                session_id,
+                _calibration_owner(),
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            return jsonify({'error': str(error)}), 400
+        bound_camera = upload_manifest.get('camera') or {}
+        current_camera = _supported_asi676mc_camera(bound_camera.get('id'))
+        if (
+            current_camera is None
+            or not bound_camera.get('uuid')
+            or not current_camera.uuid
+            or str(current_camera.uuid) != str(bound_camera.get('uuid') or '')
+        ):
+            return jsonify({
+                'error': (
+                    'The ASI676MC selected for this upload is no longer '
+                    'available. Cancel this run and start again.'
+                ),
+            }), 409
+
+        # Use a snapshot of the currently configured detector thresholds.  The
+        # calibration job derives gains/saturation/highlight values, but it must
+        # classify the uploaded evidence with explicit, auditable thresholds.
+        try:
+            settings = asi676mc.normalize_settings(
+                self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {})
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            app.logger.info(
+                'Current ASI676MC settings cannot start calibration: %s',
+                error,
+            )
+            return jsonify({
+                'error': (
+                    'The current ASI676MC settings are invalid. Restore the '
+                    'defaults or correct the highlighted fields in Image '
+                    'Settings before starting calibration.'
+                ),
+            }), 400
+
+        task = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.VIDEO,
+            state=TaskQueueState.MANUAL,
+            priority=200,  # normal timelapse generation retains priority 100
+            data={
+                'action': 'generateAsi676mcCalibration',
+                'kwargs': {'session_id': session_id},
+            },
+        )
+        db.session.add(task)
+
+        try:
+            # Flush assigns the task ID without exposing the task to the worker
+            # before its upload-session manifest has also been updated.
+            db.session.flush()
+            manifest = asi676mc_calibration.mark_queued(
+                session_id,
+                _calibration_owner(),
+                task.id,
+                max_pair_seconds,
+                settings,
+                config_id=self.indi_allsky_config_id,
+            )
+            db.session.commit()
+        except asi676mc_calibration.CalibrationSessionError as error:
+            db.session.rollback()
+            return jsonify({'error': str(error)}), 400
+        except (OSError, ValueError, SQLAlchemyError):
+            db.session.rollback()
+            app.logger.exception('Unable to queue ASI676MC calibration')
+            try:
+                asi676mc_calibration.mark_failed(
+                    session_id,
+                    _calibration_owner(),
+                    'unable to queue the calibration job',
+                )
+            except (OSError, asi676mc_calibration.CalibrationSessionError):
+                app.logger.exception(
+                    'Unable to mark ASI676MC calibration session failed'
+                )
+            return jsonify({
+                'error': (
+                    'Calibration could not start because the service is '
+                    'unavailable. Wait a minute and try again. If this repeats, '
+                    'restart indi-allsky.'
+                ),
+            }), 500
+
+        return jsonify({
+            'session_id': session_id,
+            'task_id': task.id,
+            'status': manifest['status'],
+        })
+
+
+class AjaxAsi676mcCalibrationStatusView(BaseView):
+    """Return upload/job progress and the compact successful result."""
+
+    methods = ['GET']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Return progress or the compact result for an owned session."""
+        try:
+            status = asi676mc_calibration.get_status(
+                session_id,
+                _calibration_owner(),
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            app.logger.info(
+                'ASI676MC calibration session is unavailable: %s',
+                error,
+            )
+            return jsonify({
+                'error': (
+                    'The previous calibration is no longer available. Start a '
+                    'new calibration.'
+                ),
+            }), 404
+
+        # Compare at poll time rather than storing a second configuration
+        # snapshot in the result.  This keeps the hint accurate when an admin
+        # revisits a retained result after changing settings elsewhere.
+        if (
+            status.get('status') == 'success'
+            and status.get('result')
+            and status['result'].get('outcome', 'calibration') == 'calibration'
+        ):
+            status['configuration_comparison'] = (
+                asi676mc_calibration.compare_result_to_configuration(
+                    status['result'],
+                    self.indi_allsky_config.get('IMAGE_ASI676MC_REPAIR', {}),
+                )
+            )
+        return jsonify(status)
+
+
+class Asi676mcCalibrationReportView(BaseView):
+    """Download the completed text report after rechecking session ownership."""
+
+    methods = ['GET']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Download the human-readable report for an owned result."""
+        try:
+            report_path, download_name = (
+                asi676mc_calibration.get_report_download(
+                    session_id,
+                    _calibration_owner(),
+                )
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            app.logger.info(
+                'ASI676MC calibration report is unavailable: %s',
+                error,
+            )
+            return (
+                'This calibration report is no longer available. Return to '
+                'the calibration tool and run calibration again.',
+                404,
+            )
+
+        return send_file(
+            report_path,
+            mimetype='text/plain',
+            download_name=download_name,
+            as_attachment=True,
+        )
+
+
+class AjaxAsi676mcCalibrationDiscardView(BaseView):
+    """Remove a retained result when the user chooses Reset/Recalibrate."""
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Delete an owned finished result when the user resets."""
+        try:
+            asi676mc_calibration.discard_session(
+                session_id,
+                _calibration_owner(),
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            # Expiry can race a user's Reset click. In that case the requested
+            # end state is already true, so reset the browser without showing
+            # a false failure.
+            if str(error) == (
+                'This calibration run is no longer available. Reload the page '
+                'and start a new calibration.'
+            ):
+                return jsonify({
+                    'session_id': session_id,
+                    'status': 'already_discarded',
+                })
+            app.logger.info(
+                'ASI676MC calibration result cannot be discarded: %s',
+                error,
+            )
+            return jsonify({
+                'error': 'The calibration result is not ready to be cleared.',
+                'error_code': 'discard_rejected',
+            }), 409
+        except OSError:
+            app.logger.exception('Unable to discard ASI676MC calibration result')
+            return jsonify({
+                'error': 'The retained calibration result could not be removed.',
+                'error_code': 'discard_failed',
+            }), 500
+
+        return jsonify({
+            'session_id': session_id,
+            'status': 'discarded',
+        })
+
+
+class AjaxAsi676mcCalibrationApplyView(BaseView):
+    """Apply only the result's safe subset to a version-checked configuration.
+
+    Access and persistence follow the existing Config save policy exactly.
+    Complete results may write seven repair constants; preliminary results may
+    write only detection thresholds explicitly recommended for change.
+    Operational switches are preserved and repair is never enabled implicitly.
+    """
+
+    methods = ['POST']
+    decorators = [asi676mc_calibration_required, login_required]
+
+    def dispatch_request(self, session_id):
+        """Version-check and save only the result's allowed Config subset."""
+        try:
+            manifest, result, values = (
+                asi676mc_calibration.get_completed_result(
+                    session_id,
+                    _calibration_owner(),
+                )
+            )
+        except asi676mc_calibration.CalibrationSessionError as error:
+            app.logger.info(
+                'ASI676MC calibration result cannot be applied: %s',
+                error,
+            )
+            return jsonify({
+                'error': (
+                    'This calibration result is no longer complete or '
+                    'available. Reset the tool and calibrate again.'
+                ),
+                'error_code': 'result_unavailable',
+            }), 400
+
+        result_outcome = result.get('outcome', 'calibration')
+        bound_camera = manifest.get('camera') or {}
+        current_camera = _supported_asi676mc_camera(bound_camera.get('id'))
+        if (
+            current_camera is None
+            or not bound_camera.get('uuid')
+            or not current_camera.uuid
+            or str(current_camera.uuid) != str(bound_camera.get('uuid') or '')
+        ):
+            return jsonify({
+                'error': (
+                    'The ASI676MC selected for this run is no longer the same '
+                    'available camera. Reset the tool and calibrate again.'
+                ),
+                'error_code': 'camera_changed',
+            }), 409
+        request_data = request.get_json(silent=True) or {}
+        if (
+            result_outcome == 'threshold_suggestion'
+            and request_data.get('confirm_higher_population') is not True
+        ):
+            return jsonify({
+                'error': (
+                    'Confirm that the files listed as likely purple are the '
+                    'purple frames you saw before saving detection settings.'
+                ),
+                'error_code': 'population_confirmation_required',
+            }), 400
+        calibration_config_id = manifest.get('config_id')
+        if calibration_config_id != self.indi_allsky_config_id:
+            return jsonify({
+                'error': (
+                    'Image Settings changed after this calibration began, so '
+                    'the result values were not saved. Reset the tool, review '
+                    'the current settings, and calibrate again.'
+                ),
+                'error_code': 'configuration_changed',
+            }), 409
+
+        config_key = 'IMAGE_ASI676MC_REPAIR'
+        original_repair_config = self.indi_allsky_config.get(config_key)
+        repair_config = dict(original_repair_config or {})
+        for key, value in values.items():
+            repair_config[key] = value
+
+        try:
+            # Validate the complete runtime block after merging the measured
+            # subset before changing the in-memory configuration.  This keeps
+            # operational switches (including ENABLE) exactly as the admin
+            # configured them and never turns repair on implicitly.
+            asi676mc.normalize_settings(repair_config)
+            self.indi_allsky_config[config_key] = repair_config
+            if result_outcome == 'threshold_suggestion':
+                note = (
+                    'ASI676MC web threshold discovery {0}: saved {1}; '
+                    'calibration rerun required'
+                ).format(session_id, ', '.join(sorted(values)))
+            else:
+                note = (
+                    'ASI676MC web calibration {0}: {1} matched purple frames, '
+                    '{2} normal references'
+                ).format(
+                    session_id,
+                    result['quality']['matched_bad_count'],
+                    result['quality']['matched_normal_count'],
+                )
+            self._indi_allsky_config_obj.save(_calibration_save_actor(), note)
+        except (ConfigSaveException, KeyError, TypeError, ValueError) as error:
+            # The configuration object is shared by this request. Restore it
+            # when validation or persistence fails so a failed request cannot
+            # leave an unsaved partial update behind.
+            if original_repair_config is None:
+                self.indi_allsky_config.pop(config_key, None)
+            else:
+                self.indi_allsky_config[config_key] = original_repair_config
+            if isinstance(error, ConfigSaveException):
+                app.logger.error(
+                    'Unable to save ASI676MC calibration values: %s',
+                    error,
+                )
+                error_message = (
+                    'Image Settings could not save the result values. Try again.'
+                )
+                error_code = 'configuration_save_failed'
+            else:
+                error_message = (
+                    'The result values are incompatible with the current '
+                    'ASI676MC repair settings. Review Image Settings and '
+                    'calibrate again.'
+                )
+                error_code = 'incompatible_settings'
+            return jsonify({
+                'error': error_message,
+                'error_code': error_code,
+            }), 400
+
+        self._miscDb.setState('STATUS', constants.STATUS_RELOADING)
+        task_reload = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.MAIN,
+            state=TaskQueueState.MANUAL,
+            priority=100,
+            data={'action': 'reload'},
+        )
+        db.session.add(task_reload)
+        try:
+            db.session.commit()
+            reload_queued = True
+        except SQLAlchemyError:
+            db.session.rollback()
+            app.logger.exception(
+                'Calibration values saved but configuration reload could not be queued'
+            )
+            reload_queued = False
+
+        return jsonify({
+            'success-message': (
+                (
+                    'The recommended detection settings were saved. Repair '
+                    'values and all other settings remain unchanged. '
+                    'indi-allsky will reload shortly.'
+                    if result_outcome == 'threshold_suggestion'
+                    else (
+                        'The calibration values were saved. All other settings '
+                        'remain unchanged. indi-allsky will reload shortly.'
+                    )
+                )
+                if reload_queued
+                else (
+                    (
+                        'The recommended detection settings were saved and '
+                        'all other settings remain unchanged, but the '
+                        'configuration reload could not be started.'
+                        if result_outcome == 'threshold_suggestion'
+                        else (
+                            'The calibration values were saved and all other '
+                            'settings remain unchanged, but the configuration '
+                            'reload could not be started.'
+                        )
+                    )
+                    + ' In Image Settings, enable Reload on Save and save the '
+                    'configuration, or restart the service before relying on '
+                    'the new values.'
+                )
+            ),
+            'reload_queued': reload_queued,
+            'values': values,
+        })
+
+
+class ImageProcessingView(TemplateView):
+    page_title = 'Image Processing'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(ImageProcessingView, self).get_context()
+
+        fits_id = int(request.args.get('id', 0))
+        frame_type = str(request.args.get('type', 'light'))
+
+
+        if frame_type == 'dark':
+            # always have to request a specific dark ID
+            pass
+        elif frame_type == 'bpm':
+            # always have to request a specific bpm ID
+            pass
+        else:
+            # assume light frame
+            if not fits_id:
+                # just pick the last fits file is none specified
+                fits_entry = IndiAllSkyDbFitsImageTable.query\
+                    .join(IndiAllSkyDbFitsImageTable.camera)\
+                    .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                    .order_by(IndiAllSkyDbFitsImageTable.createDate.desc())\
+                    .first()
+
+                if fits_entry:
+                    fits_id = fits_entry.id
+                else:
+                    fits_id = 0  # will not exist
+
+
+        form_data = {
+            'CAMERA_ID'                      : self.camera.id,
+            'FRAME_TYPE'                     : frame_type,
+            'FITS_ID'                        : fits_id,
+            'LENS_IMAGE_CIRCLE'              : self.indi_allsky_config.get('LENS_IMAGE_CIRCLE', 3000),
+            'LENS_OFFSET_X'                  : self.indi_allsky_config.get('LENS_OFFSET_X', 0),
+            'LENS_OFFSET_Y'                  : self.indi_allsky_config.get('LENS_OFFSET_Y', 0),
+            'LENS_AZIMUTH'                   : self.indi_allsky_config.get('LENS_AZIMUTH', 0.0),
+            'CCD_BIT_DEPTH'                  : str(self.indi_allsky_config.get('CCD_BIT_DEPTH', 0)),  # string in form, int in config
+            'NIGHT_CONTRAST_ENHANCE'         : self.indi_allsky_config.get('NIGHT_CONTRAST_ENHANCE', False),
+            'CONTRAST_ENHANCE_16BIT'         : self.indi_allsky_config.get('CONTRAST_ENHANCE_16BIT', False),
+            'CLAHE_CLIPLIMIT'                : self.indi_allsky_config.get('CLAHE_CLIPLIMIT', 3.0),
+            'CLAHE_GRIDSIZE'                 : self.indi_allsky_config.get('CLAHE_GRIDSIZE', 8),
+            'IMAGE_STRETCH__CLASSNAME'       : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('CLASSNAME', ''),
+            'IMAGE_STRETCH__MODE1_GAMMA'     : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE1_GAMMA', 3.0),
+            'IMAGE_STRETCH__MODE1_STDDEVS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE1_STDDEVS', 2.25),
+            'IMAGE_STRETCH__MODE2_SHADOWS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_SHADOWS', 0.0),
+            'IMAGE_STRETCH__MODE2_MIDTONES'  : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_MIDTONES', 0.35),
+            'IMAGE_STRETCH__MODE2_HIGHLIGHTS': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE2_HIGHLIGHTS', 1.0),
+            'IMAGE_STRETCH__MODE3_BLACK_CLIP': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_BLACK_CLIP', -2.8),
+            'IMAGE_STRETCH__MODE3_SHADOWS'   : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_SHADOWS', 0.0),
+            'IMAGE_STRETCH__MODE3_MIDTONES'  : self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_MIDTONES', 0.25),
+            'IMAGE_STRETCH__MODE3_HIGHLIGHTS': self.indi_allsky_config.get('IMAGE_STRETCH', {}).get('MODE3_HIGHLIGHTS', 1.0),
+            'CFA_PATTERN'                    : self.indi_allsky_config.get('CFA_PATTERN', ''),
+            'SCNR_ALGORITHM'                 : self.indi_allsky_config.get('SCNR_ALGORITHM', ''),
+            'SCNR_MTF_MIDTONES'              : self.indi_allsky_config.get('SCNR_MTF_MIDTONES', 0.65),
+            'IMAGE_DENOISE'                  : self.indi_allsky_config.get('IMAGE_DENOISE', ''),
+            'IMAGE_DENOISE_STRENGTH'         : self.indi_allsky_config.get('IMAGE_DENOISE_STRENGTH', 3),
+            'BILATERAL_SIGMA_COLOR'          : self.indi_allsky_config.get('BILATERAL_SIGMA_COLOR', 20),
+            'BILATERAL_SIGMA_SPACE'          : self.indi_allsky_config.get('BILATERAL_SIGMA_SPACE', 35),
+            'WBR_FACTOR'                     : self.indi_allsky_config.get('WBR_FACTOR', 1.0),
+            'WBG_FACTOR'                     : self.indi_allsky_config.get('WBG_FACTOR', 1.0),
+            'WBB_FACTOR'                     : self.indi_allsky_config.get('WBB_FACTOR', 1.0),
+            'AUTO_WB'                        : self.indi_allsky_config.get('AUTO_WB', False),
+            'WBR_MTF_MIDTONES'               : self.indi_allsky_config.get('WBR_MTF_MIDTONES', 0.5),
+            'WBG_MTF_MIDTONES'               : self.indi_allsky_config.get('WBG_MTF_MIDTONES', 0.5),
+            'WBB_MTF_MIDTONES'               : self.indi_allsky_config.get('WBB_MTF_MIDTONES', 0.5),
+            'SATURATION_FACTOR'              : self.indi_allsky_config.get('SATURATION_FACTOR', 1.0),
+            'GAMMA_CORRECTION'               : self.indi_allsky_config.get('GAMMA_CORRECTION', 1.0),
+            'SHARPEN_AMOUNT'                 : self.indi_allsky_config.get('SHARPEN_AMOUNT', 0.0),
+            'IMAGE_ROTATE'                   : self.indi_allsky_config.get('IMAGE_ROTATE', ''),
+            'IMAGE_ROTATE_ANGLE'             : self.indi_allsky_config.get('IMAGE_ROTATE_ANGLE', 0),
+            'IMAGE_ROTATE_KEEP_SIZE'         : self.indi_allsky_config.get('IMAGE_ROTATE_KEEP_SIZE', False),
+            'IMAGE_FLIP_V'                   : self.indi_allsky_config.get('IMAGE_FLIP_V', True),
+            'IMAGE_FLIP_H'                   : self.indi_allsky_config.get('IMAGE_FLIP_H', True),
+            'IMAGE_COLORMAP'                 : '',
+            'DETECT_MASK'                    : self.indi_allsky_config.get('DETECT_MASK', ''),
+            'SQM_FOV_DIV'                    : str(self.indi_allsky_config.get('SQM_FOV_DIV', 4)),  # string in form, int in config
+            'IMAGE_STACK_METHOD'             : self.indi_allsky_config.get('IMAGE_STACK_METHOD', 'maximum'),
+            'IMAGE_STACK_COUNT'              : str(self.indi_allsky_config.get('IMAGE_STACK_COUNT', 1)),  # string in form, int in config
+            'IMAGE_STACK_ALIGN'              : self.indi_allsky_config.get('IMAGE_STACK_ALIGN', False),
+            'IMAGE_ALIGN_DETECTSIGMA'        : self.indi_allsky_config.get('IMAGE_ALIGN_DETECTSIGMA', 5),
+            'IMAGE_ALIGN_POINTS'             : self.indi_allsky_config.get('IMAGE_ALIGN_POINTS', 50),
+            'IMAGE_ALIGN_SOURCEMINAREA'      : self.indi_allsky_config.get('IMAGE_ALIGN_SOURCEMINAREA', 10),
+            'FISH2PANO__ENABLE'              : False,
+            'FISH2PANO__DIAMETER'            : self.indi_allsky_config.get('FISH2PANO', {}).get('DIAMETER', 3000),
+            'FISH2PANO__ROTATE_ANGLE'        : self.indi_allsky_config.get('FISH2PANO', {}).get('ROTATE_ANGLE', 0),
+            'FISH2PANO__SCALE'               : self.indi_allsky_config.get('FISH2PANO', {}).get('SCALE', 0.3),
+            'FISH2PANO__FLIP_H'              : self.indi_allsky_config.get('FISH2PANO', {}).get('FLIP_H', False),
+            'FISH2PANO__ENABLE_CARDINAL_DIRS': self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE_CARDINAL_DIRS', True),
+            'FISH2PANO__DIRS_OFFSET_BOTTOM'  : self.indi_allsky_config.get('FISH2PANO', {}).get('DIRS_OFFSET_BOTTOM', 25),
+            'FISH2PANO__OPENCV_FONT_SCALE'   : self.indi_allsky_config.get('FISH2PANO', {}).get('OPENCV_FONT_SCALE', 0.8),
+            'FISH2PANO__PIL_FONT_SIZE'       : self.indi_allsky_config.get('FISH2PANO', {}).get('PIL_FONT_SIZE', 30),
+            'PROCESSING_SPLIT_SCREEN'        : False,
+            'IMAGE_CALIBRATE_DARK'           : False,  # darks are almost always already applied
+            'IMAGE_CALIBRATE_BPM'            : False,
+            'IMAGE_CALIBRATE_FIX_HOLES'      : self.indi_allsky_config.get('IMAGE_CALIBRATE_FIX_HOLES', False),
+            'IMAGE_CALIBRATE_HOLE_THOLD'     : self.indi_allsky_config.get('IMAGE_CALIBRATE_HOLE_THOLD', 30),
+            'IMAGE_CALIBRATE_MANUAL_OFFSET'  : self.indi_allsky_config.get('IMAGE_CALIBRATE_MANUAL_OFFSET', 0),
+            'IMAGE_LABEL_TEMPLATE'           : self.indi_allsky_config.get('IMAGE_LABEL_TEMPLATE', ''),
+            'IMAGE_EXTRA_TEXT'               : self.indi_allsky_config.get('IMAGE_EXTRA_TEXT'),
+            'IMAGE_LABEL_SYSTEM'             : '',
+            'TEXT_PROPERTIES__FONT_FACE'     : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_FACE', 'FONT_HERSHEY_SIMPLEX'),
+            'TEXT_PROPERTIES__FONT_SCALE'    : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_SCALE', 0.8),
+            'TEXT_PROPERTIES__FONT_THICKNESS': self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_THICKNESS', 1),
+            'TEXT_PROPERTIES__FONT_OUTLINE'  : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_OUTLINE', True),
+            'TEXT_PROPERTIES__FONT_HEIGHT'   : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_HEIGHT', 30),
+            'TEXT_PROPERTIES__FONT_X'        : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_X', 15),
+            'TEXT_PROPERTIES__FONT_Y'        : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_Y', 30),
+            'TEXT_PROPERTIES__PIL_FONT_FILE' : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_FILE', 'fonts-freefont-ttf/FreeSans.ttf'),
+            'TEXT_PROPERTIES__PIL_FONT_CUSTOM': self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_CUSTOM', ''),
+            'TEXT_PROPERTIES__PIL_FONT_SIZE' : self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('PIL_FONT_SIZE', 30),
+            'CARDINAL_DIRS__ENABLE'          : False,
+            'CARDINAL_DIRS__SWAP_NS'         : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('SWAP_NS', False),
+            'CARDINAL_DIRS__SWAP_EW'         : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('SWAP_EW', False),
+            'CARDINAL_DIRS__CHAR_NORTH'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_NORTH', 'N'),
+            'CARDINAL_DIRS__CHAR_EAST'       : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_EAST', 'E'),
+            'CARDINAL_DIRS__CHAR_WEST'       : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_WEST', 'W'),
+            'CARDINAL_DIRS__CHAR_SOUTH'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('CHAR_SOUTH', 'S'),
+            'CARDINAL_DIRS__DIAMETER'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('DIAMETER', 3000),
+            'CARDINAL_DIRS__OFFSET_X'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_X', 0),
+            'CARDINAL_DIRS__OFFSET_Y'        : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_Y', 0),
+            'CARDINAL_DIRS__OFFSET_TOP'      : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_TOP', 15),
+            'CARDINAL_DIRS__OFFSET_LEFT'     : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_LEFT', 15),
+            'CARDINAL_DIRS__OFFSET_RIGHT'    : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_RIGHT', 15),
+            'CARDINAL_DIRS__OFFSET_BOTTOM'   : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OFFSET_BOTTOM', 15),
+            'CARDINAL_DIRS__OPENCV_FONT_SCALE' : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OPENCV_FONT_SCALE', 0.5),
+            'CARDINAL_DIRS__PIL_FONT_SIZE'   : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('PIL_FONT_SIZE', 20),
+            'CARDINAL_DIRS__OUTLINE_CIRCLE'  : self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('OUTLINE_CIRCLE', False),
+            'IMAGE_CIRCLE_MASK__ENABLE'      : False,
+            'IMAGE_CIRCLE_MASK__DIAMETER'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('DIAMETER', 3000),
+            'IMAGE_CIRCLE_MASK__OFFSET_X'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OFFSET_X', 0),
+            'IMAGE_CIRCLE_MASK__OFFSET_Y'    : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OFFSET_Y', 0),
+            'IMAGE_CIRCLE_MASK__BLUR'        : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('BLUR', 35),
+            'IMAGE_CIRCLE_MASK__OPACITY'     : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OPACITY', 100),
+            'IMAGE_CIRCLE_MASK__OUTLINE'     : self.indi_allsky_config.get('IMAGE_CIRCLE_MASK', {}).get('OUTLINE', False),
+            'IMAGE_CROP_IMAGE_CIRCLE'        : self.indi_allsky_config.get('IMAGE_CROP_IMAGE_CIRCLE', False),
+            'MOON_OVERLAY__ENABLE'           : False,
+            'MOON_OVERLAY__X'                : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('X', -500),
+            'MOON_OVERLAY__Y'                : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('Y', -200),
+            'MOON_OVERLAY__SCALE'            : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('SCALE', 0.5),
+            'MOON_OVERLAY__DARK_SIDE_SCALE'  : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('DARK_SIDE_SCALE', 0.4),
+            'MOON_OVERLAY__FLIP_V'           : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('FLIP_V', False),
+            'MOON_OVERLAY__FLIP_H'           : self.indi_allsky_config.get('MOON_OVERLAY', {}).get('FLIP_H', False),
+            'LIGHTGRAPH_OVERLAY__ENABLE'     : False,
+            'LIGHTGRAPH_OVERLAY__GRAPH_HEIGHT' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('GRAPH_HEIGHT', 30),
+            'LIGHTGRAPH_OVERLAY__GRAPH_BORDER' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('GRAPH_BORDER', 3),
+            'LIGHTGRAPH_OVERLAY__Y'          : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('Y', 10),
+            'LIGHTGRAPH_OVERLAY__OFFSET_X'   : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OFFSET_X', 0),
+            'LIGHTGRAPH_OVERLAY__SCALE'      : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('SCALE', 1.0),
+            'LIGHTGRAPH_OVERLAY__NOW_MARKER_SIZE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NOW_MARKER_SIZE', 8),
+            'LIGHTGRAPH_OVERLAY__OPACITY'    : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OPACITY', 100),
+            'LIGHTGRAPH_OVERLAY__PIL_FONT_SIZE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('PIL_FONT_SIZE', 20),
+            'LIGHTGRAPH_OVERLAY__OPENCV_FONT_SCALE' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('OPENCV_FONT_SCALE', 0.5),
+            'LIGHTGRAPH_OVERLAY__LABEL'      : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('LABEL', True),
+            'LIGHTGRAPH_OVERLAY__HOUR_LINES' : self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('HOUR_LINES', True),
+            'IMAGE_BORDER__TOP'              : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('TOP', 0),
+            'IMAGE_BORDER__LEFT'             : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('LEFT', 0),
+            'IMAGE_BORDER__RIGHT'            : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('RIGHT', 0),
+            'IMAGE_BORDER__BOTTOM'           : self.indi_allsky_config.get('IMAGE_BORDER', {}).get('BOTTOM', 0),
+            'RUN_DETECTION'                  : False,
+            'DETECT_STARS_METHOD'            : self.indi_allsky_config.get('DETECT_STARS_METHOD', 'template'),
+            'DETECT_STARS_THOLD'             : self.indi_allsky_config.get('DETECT_STARS_THOLD', 0.6),
+            'DETECT_STARS_SEP_THOLD'         : self.indi_allsky_config.get('DETECT_STARS_SEP_THOLD', 5.0),
+            'DETECT_STARS_SEP_MAX_RADIUS'    : self.indi_allsky_config.get('DETECT_STARS_SEP_MAX_RADIUS', 20),
+            'DETECT_METEORS_THOLD'           : self.indi_allsky_config.get('DETECT_METEORS_THOLD', 125),
+        }
+
+
+        # SQM_ROI
+        SQM_ROI = self.indi_allsky_config.get('SQM_ROI', [])
+        if SQM_ROI is None:
+            SQM_ROI = []
+        elif isinstance(SQM_ROI, bool):
+            SQM_ROI = []
+
+        try:
+            form_data['SQM_ROI_X1'] = SQM_ROI[0]
+        except IndexError:
+            form_data['SQM_ROI_X1'] = 0
+
+        try:
+            form_data['SQM_ROI_Y1'] = SQM_ROI[1]
+        except IndexError:
+            form_data['SQM_ROI_Y1'] = 0
+
+        try:
+            form_data['SQM_ROI_X2'] = SQM_ROI[2]
+        except IndexError:
+            form_data['SQM_ROI_X2'] = 0
+
+        try:
+            form_data['SQM_ROI_Y2'] = SQM_ROI[3]
+        except IndexError:
+            form_data['SQM_ROI_Y2'] = 0
+
+
+        # Font color
+        text_properties__font_color = self.indi_allsky_config.get('TEXT_PROPERTIES', {}).get('FONT_COLOR', [200, 200, 200])
+        form_data['TEXT_PROPERTIES__FONT_COLOR'] = ','.join([str(x) for x in text_properties__font_color])
+
+        # Cardinal directions color
+        cardinal_dirs__font_color = self.indi_allsky_config.get('CARDINAL_DIRS', {}).get('FONT_COLOR', [200, 0, 0])
+        form_data['CARDINAL_DIRS__FONT_COLOR'] = ','.join([str(x) for x in cardinal_dirs__font_color])
+
+        # Border color
+        image_border__color = self.indi_allsky_config.get('IMAGE_BORDER', {}).get('COLOR', [0, 0, 0])
+        form_data['IMAGE_BORDER__COLOR'] = ','.join([str(x) for x in image_border__color])
+
+        # Lightgraph colors
+        lightgraph_overlay__day_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('DAY_COLOR', [150, 150, 150])
+        form_data['LIGHTGRAPH_OVERLAY__DAY_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__day_color])
+
+        lightgraph_overlay__dusk_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('DUSK_COLOR', [200, 100, 60])
+        form_data['LIGHTGRAPH_OVERLAY__DUSK_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__dusk_color])
+
+        lightgraph_overlay__night_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NIGHT_COLOR', [30, 30, 30])
+        form_data['LIGHTGRAPH_OVERLAY__NIGHT_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__night_color])
+
+        lightgraph_overlay__moonmode_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('MOONMODE_COLOR', [50, 50, 50])
+        form_data['LIGHTGRAPH_OVERLAY__MOONMODE_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__moonmode_color])
+
+        lightgraph_overlay__hour_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('HOUR_COLOR', [100, 15, 15])
+        form_data['LIGHTGRAPH_OVERLAY__HOUR_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__hour_color])
+
+        lightgraph_overlay__border_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('BORDER_COLOR', [1, 1, 1])
+        form_data['LIGHTGRAPH_OVERLAY__BORDER_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__border_color])
+
+        lightgraph_overlay__now_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('NOW_COLOR', [120, 120, 200])
+        form_data['LIGHTGRAPH_OVERLAY__NOW_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__now_color])
+
+        lightgraph_overlay__font_color = self.indi_allsky_config.get('LIGHTGRAPH_OVERLAY', {}).get('FONT_COLOR', [150, 150, 150])
+        form_data['LIGHTGRAPH_OVERLAY__FONT_COLOR'] = ','.join([str(x) for x in lightgraph_overlay__font_color])
+
+
+        context['form_image_processing'] = IndiAllskyImageProcessingForm(data=form_data)
+
+        return context
+
+
+class JsonImageProcessingView(JsonView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(JsonImageProcessingView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        import ctypes
+        import cv2
+        from astropy.io import fits
+        #from PIL import Image
+        from multiprocessing import Array
+
+
+        form_processing = IndiAllskyImageProcessingForm(data=request.json)
+        if not form_processing.validate():
+            form_errors = form_processing.errors  # this must be a property
+            form_errors['form_global'] = ['Please fix the errors above']
+            return jsonify(form_errors), 400
+
+
+        disable_processing                  = bool(request.json['DISABLE_PROCESSING'])
+        output_image_type                   = str(request.json['OUTPUT_IMAGE_TYPE'])
+        camera_id                           = int(request.json['CAMERA_ID'])
+        frame_type                          = str(request.json['FRAME_TYPE'])
+        fits_id                             = int(request.json['FITS_ID'])
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        if frame_type == 'dark':
+            table = IndiAllSkyDbDarkFrameTable
+        elif frame_type == 'bpm':
+            table = IndiAllSkyDbBadPixelMapTable
+        else:
+            table = IndiAllSkyDbFitsImageTable
+
+
+        try:
+            fits_entry = table.query\
+                .join(table.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbCameraTable.id == camera_id,
+                        table.id == fits_id,
+                    )
+                )\
+                .one()
+        except NoResultFound:
+            json_data = {
+                'image_b64' : None,
+                'processing_elapsed_s' : 0.0,
+                'message' : 'No FITS images found',
+            }
+            return jsonify(json_data)
+
+
+
+        filename_p = Path(fits_entry.getFilesystemPath())
+
+
+        p_config = self.indi_allsky_config.copy()
+
+        p_config['LENS_IMAGE_CIRCLE']                    = int(request.json['LENS_IMAGE_CIRCLE'])
+        p_config['LENS_OFFSET_X']                        = int(request.json['LENS_OFFSET_X'])
+        p_config['LENS_OFFSET_Y']                        = int(request.json['LENS_OFFSET_Y'])
+        p_config['LENS_AZIMUTH']                         = float(request.json['LENS_AZIMUTH'])
+        p_config['CCD_BIT_DEPTH']                        = int(request.json['CCD_BIT_DEPTH'])
+        p_config['IMAGE_CALIBRATE_DARK']                 = bool(request.json['IMAGE_CALIBRATE_DARK'])
+        p_config['IMAGE_CALIBRATE_BPM']                  = bool(request.json['IMAGE_CALIBRATE_BPM'])
+        p_config['IMAGE_CALIBRATE_FIX_HOLES']            = bool(request.json['IMAGE_CALIBRATE_FIX_HOLES'])
+        p_config['IMAGE_CALIBRATE_HOLE_THOLD']           = int(request.json['IMAGE_CALIBRATE_HOLE_THOLD'])
+        p_config['IMAGE_CALIBRATE_MANUAL_OFFSET']        = int(request.json['IMAGE_CALIBRATE_MANUAL_OFFSET'])
+        p_config['NIGHT_CONTRAST_ENHANCE']               = bool(request.json['NIGHT_CONTRAST_ENHANCE'])
+        p_config['IMAGE_COLORMAP']                       = str(request.json['IMAGE_COLORMAP'])
+        p_config['CONTRAST_ENHANCE_16BIT']               = bool(request.json['CONTRAST_ENHANCE_16BIT'])
+        p_config['CLAHE_CLIPLIMIT']                      = float(request.json['CLAHE_CLIPLIMIT'])
+        p_config['CLAHE_GRIDSIZE']                       = int(request.json['CLAHE_GRIDSIZE'])
+        p_config['IMAGE_STRETCH']['CLASSNAME']           = str(request.json['IMAGE_STRETCH__CLASSNAME'])
+        p_config['IMAGE_STRETCH']['MODE1_GAMMA']         = float(request.json['IMAGE_STRETCH__MODE1_GAMMA'])
+        p_config['IMAGE_STRETCH']['MODE1_STDDEVS']       = float(request.json['IMAGE_STRETCH__MODE1_STDDEVS'])
+        p_config['IMAGE_STRETCH']['MODE2_SHADOWS']       = float(request.json['IMAGE_STRETCH__MODE2_SHADOWS'])
+        p_config['IMAGE_STRETCH']['MODE2_MIDTONES']      = float(request.json['IMAGE_STRETCH__MODE2_MIDTONES'])
+        p_config['IMAGE_STRETCH']['MODE2_HIGHLIGHTS']    = float(request.json['IMAGE_STRETCH__MODE2_HIGHLIGHTS'])
+        p_config['IMAGE_STRETCH']['MODE3_BLACK_CLIP']    = float(request.json['IMAGE_STRETCH__MODE3_BLACK_CLIP'])
+        p_config['IMAGE_STRETCH']['MODE3_SHADOWS']       = float(request.json['IMAGE_STRETCH__MODE3_SHADOWS'])
+        p_config['IMAGE_STRETCH']['MODE3_MIDTONES']      = float(request.json['IMAGE_STRETCH__MODE3_MIDTONES'])
+        p_config['IMAGE_STRETCH']['MODE3_HIGHLIGHTS']    = float(request.json['IMAGE_STRETCH__MODE3_HIGHLIGHTS'])
+        p_config['IMAGE_STRETCH']['SPLIT']               = False
+        p_config['CFA_PATTERN']                          = str(request.json['CFA_PATTERN'])
+        p_config['SCNR_ALGORITHM']                       = str(request.json['SCNR_ALGORITHM'])
+        p_config['SCNR_MTF_MIDTONES']                    = float(request.json['SCNR_MTF_MIDTONES'])
+        p_config['IMAGE_DENOISE']                        = str(request.json['IMAGE_DENOISE'])
+        p_config['IMAGE_DENOISE_STRENGTH']               = int(request.json['IMAGE_DENOISE_STRENGTH'])
+        p_config['BILATERAL_SIGMA_COLOR']                = int(request.json['BILATERAL_SIGMA_COLOR'])
+        p_config['BILATERAL_SIGMA_SPACE']                = int(request.json['BILATERAL_SIGMA_SPACE'])
+        p_config['WBR_FACTOR']                           = float(request.json['WBR_FACTOR'])
+        p_config['WBG_FACTOR']                           = float(request.json['WBG_FACTOR'])
+        p_config['WBB_FACTOR']                           = float(request.json['WBB_FACTOR'])
+        p_config['WBR_MTF_MIDTONES']                     = float(request.json['WBR_MTF_MIDTONES'])
+        p_config['WBG_MTF_MIDTONES']                     = float(request.json['WBG_MTF_MIDTONES'])
+        p_config['WBB_MTF_MIDTONES']                     = float(request.json['WBB_MTF_MIDTONES'])
+        p_config['AUTO_WB']                              = bool(request.json['AUTO_WB'])
+        p_config['SATURATION_FACTOR']                    = float(request.json['SATURATION_FACTOR'])
+        p_config['GAMMA_CORRECTION']                     = float(request.json['GAMMA_CORRECTION'])
+        p_config['SHARPEN_AMOUNT']                       = float(request.json['SHARPEN_AMOUNT'])
+        p_config['IMAGE_ROTATE']                         = str(request.json['IMAGE_ROTATE'])
+        p_config['IMAGE_ROTATE_ANGLE']                   = int(request.json['IMAGE_ROTATE_ANGLE'])
+        p_config['IMAGE_ROTATE_KEEP_SIZE']               = bool(request.json['IMAGE_ROTATE_KEEP_SIZE'])
+        p_config['IMAGE_FLIP_V']                         = bool(request.json['IMAGE_FLIP_V'])
+        p_config['IMAGE_FLIP_H']                         = bool(request.json['IMAGE_FLIP_H'])
+        p_config['DETECT_MASK']                          = str(request.json['DETECT_MASK'])
+        p_config['SQM_FOV_DIV']                          = int(request.json['SQM_FOV_DIV'])
+        p_config['IMAGE_STACK_METHOD']                   = str(request.json['IMAGE_STACK_METHOD'])
+        p_config['IMAGE_STACK_COUNT']                    = int(request.json['IMAGE_STACK_COUNT'])
+        p_config['IMAGE_STACK_ALIGN']                    = bool(request.json['IMAGE_STACK_ALIGN'])
+        p_config['IMAGE_ALIGN_DETECTSIGMA']              = int(request.json['IMAGE_ALIGN_DETECTSIGMA'])
+        p_config['IMAGE_ALIGN_POINTS']                   = int(request.json['IMAGE_ALIGN_POINTS'])
+        p_config['IMAGE_ALIGN_SOURCEMINAREA']            = int(request.json['IMAGE_ALIGN_SOURCEMINAREA'])
+        p_config['IMAGE_STACK_SPLIT']                    = False
+        p_config['FISH2PANO']['ENABLE']                  = bool(request.json['FISH2PANO__ENABLE'])
+        p_config['FISH2PANO']['DIAMETER']                = int(request.json['FISH2PANO__DIAMETER'])
+        p_config['FISH2PANO']['ROTATE_ANGLE']            = int(request.json['FISH2PANO__ROTATE_ANGLE'])
+        p_config['FISH2PANO']['SCALE']                   = float(request.json['FISH2PANO__SCALE'])
+        p_config['FISH2PANO']['FLIP_H']                  = bool(request.json['FISH2PANO__FLIP_H'])
+        p_config['FISH2PANO']['ENABLE_CARDINAL_DIRS']    = bool(request.json['FISH2PANO__ENABLE_CARDINAL_DIRS'])
+        p_config['FISH2PANO']['DIRS_OFFSET_BOTTOM']      = int(request.json['FISH2PANO__DIRS_OFFSET_BOTTOM'])
+        p_config['FISH2PANO']['OPENCV_FONT_SCALE']       = float(request.json['FISH2PANO__OPENCV_FONT_SCALE'])
+        p_config['FISH2PANO']['PIL_FONT_SIZE']           = int(request.json['FISH2PANO__PIL_FONT_SIZE'])
+        p_config['PROCESSING_SPLIT_SCREEN']              = bool(request.json.get('PROCESSING_SPLIT_SCREEN', False))
+        p_config['IMAGE_LABEL_TEMPLATE']                 = str(request.json['IMAGE_LABEL_TEMPLATE'])
+        p_config['IMAGE_EXTRA_TEXT']                     = str(request.json['IMAGE_EXTRA_TEXT'])
+        p_config['IMAGE_LABEL_SYSTEM']                   = str(request.json['IMAGE_LABEL_SYSTEM'])
+        p_config['TEXT_PROPERTIES']['FONT_FACE']         = str(request.json['TEXT_PROPERTIES__FONT_FACE'])
+        p_config['TEXT_PROPERTIES']['FONT_SCALE']        = float(request.json['TEXT_PROPERTIES__FONT_SCALE'])
+        p_config['TEXT_PROPERTIES']['FONT_THICKNESS']    = int(request.json['TEXT_PROPERTIES__FONT_THICKNESS'])
+        p_config['TEXT_PROPERTIES']['FONT_OUTLINE']      = bool(request.json['TEXT_PROPERTIES__FONT_OUTLINE'])
+        p_config['TEXT_PROPERTIES']['FONT_HEIGHT']       = int(request.json['TEXT_PROPERTIES__FONT_HEIGHT'])
+        p_config['TEXT_PROPERTIES']['FONT_X']            = int(request.json['TEXT_PROPERTIES__FONT_X'])
+        p_config['TEXT_PROPERTIES']['FONT_Y']            = int(request.json['TEXT_PROPERTIES__FONT_Y'])
+        p_config['TEXT_PROPERTIES']['PIL_FONT_FILE']     = str(request.json['TEXT_PROPERTIES__PIL_FONT_FILE'])
+        p_config['TEXT_PROPERTIES']['PIL_FONT_CUSTOM']   = str(request.json['TEXT_PROPERTIES__PIL_FONT_CUSTOM'])
+        p_config['TEXT_PROPERTIES']['PIL_FONT_SIZE']     = int(request.json['TEXT_PROPERTIES__PIL_FONT_SIZE'])
+        p_config['CARDINAL_DIRS']['ENABLE']              = bool(request.json['CARDINAL_DIRS__ENABLE'])
+        p_config['CARDINAL_DIRS']['SWAP_NS']             = bool(request.json['CARDINAL_DIRS__SWAP_NS'])
+        p_config['CARDINAL_DIRS']['SWAP_EW']             = bool(request.json['CARDINAL_DIRS__SWAP_EW'])
+        p_config['CARDINAL_DIRS']['CHAR_NORTH']          = str(request.json['CARDINAL_DIRS__CHAR_NORTH'])
+        p_config['CARDINAL_DIRS']['CHAR_EAST']           = str(request.json['CARDINAL_DIRS__CHAR_EAST'])
+        p_config['CARDINAL_DIRS']['CHAR_WEST']           = str(request.json['CARDINAL_DIRS__CHAR_WEST'])
+        p_config['CARDINAL_DIRS']['CHAR_SOUTH']          = str(request.json['CARDINAL_DIRS__CHAR_SOUTH'])
+        p_config['CARDINAL_DIRS']['DIAMETER']            = int(request.json['CARDINAL_DIRS__DIAMETER'])
+        p_config['CARDINAL_DIRS']['OFFSET_X']            = int(request.json['CARDINAL_DIRS__OFFSET_X'])
+        p_config['CARDINAL_DIRS']['OFFSET_Y']            = int(request.json['CARDINAL_DIRS__OFFSET_Y'])
+        p_config['CARDINAL_DIRS']['OFFSET_TOP']          = int(request.json['CARDINAL_DIRS__OFFSET_TOP'])
+        p_config['CARDINAL_DIRS']['OFFSET_LEFT']         = int(request.json['CARDINAL_DIRS__OFFSET_LEFT'])
+        p_config['CARDINAL_DIRS']['OFFSET_RIGHT']        = int(request.json['CARDINAL_DIRS__OFFSET_RIGHT'])
+        p_config['CARDINAL_DIRS']['OFFSET_BOTTOM']       = int(request.json['CARDINAL_DIRS__OFFSET_BOTTOM'])
+        p_config['CARDINAL_DIRS']['OPENCV_FONT_SCALE']   = float(request.json['CARDINAL_DIRS__OPENCV_FONT_SCALE'])
+        p_config['CARDINAL_DIRS']['PIL_FONT_SIZE']       = int(request.json['CARDINAL_DIRS__PIL_FONT_SIZE'])
+        p_config['CARDINAL_DIRS']['OUTLINE_CIRCLE']      = bool(request.json['CARDINAL_DIRS__OUTLINE_CIRCLE'])
+        p_config['IMAGE_CIRCLE_MASK']['ENABLE']          = bool(request.json['IMAGE_CIRCLE_MASK__ENABLE'])
+        p_config['IMAGE_CIRCLE_MASK']['DIAMETER']        = int(request.json['IMAGE_CIRCLE_MASK__DIAMETER'])
+        p_config['IMAGE_CIRCLE_MASK']['OFFSET_X']        = int(request.json['IMAGE_CIRCLE_MASK__OFFSET_X'])
+        p_config['IMAGE_CIRCLE_MASK']['OFFSET_Y']        = int(request.json['IMAGE_CIRCLE_MASK__OFFSET_Y'])
+        p_config['IMAGE_CIRCLE_MASK']['BLUR']            = int(request.json['IMAGE_CIRCLE_MASK__BLUR'])
+        p_config['IMAGE_CIRCLE_MASK']['OPACITY']         = int(request.json['IMAGE_CIRCLE_MASK__OPACITY'])
+        p_config['IMAGE_CIRCLE_MASK']['OUTLINE']         = bool(request.json['IMAGE_CIRCLE_MASK__OUTLINE'])
+        p_config['IMAGE_CROP_IMAGE_CIRCLE']              = bool(request.json['IMAGE_CROP_IMAGE_CIRCLE'])
+        p_config['IMAGE_BORDER']['TOP']                  = int(request.json['IMAGE_BORDER__TOP'])
+        p_config['IMAGE_BORDER']['LEFT']                 = int(request.json['IMAGE_BORDER__LEFT'])
+        p_config['IMAGE_BORDER']['RIGHT']                = int(request.json['IMAGE_BORDER__RIGHT'])
+        p_config['IMAGE_BORDER']['BOTTOM']               = int(request.json['IMAGE_BORDER__BOTTOM'])
+        p_config['MOON_OVERLAY']['ENABLE']               = bool(request.json['MOON_OVERLAY__ENABLE'])
+        p_config['MOON_OVERLAY']['X']                    = int(request.json['MOON_OVERLAY__X'])
+        p_config['MOON_OVERLAY']['Y']                    = int(request.json['MOON_OVERLAY__Y'])
+        p_config['MOON_OVERLAY']['SCALE']                = float(request.json['MOON_OVERLAY__SCALE'])
+        p_config['MOON_OVERLAY']['DARK_SIDE_SCALE']      = float(request.json['MOON_OVERLAY__DARK_SIDE_SCALE'])
+        p_config['MOON_OVERLAY']['FLIP_V']               = bool(request.json['MOON_OVERLAY__FLIP_V'])
+        p_config['MOON_OVERLAY']['FLIP_H']               = bool(request.json['MOON_OVERLAY__FLIP_H'])
+        p_config['LIGHTGRAPH_OVERLAY']['ENABLE']         = bool(request.json['LIGHTGRAPH_OVERLAY__ENABLE'])
+        p_config['LIGHTGRAPH_OVERLAY']['GRAPH_HEIGHT']   = int(request.json['LIGHTGRAPH_OVERLAY__GRAPH_HEIGHT'])
+        p_config['LIGHTGRAPH_OVERLAY']['GRAPH_BORDER']   = int(request.json['LIGHTGRAPH_OVERLAY__GRAPH_BORDER'])
+        p_config['LIGHTGRAPH_OVERLAY']['Y']              = int(request.json['LIGHTGRAPH_OVERLAY__Y'])
+        p_config['LIGHTGRAPH_OVERLAY']['OFFSET_X']       = int(request.json['LIGHTGRAPH_OVERLAY__OFFSET_X'])
+        p_config['LIGHTGRAPH_OVERLAY']['SCALE']          = float(request.json['LIGHTGRAPH_OVERLAY__SCALE'])
+        p_config['LIGHTGRAPH_OVERLAY']['NOW_MARKER_SIZE']  = int(request.json['LIGHTGRAPH_OVERLAY__NOW_MARKER_SIZE'])
+        p_config['LIGHTGRAPH_OVERLAY']['OPACITY']        = int(request.json['LIGHTGRAPH_OVERLAY__OPACITY'])
+        p_config['LIGHTGRAPH_OVERLAY']['PIL_FONT_SIZE']  = int(request.json['LIGHTGRAPH_OVERLAY__PIL_FONT_SIZE'])
+        p_config['LIGHTGRAPH_OVERLAY']['OPENCV_FONT_SCALE'] = float(request.json['LIGHTGRAPH_OVERLAY__OPENCV_FONT_SCALE'])
+        p_config['LIGHTGRAPH_OVERLAY']['LABEL']          = bool(request.json['LIGHTGRAPH_OVERLAY__LABEL'])
+        p_config['LIGHTGRAPH_OVERLAY']['HOUR_LINES']     = bool(request.json['LIGHTGRAPH_OVERLAY__HOUR_LINES'])
+
+        # allow extended time for stacking/registration
+        p_config['EXPOSURE_PERIOD'] = 120
+
+        # disable these
+        p_config['ADSB']['ENABLE']                       = False
+        p_config['SATELLITE_TRACK']['ENABLE']            = False
+
+        # SQM_ROI
+        sqm_roi_x1 = int(request.json['SQM_ROI_X1'])
+        sqm_roi_y1 = int(request.json['SQM_ROI_Y1'])
+        sqm_roi_x2 = int(request.json['SQM_ROI_X2'])
+        sqm_roi_y2 = int(request.json['SQM_ROI_Y2'])
+
+        # the x2 and y2 values must be positive integers in order to be enabled and valid
+        if sqm_roi_x2 and sqm_roi_y2:
+            p_config['SQM_ROI'] = [sqm_roi_x1, sqm_roi_y1, sqm_roi_x2, sqm_roi_y2]
+        else:
+            p_config['SQM_ROI'] = []
+
+
+        # TEXT_PROPERTIES FONT_COLOR
+        font_color_str = str(request.json['TEXT_PROPERTIES__FONT_COLOR'])
+        p_config['TEXT_PROPERTIES']['FONT_COLOR'] = [int(x) for x in font_color_str.split(',')]
+
+        # CARDINAL_DIRS FONT_COLOR
+        cardinal_dirs_color_str = str(request.json['CARDINAL_DIRS__FONT_COLOR'])
+        p_config['CARDINAL_DIRS']['FONT_COLOR'] = [int(x) for x in cardinal_dirs_color_str.split(',')]
+
+        # IMAGE_BORDER COLOR
+        image_border__color_str = str(request.json['IMAGE_BORDER__COLOR'])
+        p_config['IMAGE_BORDER']['COLOR'] = [int(x) for x in image_border__color_str.split(',')]
+
+        # LIGHTGRAPH COLORS
+        lightgraph_overlay__day_color_str = str(request.json['LIGHTGRAPH_OVERLAY__DAY_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['DAY_COLOR'] = [int(x) for x in lightgraph_overlay__day_color_str.split(',')]
+
+        lightgraph_overlay__dusk_color_str = str(request.json['LIGHTGRAPH_OVERLAY__DUSK_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['DUSK_COLOR'] = [int(x) for x in lightgraph_overlay__dusk_color_str.split(',')]
+
+        lightgraph_overlay__night_color_str = str(request.json['LIGHTGRAPH_OVERLAY__NIGHT_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['NIGHT_COLOR'] = [int(x) for x in lightgraph_overlay__night_color_str.split(',')]
+
+        lightgraph_overlay__moonmode_color_str = str(request.json['LIGHTGRAPH_OVERLAY__MOONMODE_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['MOONMODE_COLOR'] = [int(x) for x in lightgraph_overlay__moonmode_color_str.split(',')]
+
+        lightgraph_overlay__hour_color_str = str(request.json['LIGHTGRAPH_OVERLAY__HOUR_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['HOUR_COLOR'] = [int(x) for x in lightgraph_overlay__hour_color_str.split(',')]
+
+        lightgraph_overlay__border_color_str = str(request.json['LIGHTGRAPH_OVERLAY__BORDER_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['BORDER_COLOR'] = [int(x) for x in lightgraph_overlay__border_color_str.split(',')]
+
+        lightgraph_overlay__now_color_str = str(request.json['LIGHTGRAPH_OVERLAY__NOW_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['NOW_COLOR'] = [int(x) for x in lightgraph_overlay__now_color_str.split(',')]
+
+        lightgraph_overlay__font_color_str = str(request.json['LIGHTGRAPH_OVERLAY__FONT_COLOR'])
+        p_config['LIGHTGRAPH_OVERLAY']['FONT_COLOR'] = [int(x) for x in lightgraph_overlay__font_color_str.split(',')]
+
+
+        hdulist = fits.open(filename_p)
+
+        exposure = float(hdulist[0].header.get('EXPTIME', 0))
+        exposure_av = Array(ctypes.c_int32, [int(exposure * 1000000)])
+        gain = float(hdulist[0].header.get('GAIN', 0))
+        gain_av = Array(ctypes.c_int32, [int(gain * 1000)])
+        binning = int(hdulist[0].header.get('XBINNING', 1))
+        binning_av = Array('i', [binning])
+        position_av = Array('f', [self.camera.latitude, self.camera.longitude, self.camera.elevation])
+        #sensors_temp_av = Array('f', [float(hdulist[0].header.get('CCD-TEMP', 0))])
+        #sensors_user_av = Array('f', [float(hdulist[0].header.get('CCD-TEMP', 0))])
+        sensors_temp_av = Array('f', [0.0 for x in range(60)])
+        sensors_user_av = Array('f', [0.0 for x in range(110)])
+        night_av = Array('i', [1, 0])  # using night values for processing
+        astro_av = Array('f', [0.0, 0.0, 0.0])
+
+        hdulist.close()
+
+        image_processor = ImageProcessor(
+            p_config,
+            position_av,
+            exposure_av,
+            gain_av,
+            binning_av,
+            sensors_temp_av,
+            sensors_user_av,
+            night_av,
+            astro_av,
+        )
+
+
+        processing_start = time.time()
+
+
+        # Interactive detection: draw stars/meteors on the preview image
+        run_detection = bool(request.json.get('RUN_DETECTION', False))
+        stars_count = 0
+        detections_count = 0
+        detect_method = p_config.get('DETECT_STARS_METHOD', 'template')
+
+        def runDetection():
+            nonlocal stars_count, detections_count, detect_method
+
+            if not run_detection:
+                return
+
+            from ..stars import IndiAllSkyStars
+            from ..detectLines import IndiAllskyDetectLines
+
+            # tuned per-run, the saved config is not modified
+            detect_method = str(request.json.get('DETECT_STARS_METHOD', detect_method))
+            p_config['DETECT_STARS_METHOD']         = detect_method
+            p_config['DETECT_STARS_THOLD']          = float(request.json['DETECT_STARS_THOLD'])
+            p_config['DETECT_STARS_SEP_THOLD']      = float(request.json['DETECT_STARS_SEP_THOLD'])
+            p_config['DETECT_STARS_SEP_MAX_RADIUS'] = int(request.json['DETECT_STARS_SEP_MAX_RADIUS'])
+            p_config['DETECT_METEORS_THOLD']        = int(request.json['DETECT_METEORS_THOLD'])
+            p_config['DETECT_DRAW']                 = True
+
+            detect_mask_path = Path(p_config.get('DETECT_MASK', ''))
+            if detect_mask_path.is_file():
+                indi_mask = cv2.imread(str(detect_mask_path), cv2.IMREAD_GRAYSCALE)
+            else:
+                indi_mask = None
+
+            mask_dict = {binning: indi_mask}
+
+            # lines before stars, as in the capture pipeline - star markers would
+            # otherwise be detected as lines
+            lines_detect_o = IndiAllskyDetectLines(p_config, mask=mask_dict)
+            detections_count = len(lines_detect_o.detectLines(image_processor.image, binning))
+
+            if detect_method == 'sep':
+                # imported on demand: sep is unavailable on some legacy platforms
+                from ..starsSep import IndiAllSkyStarsSEP
+                stars_detect_o = IndiAllSkyStarsSEP(p_config, mask=mask_dict)
+            else:
+                stars_detect_o = IndiAllSkyStars(p_config, mask=mask_dict)
+
+            stars_count = len(stars_detect_o.detectObjects(image_processor.image, binning))
+
+
+        message_list = list()
+
+        if disable_processing:
+            # just return original image with no processing
+
+            # use mtime for date
+            image_date = datetime.fromtimestamp(filename_p.stat().st_mtime)
+
+            image_processor.add(
+                filename_p,
+                exposure,
+                gain,
+                binning,
+                image_date,
+                0.0,
+                fits_entry.camera,
+            )
+
+            image_processor.debayer()  # populates self.opencv_data
+
+            image_processor.stack()  # populates self.image
+
+            image_processor.convert_16bit_to_8bit()
+
+            runDetection()
+
+
+            # rotation
+            image_processor.rotate_90()
+            image_processor.rotate_angle()
+
+
+            # verticle flip
+            image_processor.flip_v()
+
+            # horizontal flip
+            image_processor.flip_h()
+
+
+            image_processor.colorize()
+
+
+            message_list.append('Unprocessed image')
+
+        else:
+            if p_config['IMAGE_STACK_COUNT'] > 1:
+                fits_image_query = IndiAllSkyDbFitsImageTable.query\
+                    .join(IndiAllSkyDbFitsImageTable.camera)\
+                    .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                    .filter(IndiAllSkyDbFitsImageTable.createDate < fits_entry.createDate)\
+                    .order_by(IndiAllSkyDbFitsImageTable.createDate.desc())\
+                    .limit(p_config['IMAGE_STACK_COUNT'] - 1)
+
+                for f_image in fits_image_query:
+                    f_image_p = f_image.getFilesystemPath()
+
+                    # use mtime for date
+                    pre_image_date = datetime.fromtimestamp(f_image_p.stat().st_mtime)
+
+                    alt_hdulist = fits.open(f_image_p)
+                    alt_exposure = float(alt_hdulist[0].header.get('EXPTIME', 0))
+                    alt_gain = float(alt_hdulist[0].header.get('GAIN', 0))
+                    alt_binning = int(alt_hdulist[0].header.get('XBINNING', 1))
+                    alt_hdulist.close()
+
+                    i_ref_2 = image_processor.add(
+                        f_image_p,
+                        alt_exposure,
+                        alt_gain,
+                        alt_binning,
+                        pre_image_date,
+                        0.0,
+                        f_image.camera,
+                    )
+
+                    image_processor._calibrate(i_ref_2)
+                    i_ref_2.opencv_data = image_processor._debayer(i_ref_2)  # update opencv_data
+
+                message_list.append('Stacked {0:d} images'.format(p_config['IMAGE_STACK_COUNT']))
+
+
+            # use mtime for date
+            image_date = datetime.fromtimestamp(filename_p.stat().st_mtime)
+
+
+            image_processor.update_astrometric_data(image_date)
+
+
+            # add image after preloading other images
+            i_ref = image_processor.add(
+                filename_p,
+                exposure,
+                gain,
+                binning,
+                datetime.now(),
+                0.0,
+                fits_entry.camera,
+            )
+
+
+            image_processor.calibrate()
+
+            image_processor.fix_holes_early()
+
+            image_processor.debayer()  # populates self.opencv_data
+
+            image_processor.stack()  # populates self.image
+
+            image_processor.denoise()
+
+            image_processor.stretch()
+
+            if p_config['NIGHT_CONTRAST_ENHANCE']:
+                if p_config.get('CONTRAST_ENHANCE_16BIT'):
+                    image_processor.contrast_clahe_16bit()
+
+                    message_list.append('16-bit CLAHE')
+
+
+            image_processor.convert_16bit_to_8bit()
+
+            runDetection()
+
+
+            if p_config.get('IMAGE_ROTATE'):
+                image_processor.rotate_90()
+
+
+            # rotation
+            if p_config.get('IMAGE_ROTATE_ANGLE'):
+                image_processor.rotate_angle()
+
+
+            # verticle flip
+            if p_config.get('IMAGE_FLIP_V'):
+                image_processor.flip_v()
+
+            # horizontal flip
+            if p_config.get('IMAGE_FLIP_H'):
+                image_processor.flip_h()
+
+            # crop
+            image_processor.crop_image()
+
+            # green removal
+            image_processor.scnr()
+
+
+            # white balance
+            image_processor.white_balance_mtf()
+            image_processor.white_balance_manual_bgr()
+            image_processor.white_balance_auto_bgr()
+
+
+            # saturation
+            image_processor.saturation_adjust()
+
+
+            # gamma correction
+            image_processor.apply_gamma_correction()
+
+
+            # sharpening (unsharp mask)
+            image_processor.sharpen()
+
+
+            if p_config['NIGHT_CONTRAST_ENHANCE']:
+                if not p_config.get('CONTRAST_ENHANCE_16BIT'):
+                    image_processor.contrast_clahe()
+
+                    message_list.append('CLAHE Contrast Enhance')
+
+
+            image_processor.colorize()
+
+
+            image_processor.colormap()
+
+
+            image_processor.apply_image_circle_mask(i_ref.binning)
+
+
+            if not p_config.get('FISH2PANO', {}).get('ENABLE'):
+                image_processor.add_border()
+
+                image_processor.moon_overlay()
+
+                image_processor.lightgraph_overlay()
+
+                image_processor.cardinal_dirs_label()
+
+                if p_config['IMAGE_LABEL_SYSTEM']:
+                    image_processor.label_image()
+
+            else:
+                # no labels if converting to panorama
+                pano_data = image_processor.fish2pano(i_ref.binning)
+
+
+                if p_config.get('FISH2PANO', {}).get('FLIP_H'):
+                    pano_data = image_processor._flip(pano_data, 1)
+
+
+                if p_config.get('FISH2PANO', {}).get('ENABLE_CARDINAL_DIRS'):
+                    pano_data = image_processor.fish2pano_cardinal_dirs_label(pano_data)
+
+
+                image_processor.image = pano_data
+
+        processing_elapsed_s = time.time() - processing_start
+        app.logger.info('Image processed in %0.4f s', processing_elapsed_s)
+
+
+        image = image_processor.image
+
+
+        if output_image_type == 'png':
+            png_compress_level = p_config['IMAGE_FILE_COMPRESSION']['png']
+
+            ### OpenCV
+            _, json_image = cv2.imencode('.jpg', image, [cv2.IMWRITE_PNG_COMPRESSION, png_compress_level])
+            json_image_buffer = io.BytesIO(json_image.tobytes())
+
+            ### pillow
+            #json_image_buffer = io.BytesIO()
+            #img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            #img.save(json_image_buffer, format='PNG', compress_level=png_compress_level)
+        else:
+            # jpeg default
+            jpg_compress_level = p_config['IMAGE_FILE_COMPRESSION']['jpg']
+
+            ### OpenCV
+            _, json_image = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, jpg_compress_level])
+            json_image_buffer = io.BytesIO(json_image.tobytes())
+
+            ### pillow
+            #json_image_buffer = io.BytesIO()
+            #img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            #img.save(json_image_buffer, format='JPEG', compress_level=jpg_compress_level)
+
+
+        json_image_b64 = base64.b64encode(json_image_buffer.getvalue())
+
+        json_data = dict()
+        json_data['image_b64'] = json_image_b64.decode('utf-8')
+        json_data['processing_elapsed_s'] = round(processing_elapsed_s, 3)
+        #json_data['message'] = ', '.join(message_list)
+        json_data['message'] = ''  # Blank until I can get messages from all processing actions
+        json_data['stars_count'] = stars_count
+        json_data['detections_count'] = detections_count
+        json_data['DETECT_STARS_METHOD'] = detect_method
+
+        return jsonify(json_data)
+
+
+class LogView(TemplateView):
+    page_title = 'Log Viewer'
+    log_stream_view = 'indi_allsky.stream_log_view'
+    decorators = [login_required]
+
+
+    def get_context(self):
+        context = super(LogView, self).get_context()
+
+        context['log_stream_view'] = self.log_stream_view
+
+        return context
+
+
+class LogIndiserverLogView(TemplateView):
+    page_title = 'Indiserver Log Viewer'
+    log_stream_view = 'indi_allsky.stream_indiserver_log_view'
+    decorators = [login_required]
+
+
+    def get_context(self):
+        context = super(LogIndiserverLogView, self).get_context()
+
+        context['log_stream_view'] = self.log_stream_view
+
+        return context
+
+
+class StreamLogViewBase(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+    def __init__(self, **kwargs):
+        super(StreamLogViewBase, self).__init__(**kwargs)
+
+        self.user_unit_name = 'changeme'
+        self.syslog_facility = None
+
+
+    def dispatch_request(self):
+        from systemd import journal
+        import select
+
+
+        def generate():
+            reader = journal.Reader()
+
+
+            if not isinstance(self.syslog_facility, type(None)):
+                app.logger.info('Streaming log from facility %s', self.syslog_facility)
+                reader.add_match(SYSLOG_FACILITY=self.syslog_facility)
+            else:
+                # use unit name
+                app.logger.info('Streaming log from user unit %s', self.user_unit_name)
+                reader.add_match(_SYSTEMD_USER_UNIT=self.user_unit_name)
+
+
+            reader.seek_tail()
+
+            # return the previous 10 lines of log messages
+            for _ in range(11):
+                reader.get_previous()  # Fixes edge-case pointer positioning
+
+
+            poller = select.poll()
+            poller.register(reader.fileno(), reader.get_events())
+
+
+            while True:
+                if poller.poll(500):  # Check every 500ms
+                    if reader.process() == journal.APPEND:
+                        for entry in reader:
+                            message = entry.get('MESSAGE', '')
+                            yield 'data: {0:s}\n\n'.format(message)
+                else:
+                    yield ': keep-alive\n\n'
+
+
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype='text/event-stream'
+        )
+
+
+class StreamLogView(StreamLogViewBase):
+    def __init__(self, **kwargs):
+        super(StreamLogView, self).__init__(**kwargs)
+
+        self.syslog_facility = '22'  # local6
+        #self.user_unit_name = app.config['ALLSKY_SERVICE_NAME']
+        self.user_unit_name = None
+
+
+class StreamIndiserverLogView(StreamLogViewBase):
+    def __init__(self, **kwargs):
+        super(StreamIndiserverLogView, self).__init__(**kwargs)
+
+        self.syslog_facility = None
+        self.user_unit_name = app.config['INDISERVER_SERVICE_NAME']
+
+
+class LogDownloadView(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    def dispatch_request(self):
+        import gzip
+
+        log_file_p = Path('/var/log/indi-allsky/indi-allsky.log')
+        line_size = 150  # assuming lines have an average length
+
+        lines = int(request.args.get('lines', 20000))
+
+
+        if not log_file_p.exists():
+            # this can happen in docker
+            return 'Log file does not exist'
+
+
+        read_bytes = lines * line_size
+
+
+        log_file_size = log_file_p.stat().st_size
+        if log_file_size == 0:
+            return 'Log file is empty'
+        elif log_file_size < read_bytes:
+            # just read the whole file
+            #app.logger.info('Returning %d bytes of log data', log_file_size)
+            log_file_seek = 0
+        else:
+            #app.logger.info('Returning %d bytes of log data', read_bytes)
+            log_file_seek = log_file_size - read_bytes
+
+
+        try:
+            with io.open(log_file_p, 'rb') as log_file_f:
+                log_file_f.seek(log_file_seek)
+                log_data = log_file_f.read()
+        except PermissionError as e:
+            return 'PermissionError: {0:s}'.format(str(e))
+
+
+        log_buffer = io.BytesIO(gzip.compress(log_data))
+
+
+        data = {
+            'ts'    : datetime.now(),
+        }
+
+
+        download_name = 'indi-allsky_log_{ts:%Y%m%d_%H%M%S}.txt.gz'.format(**data)
+
+        return send_file(log_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+class LogWebappDownloadView(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    def dispatch_request(self):
+        import gzip
+
+        log_file_p = Path('/var/log/indi-allsky/webapp-indi-allsky.log')
+        line_size = 150  # assuming lines have an average length
+
+        lines = int(request.args.get('lines', 5000))
+
+
+        if not log_file_p.exists():
+            # this can happen in docker
+            return 'Log file does not exist'
+
+
+        read_bytes = lines * line_size
+
+
+        log_file_size = log_file_p.stat().st_size
+        if log_file_size == 0:
+            return 'Log file is empty'
+        elif log_file_size < read_bytes:
+            # just read the whole file
+            #app.logger.info('Returning %d bytes of log data', log_file_size)
+            log_file_seek = 0
+        else:
+            #app.logger.info('Returning %d bytes of log data', read_bytes)
+            log_file_seek = log_file_size - read_bytes
+
+
+        try:
+            with io.open(log_file_p, 'rb') as log_file_f:
+                log_file_f.seek(log_file_seek)
+                log_data = log_file_f.read()
+        except PermissionError as e:
+            return 'PermissionError: {0:s}'.format(str(e))
+
+
+        log_buffer = io.BytesIO(gzip.compress(log_data))
+
+
+        data = {
+            'ts'    : datetime.now(),
+        }
+
+
+        download_name = 'indi-allsky_webapp_log_{ts:%Y%m%d_%H%M%S}.txt.gz'.format(**data)
+
+        return send_file(log_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+class LogSyslogDownloadView(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    def dispatch_request(self):
+        import gzip
+
+        log_file_p = Path('/var/log/syslog')
+        line_size = 150  # assuming lines have an average length
+
+        lines = int(request.args.get('lines', 20000))
+
+
+        if not log_file_p.exists():
+            # this can happen in docker
+            return 'Log file does not exist'
+
+
+        read_bytes = lines * line_size
+
+
+        log_file_size = log_file_p.stat().st_size
+        if log_file_size == 0:
+            return 'Log file is empty'
+        elif log_file_size < read_bytes:
+            # just read the whole file
+            #app.logger.info('Returning %d bytes of log data', log_file_size)
+            log_file_seek = 0
+        else:
+            #app.logger.info('Returning %d bytes of log data', read_bytes)
+            log_file_seek = log_file_size - read_bytes
+
+
+        try:
+            with io.open(log_file_p, 'rb') as log_file_f:
+                log_file_f.seek(log_file_seek)
+                log_data = log_file_f.read()
+        except PermissionError as e:
+            return 'PermissionError: {0:s}'.format(str(e))
+
+
+        log_buffer = io.BytesIO(gzip.compress(log_data))
+
+
+        data = {
+            'ts'    : datetime.now(),
+        }
+
+
+        download_name = 'indi-allsky_syslog_log_{ts:%Y%m%d_%H%M%S}.txt.gz'.format(**data)
+
+        return send_file(log_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+class LogKernDownloadView(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    def dispatch_request(self):
+        import gzip
+
+        log_file_p = Path('/var/log/kern.log')
+        line_size = 150  # assuming lines have an average length
+
+        lines = int(request.args.get('lines', 20000))
+
+
+        if not log_file_p.exists():
+            # this can happen in docker
+            return 'Log file does not exist'
+
+
+        read_bytes = lines * line_size
+
+
+        log_file_size = log_file_p.stat().st_size
+        if log_file_size == 0:
+            return 'Log file is empty'
+        elif log_file_size < read_bytes:
+            # just read the whole file
+            #app.logger.info('Returning %d bytes of log data', log_file_size)
+            log_file_seek = 0
+        else:
+            #app.logger.info('Returning %d bytes of log data', read_bytes)
+            log_file_seek = log_file_size - read_bytes
+
+
+        try:
+            with io.open(log_file_p, 'rb') as log_file_f:
+                log_file_f.seek(log_file_seek)
+                log_data = log_file_f.read()
+        except PermissionError as e:
+            return 'PermissionError: {0:s}'.format(str(e))
+
+
+        log_buffer = io.BytesIO(gzip.compress(log_data))
+
+
+        data = {
+            'ts'    : datetime.now(),
+        }
+
+
+        download_name = 'indi-allsky_kern_log_{ts:%Y%m%d_%H%M%S}.txt.gz'.format(**data)
+
+        return send_file(log_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+class LogDownloadJournalViewBase(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    def __init__(self, **kwargs):
+        super(LogDownloadJournalViewBase, self).__init__(**kwargs)
+
+        self.user_unit_name = 'changeme'
+        self.download_name_tmpl = 'changeme'
+
+
+    def dispatch_request(self):
+        import gzip
+        from systemd import journal
+
+        lines = int(request.args.get('lines', 20000))
+
+
+        reader = journal.Reader()
+
+        reader.add_match(_SYSTEMD_USER_UNIT=self.user_unit_name)
+
+        reader.seek_head()
+
+
+        log_data_array = list()
+        for entry in reader:
+            message = entry.get('MESSAGE', '')
+            log_data_array.append('{0:s}'.format(message))
+
+
+        log_data = '\n'.join(log_data_array[-lines:]).encode()
+
+        log_buffer = io.BytesIO(gzip.compress(log_data))
+
+
+        data = {
+            'ts'    : datetime.now(),
+        }
+
+
+        download_name = self.download_name_tmpl.format(**data)
+
+        return send_file(log_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+class LogIndiserverDownloadView(LogDownloadJournalViewBase):
+    def __init__(self, **kwargs):
+        super(LogIndiserverDownloadView, self).__init__(**kwargs)
+
+        self.user_unit_name = app.config['INDISERVER_SERVICE_NAME']
+        self.download_name_tmpl = 'indi-allsky_indiserver_log_{ts:%Y%m%d_%H%M%S}.txt.gz'
+
+
+class LogUpgradeDownloadView(LogDownloadJournalViewBase):
+    def __init__(self, **kwargs):
+        super(LogUpgradeDownloadView, self).__init__(**kwargs)
+
+        self.user_unit_name = app.config['UPGRADE_ALLSKY_SERVICE_NAME']
+        self.download_name_tmpl = 'indi-allsky_upgrade_log_{ts:%Y%m%d_%H%M%S}.txt.gz'
+
+
+class SupportInfoView(TemplateView):
+    page_title = 'Support Info'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(SupportInfoView, self).get_context()
+        return context
+
+
+class JsonSupportInfoView(JsonView):
+    decorators = [login_required]
+
+    def __init__(self, **kwargs):
+        super(JsonSupportInfoView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        import subprocess
+
+        cmd = [
+            str(Path(__file__).parent.parent.parent.absolute().joinpath('misc', 'support_info.sh')),
+        ]
+
+
+        json_data = dict()
+
+        try:
+            app.logger.info('Running: %s', ' '.join(cmd))
+            support_subproc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=True
+            )
+
+            json_data['support_info'] = (support_subproc.stdout).decode('utf-8', errors='replace')
+        except subprocess.CalledProcessError as e:
+            app.logger.error('Support info generate failed: %s', e.stdout)
+            return jsonify({}), 400
+
+
+        return jsonify(json_data)
+
+
+class NotificationsView(TemplateView):
+    page_title = 'Notifications'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(NotificationsView, self).get_context()
+
+        notices = IndiAllSkyDbNotificationTable.query\
+            .order_by(IndiAllSkyDbNotificationTable.createDate.desc())\
+            .limit(50)
+
+
+        notice_list = list()
+        for notice in notices:
+            n = {
+                'id'            : notice.id,
+                'createDate'    : notice.createDate,
+                'expireDate'    : notice.expireDate,
+                'category'      : notice.category.value,
+                'ack'           : notice.ack,
+                'notification'  : notice.notification,
+            }
+
+            notice_list.append(n)
+
+        context['notice_list'] = notice_list
+
+        return context
+
+
+class AjaxNotificationView(BaseView):
+    methods = ['GET', 'POST']
+    decorators = []  # manually handle if user is logged in
+
+
+    def __init__(self, **kwargs):
+        super(AjaxNotificationView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if not current_user.is_authenticated:
+            no_data = {
+                'id' : 0,
+            }
+            return jsonify(no_data)
+
+
+        if request.method == 'POST':
+            return self.post()
+        elif request.method == 'GET':
+            return self.get()
+        else:
+            return jsonify({}), 400
+
+
+    def get(self, camera_id=None):
+        if not camera_id:
+            camera_id = int(request.args['camera_id'])
+
+        self.cameraSetup(camera_id=camera_id)
+
+        # return a single result, newest first
+        now = self.camera_now
+
+        # this MUST ALWAYS return the newest result
+        notice = IndiAllSkyDbNotificationTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbNotificationTable.ack == sa_false(),
+                    IndiAllSkyDbNotificationTable.expireDate > now,
+                )
+            )\
+            .order_by(IndiAllSkyDbNotificationTable.createDate.desc())\
+            .first()
+
+
+        if not notice:
+            no_data = {
+                'id' : 0,
+            }
+            return jsonify(no_data)
+
+
+        data = {
+            'id'            : notice.id,
+            'createDate'    : notice.createDate.strftime('%Y-%m-%d %H:%M:%S'),
+            'category'      : notice.category.value,
+            'notification'  : notice.notification,
+        }
+
+        return jsonify(data)
+
+
+    def post(self):
+        camera_id = int(request.json['camera_id'])
+        ack_id = int(request.json['ack_id'])
+
+        try:
+            notice = IndiAllSkyDbNotificationTable.query\
+                .filter(IndiAllSkyDbNotificationTable.id == ack_id)\
+                .one()
+
+            notice.setAck()
+        except NoResultFound:
+            pass
+
+
+        # return next notification
+        return self.get(camera_id=camera_id)
+
+
+class UserInfoView(TemplateView):
+    page_title = 'User Info'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(UserInfoView, self).get_context()
+
+
+        if current_user.data:
+            current_user_data = dict(current_user.data)
+        else:
+            current_user_data = dict()
+
+
+        idp = current_user_data.get('idp', 'local')
+
+
+        form_data = {
+            'USERNAME' : current_user.username,
+            'NAME'     : current_user.name,
+            'EMAIL'    : current_user.email,
+            'ADMIN'    : current_user.admin,
+            'IDP'      : idp,
+        }
+
+        context['form_userinfo'] = IndiAllskyUserInfoForm(data=form_data)
+
+        custom_css_path = os.path.join(app.static_folder, 'css', 'custom.css')
+        user_custom_css = ''
+        if os.path.exists(custom_css_path):
+            try:
+                with open(custom_css_path, 'r', encoding='utf-8') as f:
+                    user_custom_css = f.read()
+            except Exception:
+                user_custom_css = ''
+
+        context['user_custom_css'] = user_custom_css
+
+        import re
+        user_custom_themes = []
+        if user_custom_css:
+            matches = re.findall(r'name\s*:\s*["\']?([a-zA-Z0-9_\-]+)["\']?', user_custom_css)
+            for m in matches:
+                if m not in user_custom_themes:
+                    user_custom_themes.append(m)
+
+        context['user_custom_themes'] = user_custom_themes
+
+        return context
+
+
+class AjaxCustomCssView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        data = request.get_json(force=True, silent=True) or {}
+        custom_css_new = str(data.get('custom_css', ''))
+        custom_css_path = os.path.join(app.static_folder, 'css', 'custom.css')
+
+        try:
+            with open(custom_css_path, 'w', encoding='utf-8') as f:
+                f.write(custom_css_new)
+        except Exception as e:
+            return jsonify({'error': f'Failed to save custom.css: {str(e)}'}), 500
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        try:
+            import subprocess
+            build_res = subprocess.run(
+                ["npm", "run", "build"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if build_res.returncode == 0:
+                return jsonify({
+                    'success': True,
+                    'message': 'Custom CSS saved and stylesheet recompiled successfully!'
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': f'Custom CSS saved, but stylesheet build failed: {build_res.stderr.strip()}'
+                }), 400
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Custom CSS saved, but build trigger failed: {str(e)}'
+            }), 500
+
+
+class AjaxUserInfoView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxUserInfoView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if request.method == 'POST':
+            return self.post()
+        else:
+            return jsonify({}), 400
+
+
+    def post(self):
+        form_userinfo = IndiAllskyUserInfoForm(data=request.json)
+
+
+        if not form_userinfo.validate(current_user):
+            form_errors = form_userinfo.errors  # this must be a property
+            form_errors['form_global'] = ['Please fix the errors above']
+            return jsonify(form_errors), 400
+
+
+        # check current password (again)
+        current_password = str(request.json['CURRENT_PASSWORD'])
+        if not argon2.verify(current_password, current_user.password):
+            message = {
+                'CURRENT_PASSWORD' : ['Current password is not valid'],
+            }
+            return jsonify(message), 400
+
+
+        new_name = str(request.json['NAME'])
+        new_password = str(request.json['NEW_PASSWORD'])
+        # email is read only
+        # admin is read only
+
+
+        current_user.name = new_name
+
+
+        if new_password:
+            # do not update password if not defined
+            hashed_password = argon2.hash(new_password)
+            current_user.password = hashed_password
+            current_user.passwordDate = datetime.now()
+
+
+        db.session.commit()
+
+
+        message = {
+            'success-message' : 'User info updated',
+        }
+        return jsonify(message)
+
+
+class UsersView(TemplateView):
+    page_title = 'Users'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(UsersView, self).get_context()
+
+        user_list = IndiAllSkyDbUserTable.query\
+            .order_by(IndiAllSkyDbUserTable.createDate.asc())
+
+        context['user_list'] = user_list
+
+        return context
+
+
+class ConfigListView(TemplateView):
+    page_title = 'Config History'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(ConfigListView, self).get_context()
+
+        config_list = IndiAllSkyDbConfigTable.query\
+            .add_columns(
+                IndiAllSkyDbConfigTable.id,
+                IndiAllSkyDbConfigTable.createDate,
+                IndiAllSkyDbConfigTable.level,
+                IndiAllSkyDbConfigTable.note,
+                IndiAllSkyDbConfigTable.encrypted,
+                IndiAllSkyDbUserTable.username,
+            )\
+            .join(IndiAllSkyDbUserTable)\
+            .order_by(IndiAllSkyDbConfigTable.createDate.desc())\
+            .limit(25)
+
+        context['config_list'] = config_list
+
+        return context
+
+
+class ConfigDownloadView(BaseView):
+    decorators = [login_required]
+    methods = ['GET']
+
+
+    redact_dict = {
+        'OWNER' : 'REDACTED',
+        'FILETRANSFER' : {
+            'PASSWORD' : 'REDACTED',
+            'PASSWORD_E' : '',
+        },
+        'S3UPLOAD' : {
+            'SECRET_KEY' : 'REDACTED',
+            'SECRET_KEY_E' : '',
+        },
+        'MQTTPUBLISH' : {
+            'PASSWORD' : 'REDACTED',
+            'PASSWORD_E' : '',
+        },
+        'SYNCAPI' : {
+            'APIKEY' : 'REDACTED',
+            'APIKEY_E' : '',
+        },
+        'PYCURL_CAMERA' : {
+            'PASSWORD' : 'REDACTED',
+            'PASSWORD_E' : '',
+        },
+        'TEMP_SENSOR' : {
+            'OPENWEATHERMAP_APIKEY' : 'REDACTED',
+            'OPENWEATHERMAP_APIKEY_E' : '',
+            'WUNDERGROUND_APIKEY' : 'REDACTED',
+            'WUNDERGROUND_APIKEY_E' : '',
+            'ASTROSPHERIC_APIKEY' : 'REDACTED',
+            'ASTROSPHERIC_APIKEY_E' : '',
+            'AMBIENTWEATHER_APIKEY' : 'REDACTED',
+            'AMBIENTWEATHER_APIKEY_E' : '',
+            'AMBIENTWEATHER_APPLICATIONKEY' : 'REDACTED',
+            'AMBIENTWEATHER_APPLICATIONKEY_E' : '',
+            'AMBIENTWEATHER_MACADDRESS' : 'REDACTED',
+            'AMBIENTWEATHER_MACADDRESS_E' : '',
+            'ECOWITT_APIKEY' : 'REDACTED',
+            'ECOWITT_APIKEY_E' : '',
+            'ECOWITT_APPLICATIONKEY' : 'REDACTED',
+            'ECOWITT_APPLICATIONKEY_E' : '',
+            'ECOWITT_MACADDRESS' : 'REDACTED',
+            'ECOWITT_MACADDRESS_E' : '',
+            'MQTT_PASSWORD' : 'REDACTED',
+            'MQTT_PASSWORD_E' : '',
+        },
+        'DEVICE' : {
+            'MQTT_PASSWORD' : 'REDACTED',
+            'MQTT_PASSWORD_E' : '',
+        },
+        'LIBCAMERA' : {
+            'MQTT_PASSWORD' : 'REDACTED',
+            'MQTT_PASSWORD_E' : '',
+        },
+        'ADSB' : {
+            'PASSWORD' : 'REDACTED',
+            'PASSWORD_E' : '',
+        },
+        'IMAGE_OVERLAY' : {
+            'A_PASSWORD' : 'REDACTED',
+            'A_PASSWORD_E' : '',
+        },
+    }
+
+
+    def dispatch_request(self):
+        config_id = int(request.args.get('id', -1))
+        redact = bool(request.args.get('redact', 0))
+
+        # not catching NoResultFound
+        config_entry = IndiAllSkyDbConfigTable.query\
+            .filter(IndiAllSkyDbConfigTable.id == config_id)\
+            .one()
+
+
+        config = dict(config_entry.data)
+
+
+        if redact:
+            app.logger.warning('Redacting sensitive info from config download')
+            config = self.dict_merge(config, self.redact_dict)
+
+            # reduce precision of lat/long
+            config['LOCATION_LATITUDE'] = float(round(config['LOCATION_LATITUDE']))
+            config['LOCATION_LONGITUDE'] = float(round(config['LOCATION_LONGITUDE']))
+
+
+        config_str = json.dumps(config, indent=4, ensure_ascii=False)
+        config_buffer = io.BytesIO(config_str.encode())
+
+
+        data = {
+            'id'    : config_entry.id,
+            'ts'    : datetime.now(),
+            'level' : config_entry.level.replace('.', '-'),
+        }
+
+        download_name = 'indi-allsky_config_id-{id:d}_level-{level:s}_{ts:%Y%m%d_%H%M%S}.json'.format(**data)
+
+        return send_file(config_buffer, mimetype='application/octet-stream', download_name=download_name, as_attachment=True)
+
+
+    def dict_merge(self, a_dict, b_dict, path=[]):
+        for k in b_dict.keys():
+            if k in a_dict.keys():
+                if isinstance(a_dict[k], (str, int, float, bool)) and isinstance(b_dict[k], (str, int, float, bool)):
+                    a_dict[k] = b_dict[k]
+                elif isinstance(a_dict[k], dict) and isinstance(b_dict[k], dict):
+                    self.dict_merge(a_dict[k], b_dict[k], path + [str(k)])  # recursion
+                else:
+                    raise Exception('Dictionary conflict at ' + '.'.join(path + [str(k)]))
+            else:
+                a_dict[k] = b_dict[k]
+
+        return a_dict
+
+
+class ConfigRestoreView(TemplateView):
+    page_title = 'Config Restore'
+    decorators = [login_required]
+
+    def get_context(self):
+        context = super(ConfigRestoreView, self).get_context()
+
+        context['camera_id'] = self.camera.id
+
+        context['form_config_restore'] = IndiAllskyConfigRestoreForm(indi_allsky_config=self.indi_allsky_config)
+
+        return context
+
+
+class AjaxConfigRestoreView(BaseView):
+    decorators = [login_required]
+    methods = ['POST']
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            return jsonify({}), 400
+
+        form_config_restore = IndiAllskyConfigRestoreForm(data=request.form)
+
+        if not form_config_restore.validate():
+            form_errors = form_config_restore.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        config_form_file = request.files['CONFIG_UPLOAD']
+        reset_keys = request.form.get('RESET_KEYS')
+        flush_configs = request.form.get('FLUSH_CONFIGS')
+
+
+        f_tmp_config = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json')
+        f_tmp_config.close()
+
+        tmp_config_p = Path(f_tmp_config.name)
+
+        config_form_file.save(str(tmp_config_p))
+
+
+        file_size = tmp_config_p.stat().st_size
+        if file_size == 0:
+            error_data = {
+                'form_global' : ['Please fix the errors above'],
+                'CONFIG_UPLOAD' : ['File is empty'],
+            }
+            tmp_config_p.unlink()  # cleanup
+            return jsonify(error_data), 400
+
+        if file_size > 100000:
+            error_data = {
+                'form_global' : ['Please fix the errors above'],
+                'CONFIG_UPLOAD' : ['File too large'],
+            }
+            tmp_config_p.unlink()  # cleanup
+            return jsonify(error_data), 400
+
+
+        try:
+            with io.open(str(tmp_config_p), 'rb') as config_f:
+                config_dict = json.load(config_f, object_pairs_hook=OrderedDict)
+        except ValueError:
+            error_data = {
+                'form_global' : ['Please fix the errors above'],
+                'CONFIG_UPLOAD' : ['Invalid JSON'],
+            }
+            return jsonify(error_data), 400
+        finally:
+            tmp_config_p.unlink()  # cleanup
+
+
+        # basic config validation
+        if not isinstance(config_dict.get('INDI_SERVER'), str) or not isinstance(config_dict.get('CCD_CONFIG'), dict) or not isinstance(config_dict.get('INDI_CONFIG_DEFAULTS'), dict):
+            error_data = {
+                'form_global' : ['Please fix the errors above'],
+                'CONFIG_UPLOAD' : ['Not a valid indi-allsky config'],
+            }
+            return jsonify(error_data), 400
+
+
+        # save new config
+        if not app.config['LOGIN_DISABLED']:
+            username = current_user.username
+        else:
+            username = 'system'
+
+
+        try:
+            # replace config
+            self._indi_allsky_config_obj.config = config_dict
+            self._indi_allsky_config_obj.save(username, 'Manual config restore from upload')
+        except ConfigSaveException as e:
+            error_data = {
+                'form_global' : ['Please fix the errors above'],
+                'CONFIG_UPLOAD' : [str(e)],
+            }
+            return jsonify(error_data), 400
+
+
+        app.logger.info('Restored config from upload')
+
+
+        if flush_configs:
+            flush_entries = IndiAllSkyDbConfigTable.query\
+                .filter(IndiAllSkyDbConfigTable.id != self._indi_allsky_config_obj.config_id)
+
+            flush_entries.delete()
+            db.session.commit()
+
+            app.logger.warning('Config entries flushed')
+
+
+        if reset_keys:
+            import shutil
+            import secrets
+            from cryptography.fernet import Fernet
+
+
+            flask_config_p = Path('/etc/indi-allsky/flask.json')
+
+
+            with io.open(str(flask_config_p), 'rb') as flask_config_f:
+                flask_config = json.load(flask_config_f, object_pairs_hook=OrderedDict)
+
+
+            new_flask_secret_key = secrets.token_hex()
+            new_flask_password_key = Fernet.generate_key().decode()
+
+
+            flask_config['SECRET_KEY'] = new_flask_secret_key
+            flask_config['PASSWORD_KEY'] = new_flask_password_key
+
+
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as f_tmp_config:
+                json.dump(
+                    flask_config,
+                    f_tmp_config,
+                    indent=2,  # matches jq output
+                    ensure_ascii=False,
+                )
+
+                tmp_config_p = Path(f_tmp_config.name)
+
+
+            shutil.copy2(str(tmp_config_p), str(flask_config_p))
+            tmp_config_p.unlink()
+
+            flask_config_p.chmod(0o660)
+
+            app.logger.warning('Reset security keys')
+
+
+        message = {
+            'success-message' : 'Restored Config',
+        }
+        return jsonify(message)
+
+
+class AjaxSelectCameraView(BaseView):
+    methods = ['POST']
+
+
+    def __init__(self, **kwargs):
+        super(AjaxSelectCameraView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if request.method == 'POST':
+            return self.post()
+        else:
+            return jsonify({}), 400
+
+
+    def post(self):
+        camera_id = int(request.json['camera_id'])
+
+        try:
+            camera = IndiAllSkyDbCameraTable.query\
+                .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+                .one()
+        except NoResultFound:
+            return jsonify({}), 400
+
+
+        session['camera_id'] = camera.id
+
+
+        # return next notification
+        return jsonify({})
+
+
+class CameraLensView(TemplateView):
+    page_title = 'Camera/Lens Info'
+
+
+    def get_context(self):
+        context = super(CameraLensView, self).get_context()
+
+        camera = IndiAllSkyDbCameraTable.query\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .one()
+
+
+        context['camera'] = camera
+
+        if self.indi_allsky_config.get('PRIVACY_MODE'):
+            context['owner'] = 'Private'
+        else:
+            context['owner'] = camera.owner
+
+
+        context['camera_cfa'] = constants.CFA_MAP_STR[camera.cfa]
+
+        lens_aperature_mm = camera.lensFocalLength / camera.lensFocalRatio
+        context['lensAperture'] = lens_aperature_mm
+
+
+        camera_width_mm = camera.width * camera.pixelSize / 1000.0
+        camera_height_mm = camera.height * camera.pixelSize / 1000.0
+        camera_diagonal_mm = math.hypot(camera_width_mm, camera_height_mm)
+
+        context['camera_width_mm'] = camera_width_mm
+        context['camera_height_mm'] = camera_height_mm
+        context['camera_diagonal_mm'] = camera_diagonal_mm
+
+
+        arcsec_pixel = camera.pixelSize / camera.lensFocalLength * 206.2648
+        context['arcsec_pixel'] = arcsec_pixel
+        context['dms_pixel'] = self.decdeg2dms(arcsec_pixel / 3600.0)
+        context['arcsec_um'] = arcsec_pixel / camera.pixelSize
+        context['deg2_px'] = (arcsec_pixel / 3600) ** 2
+
+
+        image_circle_diameter = int(camera.lensImageCircle)  # might be null
+        context['image_circle_diameter'] = image_circle_diameter
+        context['image_circle_diameter_mm'] = image_circle_diameter * camera.pixelSize / 1000.0
+
+
+        #circle_of_confusion = camera_diagonal_mm / 1730
+        circle_of_confusion = 2 * (camera.pixelSize * (10 ** -3))
+
+        context['hyperfocal_distance_mm'] = ((camera.lensFocalLength ** 2) / (camera.lensFocalRatio * circle_of_confusion)) + camera.lensFocalLength
+
+        # thin lens equation
+        #context['hyperfocal_distance_mm'] = (camera.lensFocalLength ** 2) / (camera.lensFocalRatio * circle_of_confusion)
+
+        # Geometric limit
+        #context['geometric_distance_mm'] = (camera.lensFocalLength ** 2) / ((camera.pixelSize * (10 ** -3)) / camera.lenFocalRatio)
+
+
+        # Fresnel Distance - 450nm (blue) - Near-Field
+        #context['fresnel_distance_mm'] = (lens_aperature_mm ** 2) / (450 * (10 ** -6))
+
+        # Fraunhofer Infinity Threshold - 450nm (blue) - Strict Far-Field Zone
+        context['fraunhofer_distance_mm'] = (2 * (lens_aperature_mm ** 2)) / (450 * (10 ** -6))
+
+
+        # since the arcsec/px increases near the edges of the image, this factor tries to account for that
+        arcsec_pix_factor = 1.2
+
+        if image_circle_diameter <= camera.width:
+            arcsec_fov_width = image_circle_diameter * arcsec_pixel * arcsec_pix_factor
+        else:
+            arcsec_fov_width = camera.width * arcsec_pixel * arcsec_pix_factor
+
+        if image_circle_diameter <= camera.height:
+            arcsec_fov_height = image_circle_diameter * arcsec_pixel * arcsec_pix_factor
+        else:
+            arcsec_fov_height = camera.height * arcsec_pixel * arcsec_pix_factor
+
+        camera_diagonal = math.hypot(camera.width, camera.height)  # this cannot be used to calculate distance
+        if image_circle_diameter <= camera_diagonal:
+            arcsec_fov_diagonal = image_circle_diameter * arcsec_pixel * arcsec_pix_factor
+        else:
+            arcsec_fov_diagonal = camera_diagonal * arcsec_pixel * arcsec_pix_factor
+
+
+        #context['arcsec_fov_width'] = arcsec_fov_width
+        #context['arcsec_fov_height'] = arcsec_fov_height
+
+        context['deg_fov_width'] = arcsec_fov_width / 3600
+        context['deg_fov_height'] = arcsec_fov_height / 3600
+        context['deg_fov_diagonal'] = arcsec_fov_diagonal / 3600
+
+        return context
+
+
+    def decdeg2dms(self, dd):
+        is_positive = dd >= 0
+        dd = abs(dd)
+        minutes, seconds = divmod(dd * 3600, 60)
+        degrees, minutes = divmod(minutes, 60)
+        degrees = degrees if is_positive else -degrees
+        return degrees, minutes, seconds
+
+
+class AjaxImageExcludeView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxImageExcludeView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            return jsonify({}), 400
+
+        form_image_exclude = IndiAllskyImageExcludeForm(data=request.json)
+
+        if not form_image_exclude.validate():
+            form_errors = form_image_exclude.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        camera_id = int(request.json['CAMERA_ID'])
+        image_id = int(request.json['EXCLUDE_IMAGE_ID'])
+        exclude = bool(request.json['EXCLUDE_EXCLUDE'])
+
+
+        try:
+            image = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(
+                    and_(
+                        IndiAllSkyDbImageTable.id == image_id,
+                        IndiAllSkyDbCameraTable.id == camera_id,
+                    )
+                )\
+                .one()
+        except NoResultFound:
+            app.logger.error('Image not found')
+            return jsonify({}), 400
+
+
+        image.exclude = exclude
+
+        IndiAllSkyDbPanoramaImageTable.query\
+            .filter(
+                and_(
+                    IndiAllSkyDbPanoramaImageTable.camera_id == image.camera_id,
+                    IndiAllSkyDbPanoramaImageTable.createDate == image.createDate,
+                )
+            )\
+            .update(
+                {'exclude': exclude},
+                synchronize_session=False,
+            )
+
+        db.session.commit()
+
+        data = {
+            'exclude' : exclude,
+        }
+
+        return jsonify(data)
+
+
+class AjaxUploadYoutubeView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxUploadYoutubeView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        camera_id = int(request.json['CAMERA_ID'])
+        video_id = int(request.json['VIDEO_ID'])
+        asset_type = int(request.json['ASSET_TYPE'])
+
+
+        if asset_type == constants.VIDEO:
+            table = IndiAllSkyDbVideoTable
+            asset_label = 'Timelapse'
+        elif asset_type == constants.MINI_VIDEO:
+            table = IndiAllSkyDbMiniVideoTable
+            asset_label = 'Mini Timelapse'
+        elif asset_type == constants.STARTRAIL_VIDEO:
+            table = IndiAllSkyDbStarTrailsVideoTable
+            asset_label = 'Star Trails Timelapse'
+        elif asset_type == constants.PANORAMA_VIDEO:
+            table = IndiAllSkyDbPanoramaVideoTable
+            asset_label = 'Panorama Timelapse'
+        else:
+            app.logger.error('Unknown video type: %d', video_id)
+            return jsonify(), 400
+
+
+        try:
+            video_entry = table.query\
+                .join(table.camera)\
+                .filter(
+                    and_(
+                        table.id == video_id,
+                        IndiAllSkyDbCameraTable.id == camera_id,
+                    )
+                )\
+                .one()
+        except NoResultFound:
+            app.logger.error('Video not found')
+            return jsonify({}), 400
+
+
+        metadata = {
+            'dayDate' : video_entry.dayDate.strftime('%Y%m%d'),
+            'night'   : video_entry.night,
+            'asset_label' : asset_label,
+        }
+
+
+        jobdata = {
+            'action'      : constants.TRANSFER_YOUTUBE,
+            'model'       : video_entry.__class__.__name__,
+            'id'          : video_entry.id,
+            'metadata'    : metadata,
+        }
+
+
+        upload_task = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.UPLOAD,
+            state=TaskQueueState.MANUAL,
+            priority=100,
+            data=jobdata,
+        )
+
+        db.session.add(upload_task)
+        db.session.commit()
+
+        message = {
+            'success-message' : 'Upload task submitted',
+        }
+
+        return jsonify(message)
+
+
+class CameraSimulatorView(TemplateView):
+    page_title = 'Camera Simulator'
+
+    def get_context(self):
+        context = super(CameraSimulatorView, self).get_context()
+
+        lens = str(request.args.get('lens', 'zwo_f1.2_2.5mm_1-2'))
+        sensor = str(request.args.get('sensor', 'imx477'))
+        offset_x = int(request.args.get('offset_x', 0))
+        offset_y = int(request.args.get('offset_y', 0))
+
+        form_data = {
+            'LENS_SELECT'   : lens,
+            'SENSOR_SELECT' : sensor,
+            'OFFSET_X'      : offset_x,
+            'OFFSET_Y'      : offset_y,
+        }
+
+        context['form_camera_simulator'] = IndiAllskyCameraSimulatorForm(data=form_data)
+
+        return context
+
+
+class TimelapseImageView(TemplateView):
+    model = IndiAllSkyDbImageTable
+    page_title = 'Timelapse Image'
+    file_view = 'indi_allsky.timelapse_image_view'
+    decorators = [login_optional_media]
+
+
+    def get_context(self):
+        context = super(TimelapseImageView, self).get_context()
+
+        context['file_view'] = self.file_view
+
+        image_id = int(request.args.get('id', -1))
+
+        if image_id == -1:
+            latest_image = self.model.query\
+                .order_by(
+                    self.model.dayDate.desc(),
+                    self.model.createDate.desc(),
+                )\
+                .first()
+
+            if latest_image:
+                image_id = latest_image.id
+
+
+        context['image_id'] = image_id
+
+
+        #createDate = datetime.fromtimestamp(timestamp)
+        #app.logger.info('Timestamp date: %s', createDate)
+
+
+        image_q = self.model.query\
+            .filter(self.model.id == image_id)
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+                # Do not serve local assets
+                image_q = image_q\
+                    .filter(
+                        or_(
+                            self.model.remote_url != sa_null(),
+                            self.model.s3_key != sa_null(),
+                        )
+                    )
+
+        #app.logger.info('SQL: %s', str(image_q))
+
+        try:
+            image = image_q.one()
+        except NoResultFound:
+            app.logger.error('Image not found')
+            context['timeofday'] = ''
+            context['createDate_full'] = 'Image not found'
+            context['image_url'] = ''
+            return context
+
+
+        if image.night:
+            context['timeofday'] = 'Night'
+        else:
+            context['timeofday'] = 'Day'
+
+        context['createDate_full'] = image.dayDate.strftime('%B %d, %Y - %H:%M:%S')
+        context['image_url'] = image.getUrl(s3_prefix=self.s3_prefix, local=local)
+
+
+        return context
+
+
+class PanoramaImageView(TimelapseImageView):
+    model = IndiAllSkyDbPanoramaImageTable
+    page_title = 'Panorama Image'
+    file_view = 'indi_allsky.panorama_image_view'
+
+
+class KeogramImageView(TimelapseImageView):
+    model = IndiAllSkyDbKeogramTable
+    page_title = 'Keogram'
+    file_view = 'indi_allsky.keogram_image_view'
+
+
+class StartrailImageView(TimelapseImageView):
+    model = IndiAllSkyDbStarTrailsTable
+    page_title = 'Startrail Image'
+    file_view = 'indi_allsky.startrail_image_view'
+
+
+class RawImageView(TimelapseImageView):
+    model = IndiAllSkyDbRawImageTable
+    page_title = 'RAW Image'
+    file_view = 'indi_allsky.raw_image_view'
+
+
+class TimelapseVideoView(TemplateView):
+    model = IndiAllSkyDbVideoTable
+    page_title = 'Timelapse Video'
+    file_view = 'indi_allsky.timelapse_video_view'
+    decorators = [login_optional_media]
+
+
+    def get_context(self):
+        context = super(TimelapseVideoView, self).get_context()
+
+        context['file_view'] = self.file_view
+
+        video_id = int(request.args.get('id', -1))
+
+        if video_id == -1:
+            latest_video = self.model.query\
+                .order_by(
+                    self.model.dayDate.desc(),
+                    self.model.createDate.desc(),
+                )\
+                .first()
+
+            if latest_video:
+                video_id = latest_video.id
+
+
+        context['video_id'] = video_id
+
+
+        video_q = self.model.query\
+            .filter(self.model.id == video_id)
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+                # Do not serve local assets
+                video_q = video_q\
+                    .filter(
+                        or_(
+                            self.model.remote_url != sa_null(),
+                            self.model.s3_key != sa_null(),
+                        )
+                    )
+
+        try:
+            video = video_q.one()
+        except NoResultFound:
+            app.logger.error('Video not found')
+            context['timeofday'] = ''
+            context['dayDate_full'] = 'Video not found'
+            context['video_url'] = ''
+            return context
+
+
+        if video.night:
+            context['timeofday'] = 'Night'
+        else:
+            context['timeofday'] = 'Day'
+
+        context['dayDate_full'] = video.dayDate.strftime('%B %d, %Y')
+        context['video_url'] = video.getUrl(s3_prefix=self.s3_prefix, local=local)
+
+
+        return context
+
+
+class MiniTimelapseVideoView(TimelapseVideoView):
+    model = IndiAllSkyDbMiniVideoTable
+    page_title = 'Mini Timelapse'
+    file_view = 'indi_allsky.mini_timelapse_video_view'
+
+
+    def get_context(self):
+        context = super(MiniTimelapseVideoView, self).get_context()
+        context['video_delete_allowed'] = False
+
+        if not context.get('video_url'):
+            return context
+
+        mini_video = self.model.query\
+            .filter(self.model.id == context['video_id'])\
+            .first()
+        if not mini_video:
+            return context
+
+        context['video_delete_allowed'] = _can_save_standard_configuration()
+        context['video_camera_id'] = mini_video.camera_id
+        context['video_source'] = (mini_video.data or {}).get('source', 'standard')
+
+        return context
+
+
+class StartrailVideoView(TimelapseVideoView):
+    model = IndiAllSkyDbStarTrailsVideoTable
+    page_title = 'Startrail Video'
+    file_view = 'indi_allsky.startrail_video_view'
+
+
+class PanoramaVideoView(TimelapseVideoView):
+    model = IndiAllSkyDbPanoramaVideoTable
+    page_title = 'Panorama Video'
+    file_view = 'indi_allsky.panorama_video_view'
+
+
+class MiniTimelapseGeneratorView(TemplateView):
+    decorators = [login_required]
+
+    page_title = 'Mini Timelapse'
+    image_loop_view = 'indi_allsky.js_image_loop_view'
+
+
+    @staticmethod
+    def _getStandardVideoDimensions(image_entry, vf_scale):
+        try:
+            source_width = int(image_entry.width)
+            source_height = int(image_entry.height)
+        except (TypeError, ValueError):
+            return None, None
+        if source_width < 1 or source_height < 1:
+            return None, None
+
+        if not vf_scale:
+            return source_width, source_height
+
+        height_match = re.fullmatch(r'-[12]:(\d+)', vf_scale)
+        if height_match:
+            output_height = int(height_match.group(1))
+            if output_height < 1:
+                return None, None
+            output_width = round(source_width * output_height / source_height)
+            return max(2, round(output_width / 2) * 2), output_height
+
+        percentage_match = re.fullmatch(r'iw\*(\.\d+):(ih\*\.\d+|-2)', vf_scale)
+        if not percentage_match:
+            return None, None
+
+        width_factor = float(percentage_match.group(1))
+        output_width = max(2, round((source_width * width_factor) / 2) * 2)
+        if percentage_match.group(2) == '-2':
+            output_height = round(source_height * output_width / source_width)
+        else:
+            height_factor = float(percentage_match.group(2).split('*')[1])
+            output_height = round(source_height * height_factor)
+
+        return output_width, max(2, round(output_height / 2) * 2)
+
+
+    def _getPanoramaContext(self, image_entry):
+        panorama_enabled = bool(
+            self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE', False)
+        )
+        panorama_data = {
+            'available'      : False,
+            'id'             : 0,
+            'url'            : '',
+            'width'          : 0,
+            'height'         : 0,
+            'circle_clipped' : False,
+        }
+        panorama_suggestions = []
+
+        if not panorama_enabled:
+            return panorama_enabled, panorama_data, panorama_suggestions
+
+        panorama_query = IndiAllSkyDbPanoramaImageTable.query\
+            .join(IndiAllSkyDbPanoramaImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .filter(IndiAllSkyDbPanoramaImageTable.exclude == sa_false())
+
+        # Panorama controls follow the same exact-asset rule as other optional
+        # downloads. Nearby panoramas are navigation choices, never substitutes.
+        panorama_image_entry = panorama_query\
+            .filter(IndiAllSkyDbPanoramaImageTable.createDate == image_entry.createDate)\
+            .order_by(IndiAllSkyDbPanoramaImageTable.id.desc())\
+            .first()
+
+        local = not self.web_nonlocal_images or (
+            self.web_local_images_admin and self.verify_admin_network()
+        )
+
+        if panorama_image_entry:
+            try:
+                panorama_path = Path(panorama_image_entry.getFilesystemPath())
+                panorama_url = ''
+                if panorama_path.stat().st_size:
+                    panorama_url = panorama_image_entry.getUrl(
+                        s3_prefix=self.s3_prefix,
+                        local=local,
+                    )
+            except (OSError, ValueError):
+                panorama_url = ''
+
+            if panorama_url:
+                panorama_image_data = panorama_image_entry.data or {}
+                circle_clipped = panorama_image_data.get('fish2pano_circle_clipped')
+                if circle_clipped is None:
+                    # Older panorama rows predate the stored source geometry.
+                    try:
+                        binning = max(int(image_entry.binmode), 1)
+                        diameter = int(self.indi_allsky_config['FISH2PANO']['DIAMETER'] / binning)
+                        offset_x = int(self.indi_allsky_config.get('LENS_OFFSET_X', 0) / binning)
+                        offset_y = int(self.indi_allsky_config.get('LENS_OFFSET_Y', 0) / binning)
+                        circle_clipped = panoramaSourceCircleClipped(
+                            image_entry.width,
+                            image_entry.height,
+                            diameter,
+                            offset_x,
+                            offset_y,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        circle_clipped = False
+
+                panorama_data = {
+                    'available'      : True,
+                    'id'             : panorama_image_entry.id,
+                    'url'            : str(panorama_url),
+                    'width'          : panorama_image_entry.width,
+                    'height'         : panorama_image_entry.height,
+                    'circle_clipped' : bool(circle_clipped),
+                }
+
+        if panorama_data['available']:
+            return panorama_enabled, panorama_data, panorama_suggestions
+
+        panorama_before = panorama_query\
+            .filter(IndiAllSkyDbPanoramaImageTable.createDate < image_entry.createDate)\
+            .order_by(
+                IndiAllSkyDbPanoramaImageTable.createDate.desc(),
+                IndiAllSkyDbPanoramaImageTable.id.desc(),
+            )\
+            .first()
+        panorama_after = panorama_query\
+            .filter(IndiAllSkyDbPanoramaImageTable.createDate > image_entry.createDate)\
+            .order_by(
+                IndiAllSkyDbPanoramaImageTable.createDate.asc(),
+                IndiAllSkyDbPanoramaImageTable.id.desc(),
+            )\
+            .first()
+
+        for direction, panorama_candidate in (
+            ('Previous panorama', panorama_before),
+            ('Next panorama', panorama_after),
+        ):
+            if not panorama_candidate:
+                continue
+
+            suggestion_image_entry = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                .filter(IndiAllSkyDbImageTable.createDate == panorama_candidate.createDate)\
+                .order_by(IndiAllSkyDbImageTable.id.desc())\
+                .first()
+
+            if not suggestion_image_entry:
+                continue
+
+            panorama_suggestions.append({
+                'label'    : direction,
+                'datetime' : panorama_candidate.createDate.strftime('%Y-%m-%d %H:%M:%S'),
+                'url'      : url_for(
+                    'indi_allsky.mini_generate_view',
+                    image_id=suggestion_image_entry.id,
+                    source='panorama',
+                ),
+            })
+
+        return panorama_enabled, panorama_data, panorama_suggestions
+
+
+    def get_context(self):
+        context = super(MiniTimelapseGeneratorView, self).get_context()
+
+        image_id = int(request.args.get('image_id', 0))
+
+        if image_id:
+            image_entry = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                .filter(IndiAllSkyDbImageTable.id == image_id)\
+                .one()
+        else:
+            # load last image
+            image_entry = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+                .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+                .first()
+
+        (
+            panorama_enabled,
+            panorama_data,
+            panorama_suggestions,
+        ) = self._getPanoramaContext(image_entry)
+
+
+        context['image_loop_view'] = self.image_loop_view
+        context['panorama_image_loop_view'] = 'indi_allsky.js_panorama_loop_view'
+
+        context['timestamp'] = int(image_entry.createDate.timestamp())
+        context['panorama'] = panorama_data
+        context['panorama_enabled'] = panorama_enabled
+        context['panorama_suggestions'] = panorama_suggestions
+        if panorama_enabled:
+            context['source_type'] = request.args.get('source', 'standard')
+        else:
+            context['source_type'] = 'standard'
+
+
+        use_night_config = self.indi_allsky_config.get('TIMELAPSE', {}).get('USE_NIGHT_CONFIG', True)
+        if use_night_config or image_entry.night:
+            bitrate = str(self.indi_allsky_config.get('FFMPEG_BITRATE', '5000k'))
+            vf_scale = self.indi_allsky_config.get('FFMPEG_VFSCALE', '')
+        else:
+            bitrate = str(self.indi_allsky_config.get('FFMPEG_BITRATE_DAY', '5000k'))
+            vf_scale = self.indi_allsky_config.get('FFMPEG_VFSCALE_DAY', '')
+
+        standard_width, standard_height = self._getStandardVideoDimensions(image_entry, vf_scale)
+        context['standard_video'] = {
+            'width'  : standard_width,
+            'height' : standard_height,
+            'codec'  : self.indi_allsky_config.get('FFMPEG_CODEC', 'libx264'),
+        }
+
+
+        bitrate_choices = dict(IndiAllskyMiniTimelapseForm.BITRATE_SELECT_choices)
+
+        def bitrate_kbps(value):
+            bitrate_match = re.fullmatch(r'(\d+)([km])', value)
+            if not bitrate_match:
+                return None
+
+            multiplier = 1000 if bitrate_match.group(2) == 'm' else 1
+            return int(bitrate_match.group(1)) * multiplier
+
+        preset_bitrates = {
+            bitrate_kbps(value): value
+            for choices in bitrate_choices.values()
+            for value, label in choices
+        }
+        bitrate = preset_bitrates.get(bitrate_kbps(bitrate), bitrate)
+
+        form_data = {
+            'CAMERA_ID'             : self.camera.id,
+            'IMAGE_ID'              : image_entry.id,
+            'PRE_SECONDS_SELECT'    : '240',
+            'POST_SECONDS_SELECT'   : '120',
+            'FRAMERATE_SELECT'      : '10',
+            'BITRATE_SELECT'        : bitrate,
+        }
+
+        form_mini_timelapse = IndiAllskyMiniTimelapseForm(data=form_data)
+        if bitrate not in preset_bitrates.values():
+            bitrate_choices = {
+                'Configured default': (
+                    (bitrate, '{0:s} — configured default'.format(bitrate)),
+                ),
+                **bitrate_choices,
+            }
+        form_mini_timelapse.BITRATE_SELECT.choices = bitrate_choices
+        context['form_mini_timelapse'] = form_mini_timelapse
+
+        return context
+
+
+class AjaxMiniTimelapseGeneratorView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def __init__(self, **kwargs):
+        super(AjaxMiniTimelapseGeneratorView, self).__init__(**kwargs)
+
+
+    def _parseMiniVideoRequest(self, request_data):
+        try:
+            request_values = {
+                'image_id'    : int(request_data['IMAGE_ID']),
+                'camera_id'   : int(request_data['CAMERA_ID']),
+                'pre_seconds' : int(request_data['PRE_SECONDS']),
+                'post_seconds': int(request_data['POST_SECONDS']),
+                'framerate'   : float(request_data['FRAMERATE']),
+                'bitrate'     : request_data.get('BITRATE'),
+                'note'        : str(request_data.get('NOTE') or ''),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None, 'Check the selected time range and speed, then try again.'
+
+        if not request_values['note'].strip():
+            return None, 'Enter a description for this video.'
+        if len(request_values['note']) > 255:
+            return None, 'Keep the description to 255 characters or fewer.'
+        if request_values['bitrate'] is not None:
+            request_values['bitrate'] = str(request_values['bitrate'])
+        if (
+            request_values['bitrate'] is not None
+            and not re.fullmatch(r'\d+[km]', request_values['bitrate'])
+        ):
+            return None, 'Choose a valid bitrate/file size, then try again.'
+        if (
+            request_values['pre_seconds'] < 1
+            or request_values['pre_seconds'] > 43200
+            or request_values['post_seconds'] < 1
+            or request_values['post_seconds'] > 43200
+            or not math.isfinite(request_values['framerate'])
+            or request_values['framerate'] <= 0
+            or request_values['framerate'] > 60
+        ):
+            return None, 'Check the selected time range and speed, then try again.'
+
+        return request_values, None
+
+
+    def _queueMiniVideo(self, action, job_kwargs):
+        task_mini_video = IndiAllSkyDbTaskQueueTable(
+            queue=TaskQueueQueue.VIDEO,
+            state=TaskQueueState.MANUAL,
+            priority=100,
+            data={
+                'action' : action,
+                'kwargs' : job_kwargs,
+            },
+        )
+        db.session.add(task_mini_video)
+        db.session.commit()
+
+        return jsonify({
+            'success-message' : 'Your mini timelapse is being created. Check Mini Timelapses in a few minutes.',
+        })
+
+
+    def _queuePanoramaMiniVideo(self, request_data):
+        if not self.indi_allsky_config.get('FISH2PANO', {}).get('ENABLE', False):
+            json_data = {
+                'failure-message' : 'Panorama creation is turned off in the Image Processing settings.',
+            }
+            return jsonify(json_data), 400
+
+        request_values, error_message = self._parseMiniVideoRequest(request_data)
+        if error_message:
+            return jsonify({'failure-message': error_message}), 400
+
+        try:
+            panorama_image_id = int(request_data['PANORAMA_IMAGE_ID'])
+        except (KeyError, TypeError, ValueError):
+            json_data = {
+                'failure-message' : 'Check the selected time range and speed, then try again.',
+            }
+            return jsonify(json_data), 400
+
+        try:
+            image_entry = IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == request_values['camera_id'])\
+                .filter(IndiAllSkyDbImageTable.id == request_values['image_id'])\
+                .one()
+
+            panorama_image_entry = IndiAllSkyDbPanoramaImageTable.query\
+                .join(IndiAllSkyDbPanoramaImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == request_values['camera_id'])\
+                .filter(IndiAllSkyDbPanoramaImageTable.id == panorama_image_id)\
+                .filter(IndiAllSkyDbPanoramaImageTable.exclude == sa_false())\
+                .one()
+
+            # Nearby panoramas are offered as links, never silent substitutes.
+            if panorama_image_entry.createDate != image_entry.createDate:
+                raise ValueError('The selected panorama does not match the selected image')
+
+            selection = validatePanoramaMiniTimelapseRequest(
+                panorama_image_entry.width,
+                panorama_image_entry.height,
+                request_data,
+            )
+        except (KeyError, NoResultFound, TypeError, ValueError) as e:
+            app.logger.warning('Invalid panorama mini timelapse selection: %s', str(e))
+            json_data = {
+                'failure-message' : 'The selected panorama area is not valid. Reset the area and try again.',
+            }
+            return jsonify(json_data), 400
+
+        request_values.update({
+            'panorama_image_id' : panorama_image_id,
+            'crop_x'            : selection['crop_x'],
+            'crop_y'            : selection['crop_y'],
+            'crop_width'        : selection['crop_width'],
+            'crop_height'       : selection['crop_height'],
+            'aspect_ratio'      : selection['aspect_ratio'],
+            'pan_mode'          : selection['pan_mode'],
+            'end_crop_x'        : selection['end_crop_x'],
+            'end_crop_y'        : selection['end_crop_y'],
+            'pan_direction'     : selection['pan_direction'],
+        })
+        return self._queueMiniVideo('generatePanoramaMiniVideo', request_values)
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            json_data = {
+                'failure-message' : 'You do not have permission to create mini timelapses.',
+            }
+            return jsonify(json_data), 400
+
+        request_data = request.get_json(silent=True) or {}
+        source_type = str(request_data.get('SOURCE_TYPE', 'standard'))
+        if source_type == 'panorama':
+            return self._queuePanoramaMiniVideo(request_data)
+        if source_type != 'standard':
+            json_data = {
+                'failure-message' : 'Choose all-sky images or panorama images.',
+            }
+            return jsonify(json_data), 400
+
+
+        request_values, error_message = self._parseMiniVideoRequest(request_data)
+        if error_message:
+            return jsonify({'failure-message': error_message}), 400
+
+
+        # sanity check
+        try:
+            IndiAllSkyDbImageTable.query\
+                .join(IndiAllSkyDbImageTable.camera)\
+                .filter(IndiAllSkyDbCameraTable.id == request_values['camera_id'])\
+                .filter(IndiAllSkyDbImageTable.id == request_values['image_id'])\
+                .one()
+        except NoResultFound:
+            json_data = {
+                'failure-message' : 'The selected image is no longer available. Choose another image.',
+            }
+            return jsonify(json_data), 400
+
+
+        return self._queueMiniVideo('generateMiniVideo', request_values)
+
+
+class FileSpaceUsageView(TemplateView):
+    decorators = [login_required]
+
+    page_title = 'File Space Usage'
+
+    def get_context(self):
+        context = super(FileSpaceUsageView, self).get_context()
+
+
+        total_size = 0
+        total_count = 0
+        file_data_dict = dict()
+
+
+        ### images
+        days_fileSize_images = self.get_table_fileSize(IndiAllSkyDbImageTable, self.camera.id)
+        image_total_size, image_total_count = self.update_dict(file_data_dict, days_fileSize_images, 'Images')
+        total_size += image_total_size
+        total_count += image_total_count
+
+
+        ### panorama images
+        days_fileSize_panorama_images = self.get_table_fileSize_nothumbs(IndiAllSkyDbPanoramaImageTable, self.camera.id)
+        panorama_image_total_size, panorama_image_total_count = self.update_dict(file_data_dict, days_fileSize_panorama_images, 'Panoramas')
+        total_size += panorama_image_total_size
+        total_count += panorama_image_total_count
+
+
+        ### timelapse videos
+        days_fileSize_videos = self.get_table_fileSize_nothumbs(IndiAllSkyDbVideoTable, self.camera.id)
+        videos_total_size, videos_total_count = self.update_dict(file_data_dict, days_fileSize_videos, 'Timelapses')
+        total_size += videos_total_size
+        total_count += videos_total_count
+
+
+        ### panorama timelapses
+        days_fileSize_panorama_videos = self.get_table_fileSize_nothumbs(IndiAllSkyDbPanoramaVideoTable, self.camera.id)
+        panorama_videos_total_size, panorama_videos_total_count = self.update_dict(file_data_dict, days_fileSize_panorama_videos, 'Panorama Timelapses')
+        total_size += panorama_videos_total_size
+        total_count += panorama_videos_total_count
+
+
+        # keograms are not a significant usage of sapce
+        ### keograms
+        #days_fileSize_keograms = self.get_table_fileSize_nothumbs(IndiAllSkyDbKeogramTable, self.camera.id)
+        #keograms_total_size, keograms_total_count = self.update_dict(file_data_dict, days_fileSize_keograms, 'Keograms')
+        #total_size += keograms_total_size
+        #total_count += keograms_total_count
+
+
+        # startrails are not a significant usage of sapce
+        ### star trails
+        #days_fileSize_startrails = self.get_table_fileSize_nothumbs(IndiAllSkyDbStarTrailsTable, self.camera.id)
+        #startrails_total_size, startrails_total_count = self.update_dict(file_data_dict, days_fileSize_startrails, 'Star Trails')
+        #total_size += startrails_total_size
+        #total_count += startrails_total_count
+
+
+        ### star trail timelapses
+        days_fileSize_startrail_videos = self.get_table_fileSize_nothumbs(IndiAllSkyDbStarTrailsVideoTable, self.camera.id)
+        startrail_videos_total_size, startrail_videos_total_count = self.update_dict(file_data_dict, days_fileSize_startrail_videos, 'Star Trail Timelapses')
+        total_size += startrail_videos_total_size
+        total_count += startrail_videos_total_count
+
+
+        ### fits
+        days_fileSize_fits = self.get_table_fileSize_nothumbs(IndiAllSkyDbFitsImageTable, self.camera.id)
+        fits_total_size, fits_total_count = self.update_dict(file_data_dict, days_fileSize_fits, 'FITS')
+        total_size += fits_total_size
+        total_count += fits_total_count
+
+
+        ### raw images
+        days_fileSize_raw = self.get_table_fileSize_nothumbs(IndiAllSkyDbRawImageTable, self.camera.id)
+        raw_total_size, raw_total_count = self.update_dict(file_data_dict, days_fileSize_raw, 'Raw Images')
+        total_size += raw_total_size
+        total_count += raw_total_count
+
+
+        #app.logger.info('Data: %s', str(file_data_dict))
+
+        context['days_fileSize_dict'] = file_data_dict
+
+
+        return context
+
+
+    def get_table_fileSize(self, table, camera_id):
+        days_fileSize = db.session.query(
+            func.distinct(table.dayDate).label('dayDate_distinct'),
+            func.sum(table.fileSize).label('dayDate_sum'),
+            table.night,
+            func.count(table.id).label('file_count'),
+            func.sum(IndiAllSkyDbThumbnailTable.fileSize).label('thumbnail_sum'),
+            func.count(IndiAllSkyDbThumbnailTable.id).label('thumbnail_count'),
+        )\
+            .join(table.camera)\
+            .join(IndiAllSkyDbThumbnailTable)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(IndiAllSkyDbThumbnailTable.uuid == table.thumbnail_uuid)\
+            .filter(table.fileSize != sa_null())\
+            .group_by(table.dayDate, table.night)\
+            .order_by(table.dayDate.desc())
+
+        return days_fileSize
+
+
+    def get_table_fileSize_nothumbs(self, table, camera_id):
+        days_fileSize = db.session.query(
+            func.distinct(table.dayDate).label('dayDate_distinct'),
+            func.sum(table.fileSize).label('dayDate_sum'),
+            table.night,
+            func.count(table.id).label('file_count'),
+            literal_column('0').label('thumbnail_sum'),  # simulate data
+            literal_column('0').label('thumbnail_count'),  # simulate data
+        )\
+            .join(table.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .filter(table.fileSize != sa_null())\
+            .group_by(table.dayDate, table.night)\
+            .order_by(table.dayDate.desc())
+
+
+        return days_fileSize
+
+
+    def update_dict(self, file_dict, fileSize_query, label):
+        total_size = 0
+        total_count = 0
+
+
+        for day in fileSize_query:
+            day_size = 0
+            day_count = 0
+
+            if db.engine.dialect.name == 'mysql':
+                # mysql returns a date object
+                dayDate = day.dayDate_distinct
+            else:
+                # sqlite returns a string
+                dayDate = datetime.strptime(day.dayDate_distinct, '%Y-%m-%d').date()
+
+
+            dayDate_str = dayDate.strftime('%Y-%m-%d')
+
+
+            if not file_dict.get(dayDate_str):
+                file_dict[dayDate_str] = dict()
+
+
+            if day.night:
+                tod = 'Night'
+            else:
+                tod = 'Day'
+
+
+            if not file_dict[dayDate_str].get(tod):
+                file_dict[dayDate_str][tod] = {
+                    'tod_fileSize' : 0,
+                    'tod_count'    : 0,
+                }
+
+
+            # ensure initial 0 values for all types
+            for x in ['Images', 'Panoramas', 'Timelapses', 'Panorama Timelapses', 'Keograms', 'Star Trails', 'Star Trail Timelapses', 'FITS', 'Raw Images', 'Thumbnails']:
+                if not file_dict[dayDate_str][tod].get(x):
+                    file_dict[dayDate_str][tod][x] = {
+                        'fileSize' : 0,
+                        'count'    : 0,
+                    }
+
+
+            file_data = {
+                'fileSize' : day.dayDate_sum if day.dayDate_sum else 0,
+                'count'    : day.file_count,
+            }
+
+
+            thumbnail_sum = day.thumbnail_sum if day.thumbnail_sum else 0
+            thumbnail_count = day.thumbnail_count
+
+
+            file_dict[dayDate_str][tod][label] = file_data
+            file_dict[dayDate_str][tod]['Thumbnails']['fileSize'] += thumbnail_sum
+            file_dict[dayDate_str][tod]['Thumbnails']['count'] += thumbnail_count
+
+
+            day_size += file_data['fileSize']
+            day_size += thumbnail_sum
+
+            day_count += file_data['count']
+            day_count += thumbnail_count
+
+
+            # totals for time of day
+            file_dict[dayDate_str][tod]['tod_fileSize'] += day_size
+            file_dict[dayDate_str][tod]['tod_count'] += day_count
+
+
+            # add to total
+            total_size += file_dict[dayDate_str][tod]['tod_fileSize']
+            total_count += file_dict[dayDate_str][tod]['tod_count']
+
+
+        return total_size, total_count
+
+
+class LongTermKeogramView(TemplateView):
+    page_title = 'Long Term Keogram'
+
+
+    def get_context(self):
+        context = super(LongTermKeogramView, self).get_context()
+
+        data = {
+            'CAMERA_ID' : self.camera.id
+        }
+
+        context['form_longterm_keogram'] = IndiAllskyLongTermKeogramForm(data=data)
+
+
+        # Load cached longterm keogram if it exists
+        longterm_keogram_image_p = Path(app.config['INDI_ALLSKY_IMAGE_FOLDER']).joinpath('ccd_{0:s}'.format(self.camera.uuid), 'longterm_keogram.jpg')
+        if longterm_keogram_image_p.is_file():
+            image_age_s = time.time() - longterm_keogram_image_p.stat().st_mtime
+
+            image_age_days = int(image_age_s / 86400)
+            image_age_hours = int((image_age_s % 86400) / 3600)
+            image_age_minutes = int(((image_age_s % 86400) % 3600 ) / 60)
+
+            context['keogram_age'] = 'Generated {0:d} days, {1:d} hours, {2:d} minutes ago'.format(image_age_days, image_age_hours, image_age_minutes)
+            context['keogram_uri'] = str(Path('images').joinpath('ccd_{0:s}'.format(self.camera.uuid), 'longterm_keogram.jpg'))
+        else:
+            context['keogram_age'] = ''
+            context['keogram_uri'] = ''
+
+
+        return context
+
+
+class JsonLongTermKeogramView(JsonView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    def dispatch_request(self):
+        import cv2
+        from PIL import Image
+
+        form_longterm_keogram = IndiAllskyLongTermKeogramForm(data=request.json)
+
+        if not form_longterm_keogram.validate():
+            form_errors = form_longterm_keogram.errors  # this must be a property
+            return jsonify(form_errors), 400
+
+
+        camera_id = int(request.json['CAMERA_ID'])
+        end = str(request.json['END_SELECT'])
+        query_days = int(request.json['DAYS_SELECT'])
+        period_pixels = int(request.json['PIXELS_SELECT'])
+        alignment_seconds = int(request.json['ALIGNMENT_SELECT'])
+        offset_seconds = int(request.json['OFFSET_SELECT'])
+        reverse = bool(request.json['REVERSE'])
+        label = bool(request.json['LABEL'])
+
+
+        if query_days > 2000:
+            # sanity check (more than 5 years)
+            json_data = {
+                'failure-message' : 'Try again',
+            }
+            return jsonify(json_data), 400
+
+
+        if alignment_seconds < 5:
+            # sanity check
+            json_data = {
+                'failure-message' : 'Try again',
+            }
+            return jsonify(json_data), 400
+
+        if offset_seconds > 43200:
+            # sanity check
+            json_data = {
+                'failure-message' : 'Try again',
+            }
+            return jsonify(json_data), 400
+
+
+        self.cameraSetup(camera_id=camera_id)
+
+
+        keogram_start = time.time()
+
+        if end == 'today':
+            tomorrow = datetime.now() + timedelta(hours=24)  # need to start noon tomorrow
+            query_end_date = datetime.strptime(tomorrow.strftime('%Y%m%d_120000'), '%Y%m%d_%H%M%S')
+            query_start_date = query_end_date - timedelta(days=query_days)
+        elif end == 'thisyear':
+            thisyear = datetime.now().year
+            query_end_date = datetime.strptime('{0:d}1231_120000'.format(thisyear), '%Y%m%d_%H%M%S')
+            query_start_date = query_end_date - timedelta(days=query_days)
+        elif end == 'lastyear':
+            lastyear = datetime.now().year - 1
+            query_end_date = datetime.strptime('{0:d}1231_120000'.format(lastyear), '%Y%m%d_%H%M%S')
+            query_start_date = query_end_date - timedelta(days=query_days)
+        else:
+            json_data = {
+                'failure-message' : 'Invalid end selection',
+            }
+            return jsonify(json_data), 400
+
+
+        from ..longTermKeogram import LongTermKeogramGenerator
+        ltg_gen = LongTermKeogramGenerator(self.indi_allsky_config)
+        ltg_gen.camera_id = self.camera.id
+        ltg_gen.days = query_days
+        ltg_gen.alignment_seconds = alignment_seconds
+        ltg_gen.offset_seconds = offset_seconds
+        ltg_gen.period_pixels = period_pixels
+        ltg_gen.reverse = reverse
+        ltg_gen.label = label
+
+        keogram_data = ltg_gen.generate(query_start_date, query_end_date)
+
+
+        jpg_compress_level = self.indi_allsky_config.get('IMAGE_FILE_COMPRESSION', {}).get('jpg', 95)
+        #png_compress_level = self.indi_allsky_config.get('IMAGE_FILE_COMPRESSION', {}).get('png', 5)
+
+
+        ### OpenCV
+        #_, image_a = cv2.imencode('.png', keogram_data, [cv2.IMWRITE_PNG_COMPRESSION, png_compress_level])
+        #image_buffer = io.BytesIO(image_a.tobytes())
+
+
+        json_data = {
+            'failure-message' : '',
+        }
+
+
+        ### pillow
+        image_buffer = io.BytesIO()
+        img = Image.fromarray(cv2.cvtColor(keogram_data, cv2.COLOR_BGR2RGB))
+        img.save(image_buffer, format='JPEG', compress_level=jpg_compress_level)
+
+
+        # Save longterm keogram so it can be cached and loaded later
+        # It may take longer than 180 seconds to generate the keogram and the browser will stop
+        #  waiting for the image and drop the connection.  The flask process will usually continue
+        #  and should save the image to the filesystem
+        longterm_keogram_image_p = Path(app.config['INDI_ALLSKY_IMAGE_FOLDER']).joinpath('ccd_{0:s}'.format(self.camera.uuid), 'longterm_keogram.jpg')
+
+        try:
+            with io.open(str(longterm_keogram_image_p), 'wb') as lt_image_f:
+                app.logger.info('Writing keogram: %s', longterm_keogram_image_p)
+                lt_image_f.write(image_buffer.getbuffer())
+        except (PermissionError, FileNotFoundError) as e:
+            app.logger.error('Creating keogram failed: %s', str(e))
+            json_data['failure-message'] = 'Exception: {0:s}'.format(str(e))
+
+
+        json_image_b64 = base64.b64encode(image_buffer.getvalue())
+
+
+        keogram_elapsed_s = time.time() - keogram_start
+        app.logger.warning('Long Term Keogram in %0.4f s', keogram_elapsed_s)
+
+
+        json_data['image_b64'] = json_image_b64.decode('utf-8'),
+        json_data['processing_time'] = round(keogram_elapsed_s, 3)
+        json_data['success-message'] = ''
+
+
+        return jsonify(json_data)
+
+
+class NetworkManagerView(TemplateView):
+    decorators = [login_required]
+    page_title = 'Network'
+
+    def getNetworkIps(self):
+        net_info = psutil.net_if_addrs()
+
+        net_list = list()
+        for dev, addr_info in net_info.items():
+            if dev == 'lo':
+                # skip loopback
+                continue
+
+            dev_info = {
+                'name'  : dev,
+                'inet4' : [],
+                'inet6' : [],
+            }
+
+            for addr in addr_info:
+                if addr.family == socket.AF_INET:
+                    cidr = ipaddress.IPv4Network('0.0.0.0/{0:s}'.format(addr.netmask)).prefixlen
+                    dev_info['inet4'].append('{0:s}/{1:d}'.format(addr.address, cidr))
+
+                elif addr.family == socket.AF_INET6:
+                    dev_info['inet6'].append('{0:s}'.format(addr.address))
+
+            net_list.append(dev_info)
+
+        return net_list
+
+    def get_context(self):
+        context = super(NetworkManagerView, self).get_context()
+
+        try:
+            context['hostname'] = socket.gethostname().split('.')[0]
+        except IndexError:
+            context['hostname'] = 'UNKNOWN'
+
+
+        try:
+            # detect if network manager is available
+            bus = dbus.SystemBus()
+            bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager")
+            nm_installed = True
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            nm_installed = False
+
+
+        context['nm_installed'] = nm_installed
+        context['form_connections'] = IndiAllskyNetworkManagerForm()
+        context['net_list'] = self.getNetworkIps()
+
+        return context
+
+
+class AjaxNetworkManagerView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    nm_conn_states = {
+        'Unknown'      : 0,
+        'Activating'   : 1,
+        'Active'       : 2,
+        'Deactivating' : 3,
+        'Not Active'   : 4,
+    }
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            json_data = {
+                'failure-message' : 'User does not have permission to access this resource',
+            }
+            return jsonify(json_data), 400
+
+
+        command = str(request.json['COMMAND'])
+
+
+        if command == 'deactivate':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.deactivateConnection(connection_uuid)
+
+        elif command == 'delete':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.deleteConnection(connection_uuid)
+
+        elif command == 'activate':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.activateConnection(connection_uuid)
+
+        elif command == 'autostart':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.setAutostartConnection(connection_uuid, auto_connect=True)
+
+        elif command == 'noautostart':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.setAutostartConnection(connection_uuid, auto_connect=False)
+
+        elif command == 'incpriority':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.incrementConnectionPriority(connection_uuid)
+
+        elif command == 'decpriority':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.decrementConnectionPriority(connection_uuid)
+
+        elif command == 'powersavedisable':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.setPowersave(connection_uuid, powersave=False)
+
+        elif command == 'powersaveenable':
+            connection_uuid = str(request.json['CONNECTION'])
+            return self.setPowersave(connection_uuid, powersave=True)
+
+        elif command == 'scanap':
+            interface = str(request.json['INTERFACE'])
+
+            if not interface:
+                return jsonify({
+                    'failure-message' : 'No interface selected',
+                }), 400
+
+            return self.scanAPs(interface)
+
+        elif command == 'connectap':
+            interface = str(request.json['INTERFACE'])
+            ap_path = str(request.json['AP_PATH'])
+            psk = str(request.json['PSK'])
+            priority = int(request.json['PRIORITY'])
+            retries = int(request.json['RETRIES'])
+
+            if not ap_path:
+                return jsonify({
+                    'failure-message' : 'No AP selected',
+                }), 400
+
+            return self.connectAP(interface, ap_path, psk, priority, retries)
+
+        elif command == 'createhotspot':
+            interface = str(request.json['INTERFACE'])
+            ssid = str(request.json['SSID'])
+            band = str(request.json['BAND'])
+            psk = str(request.json['PSK'])
+            nosecurity = bool(request.json['NOSECURITY'])
+
+            if not interface:
+                return jsonify({
+                    'failure-message' : 'No interface selected',
+                }), 400
+
+            if not ssid:
+                return jsonify({
+                    'failure-message' : 'No SSID data',
+                }), 400
+
+            if band not in ('bg', 'a'):
+                return jsonify({
+                    'failure-message' : 'Invalid band selection',
+                }), 400
+
+            if nosecurity:
+                # no encryption
+                pass
+            elif len(psk) < 8:
+                return jsonify({
+                    'failure-message' : 'PSK must be 8+ characters',
+                }), 400
+
+
+            return self.createHotspot(interface, ssid, band, psk, nosecurity=nosecurity)
+        else:
+            json_data = {
+                'failure-message' : 'Unknown command',
+            }
+            return jsonify(json_data), 400
+
+
+    def activateConnection(self, connection_uuid):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+        if settings_dict['connection']['type'] not in ('802-11-wireless', '802-3-ethernet'):
+            return jsonify({
+                'failure-message' : 'Only Ethernet and Wireless connections can be managed',
+            }), 400
+
+
+        nm = bus.get_object(
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager")
+
+        manager = dbus.Interface(
+            nm,
+            "org.freedesktop.NetworkManager")
+
+
+        try:
+            #device_path = nm_interface.GetDeviceByIpIface("xxx")
+            connection_path = manager.ActivateConnection(settings_path, '/', '/')
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        connection_props = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", connection_path),
+            "org.freedesktop.DBus.Properties"
+        )
+
+
+        # Wait until connection is established. This may take a few seconds.
+        app.logger.info("Waiting for connection")
+
+
+        state = None
+        for _ in range(30):
+            time.sleep(1.0)
+            # Loop until desired state is detected.
+            try:
+                state = connection_props.Get(
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "State")
+                #app.logger.info('Connection state: %d', int(state))
+            except dbus.exceptions.DBusException as e:
+                app.logger.error('D-Bus Exception: %s', str(e))
+
+            if int(state) == self.nm_conn_states['Active']:
+                app.logger.warning("Connection established!")
+                break
+        else:
+            app.logger.error('Connection failed to activate')
+            return jsonify({
+                'failure-message' : 'Connection failed to activate',
+            }), 400
+
+
+        return jsonify({
+            'success-message' : 'Connection Activated',
+        })
+
+
+    def deactivateConnection(self, connection_uuid):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        nm = bus.get_object(
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager")
+
+
+        try:
+            conn_path = self.getActiveConnection(bus, nm, connection_uuid)
+        except NotFound:
+            app.logger.error('Active connection not found')
+            return jsonify({
+                'failure-message' : 'Active connection not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+        if settings_dict['connection']['type'] not in ('802-11-wireless', '802-3-ethernet'):
+            return jsonify({
+                'failure-message' : 'Only Ethernet and Wireless connections can be managed',
+            }), 400
+
+
+
+        manager = dbus.Interface(
+            nm,
+            "org.freedesktop.NetworkManager")
+
+
+        try:
+            manager.DeactivateConnection(conn_path)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Failed to deactivate connection: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Connection deactivated',
+        })
+
+
+    def deleteConnection(self, connection_uuid):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        nm = bus.get_object(
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager")
+
+
+        try:
+            self.getActiveConnection(bus, nm, connection_uuid)
+            return jsonify({
+                'failure-message' : 'Cannot delete active connections',
+            }), 400
+        except NotFound:
+            pass
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+        if settings_dict['connection']['type'] not in ('802-11-wireless', '802-3-ethernet'):
+            return jsonify({
+                'failure-message' : 'Only Ethernet and Wireless connections can be managed',
+            }), 400
+
+
+        settings.Delete()
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Connection deleted',
+        })
+
+
+    def setAutostartConnection(self, connection_uuid, auto_connect=True):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+
+        ### Here is the magic
+        settings_dict['connection']['autoconnect'] = auto_connect
+
+
+        try:
+            settings_connection.Update(settings_dict)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Configure Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Configure Successful',
+        })
+
+
+    def incrementConnectionPriority(self, connection_uuid, increment=10):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+
+
+        ### Here is the magic
+        try:
+            current_priority = int(settings_dict['connection']['autoconnect-priority'])
+        except TypeError:
+            current_priority = 0
+        except ValueError:
+            current_priority = 0
+        except KeyError:
+            current_priority = 0
+
+
+        new_priority = current_priority + increment
+        settings_dict['connection']['autoconnect-priority'] = new_priority
+
+
+        try:
+            settings_connection.Update(settings_dict)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Configure Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Priority Updated',
+        })
+
+
+    def decrementConnectionPriority(self, connection_uuid, increment=-10):
+        return self.incrementConnectionPriority(connection_uuid, increment=increment)
+
+
+    def setPowersave(self, connection_uuid, powersave=False):
+        bus = dbus.SystemBus()
+
+
+        try:
+            nm_settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager/Settings")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        try:
+            settings_path = self.getSettingsPath(bus, nm_settings, connection_uuid)
+        except NotFound:
+            app.logger.error('Connection settings not found')
+            return jsonify({
+                'failure-message' : 'Connection settings not found',
+            }), 400
+
+
+        settings = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", settings_path),
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_connection = dbus.Interface(
+            settings,
+            "org.freedesktop.NetworkManager.Settings.Connection")
+
+
+        settings_dict = settings_connection.GetSettings()
+
+
+        if settings_dict['connection']['type'] != '802-11-wireless':
+            return jsonify({
+                'failure-message' : 'Powersave only valid for wifi connections',
+            }), 400
+
+
+        if powersave:
+            nm_powersave = 3  # enabled
+        else:
+            nm_powersave = 2  # disabled
+
+        settings_dict['802-11-wireless']['powersave'] = nm_powersave
+
+
+        try:
+            settings_connection.Update(settings_dict)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Configure Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Configure Successful',
+        })
+
+
+    def getSettingsPath(self, bus, nm_settings, connection_uuid):
+        settingspath_list = nm_settings.Get(
+            "org.freedesktop.NetworkManager.Settings",
+            "Connections",
+            dbus_interface=dbus.PROPERTIES_IFACE)
+
+
+        for settings_path in settingspath_list:
+            settings = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                settings_path)
+
+
+            settings_connection = dbus.Interface(
+                settings,
+                "org.freedesktop.NetworkManager.Settings.Connection")
+
+            settings_dict = settings_connection.GetSettings()
+            #app.logger.info('Settings: %s', settings_dict)
+
+            settings_uuid = str(settings_dict['connection']['uuid'])
+
+
+            if settings_uuid == connection_uuid:
+                return settings_path
+        else:
+            raise NotFound('Connection settings not found')
+
+
+    def getActiveConnection(self, bus, nm, connection_uuid):
+        # get active connections
+        connpath_list = nm.Get(
+            "org.freedesktop.NetworkManager",
+            "ActiveConnections",
+            dbus_interface=dbus.PROPERTIES_IFACE)
+
+
+        for conn_path in connpath_list:
+            conn = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                conn_path)
+
+
+            conn_uuid = conn.Get(
+                "org.freedesktop.NetworkManager.Connection.Active",
+                "Uuid",
+                dbus_interface=dbus.PROPERTIES_IFACE)
+
+
+            if str(conn_uuid) == connection_uuid:
+                return conn_path
+
+        else:
+            raise NotFound('Connection settings not found')
+
+
+    def scanAPs(self, interface_name):
+        bus = dbus.SystemBus()
+
+        try:
+            manager_bus_object = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        manager = dbus.Interface(
+            manager_bus_object,
+            "org.freedesktop.NetworkManager")
+
+        manager_props = dbus.Interface(
+            manager_bus_object,
+            "org.freedesktop.DBus.Properties")
+
+
+        # Enable Wireless. If Wireless is already enabled, this does nothing.
+        wifi_enabled = manager_props.Get(
+            "org.freedesktop.NetworkManager",
+            "WirelessEnabled")
+
+        if not wifi_enabled:
+            app.logger.warning('Enabling WiFi')
+            manager_props.Set(
+                "org.freedesktop.NetworkManager",
+                "WirelessEnabled",
+                True)
+
+            # Give the WiFi adapter some time to scan for APs. This is absolutely
+            # the wrong way to do it, and the program should listen for
+            # AccessPointAdded() signals, but it will do.
+            time.sleep(10)
+
+
+        device_path = manager.GetDeviceByIpIface(interface_name)
+        device = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", device_path),
+            "org.freedesktop.NetworkManager.Device.Wireless"
+        )
+
+
+        try:
+            device.RequestScan(dbus.Dictionary({}, signature='sv'))
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'RequestScan Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(10.0)
+
+
+        try:
+            accesspoints_paths_list = device.GetAccessPoints()
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Scan APs Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        ap_list = list()
+        for ap_path in accesspoints_paths_list:
+            ap_props = dbus.Interface(
+                bus.get_object("org.freedesktop.NetworkManager", ap_path),
+                "org.freedesktop.DBus.Properties"
+            )
+
+            ap_ssid = ap_props.Get(
+                "org.freedesktop.NetworkManager.AccessPoint",
+                "Ssid")
+
+            ap_strength = ap_props.Get(
+                "org.freedesktop.NetworkManager.AccessPoint",
+                "Strength")
+
+            ap_frequency = ap_props.Get(
+                "org.freedesktop.NetworkManager.AccessPoint",
+                "Frequency")
+
+            ap_hwaddress = ap_props.Get(
+                "org.freedesktop.NetworkManager.AccessPoint",
+                "HwAddress")
+
+
+            str_ap_ssid = "".join(chr(i) for i in ap_ssid)
+            app.logger.info("Found SSID: %s", str_ap_ssid)
+
+
+            ap_frequency_int = int(ap_frequency)
+
+            if ap_frequency_int > 5999:
+                ap_frequency_str = '6 GHz'
+            elif ap_frequency_int > 3000:
+                ap_frequency_str = '5 GHz'
+            else:
+                ap_frequency_str = '2.4 GHz'
+
+
+            ap_list.append({
+                'path' : str(ap_path),
+                'ssid' : str_ap_ssid,
+                'ap_hwaddress' : ap_hwaddress,
+                'desc' : '{0:s} [{1:s}] - {2:s} - {3:d}%'.format(str_ap_ssid, ap_hwaddress, ap_frequency_str, int.from_bytes(str(ap_strength).encode())),
+                'strength' : int.from_bytes(str(ap_strength).encode()),  # need to sort on this key
+                'frequency' : ap_frequency_int,
+            })
+
+
+        ap_list_sorted = sorted(ap_list, key=lambda x: (x['strength'], x['ap_hwaddress']), reverse=True)
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Scan Successful',
+            'data' : ap_list_sorted,
+        })
+
+
+    def connectAP(self, interface_name, ap_path, psk, priority, retries):
+        bus = dbus.SystemBus()
+
+        manager_bus_object = bus.get_object(
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager")
+
+        manager = dbus.Interface(
+            manager_bus_object,
+            "org.freedesktop.NetworkManager")
+
+
+        device_path = manager.GetDeviceByIpIface(interface_name)
+
+
+        connection_params = {
+            'connection' : {
+                'type' : '802-11-wireless',
+                'autoconnect' : True,
+                'autoconnect-priority' : priority,
+                'autoconnect-retries' : retries,
+            },
+            '802-11-wireless': {
+                'security': '802-11-wireless-security',
+                'powersave': 2,  # disable power saving
+            },
+            '802-11-wireless-security': {
+                'key-mgmt': 'wpa-psk',
+                'psk': psk,
+            },
+        }
+
+
+        try:
+            # Establish the connection.
+            settings_path, connection_path = manager.AddAndActivateConnection(connection_params, device_path, ap_path)
+            #app.logger.info("settings_path = %s", settings_path)
+            #app.logger.info("connection_path = %s", connection_path)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Connect AP Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        connection_props = dbus.Interface(
+            bus.get_object("org.freedesktop.NetworkManager", connection_path),
+            "org.freedesktop.DBus.Properties"
+        )
+
+
+        # Wait until connection is established. This may take a few seconds.
+        app.logger.info("Waiting for wireless connection")
+
+
+        state = None
+        for _ in range(30):
+            time.sleep(1.0)
+            # Loop until desired state is detected.
+            #
+            # A timeout should be implemented here, otherwise the program will
+            # get stuck if connection fails.
+            #
+            # IF PASSWORD IS BAD, NETWORK MANAGER WILL DISPLAY A QUERY DIALOG!
+            #
+            # Also, if connection is disconnected at this point, the Get()
+            # method will raise an org.freedesktop.DBus.Error.UnknownMethod
+            # exception. This should also be anticipated.
+            try:
+                state = connection_props.Get(
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "State")
+                #app.logger.info('Connection state: %d', int(state))
+            except dbus.exceptions.DBusException as e:
+                app.logger.error('D-Bus Exception: %s (psk may be incorrect)', str(e))
+
+
+                ### remove the connection
+                #manager.DeactivateConnection(connection_path)
+                settings = dbus.Interface(
+                    bus.get_object("org.freedesktop.NetworkManager", settings_path),
+                    "org.freedesktop.NetworkManager.Settings.Connection")
+
+                settings.Delete()
+
+
+                return jsonify({
+                    'failure-message' : 'Connect AP Failed: {0:s} (PSK may be incorrect)'.format(str(e)),
+                }), 400
+
+
+            if int(state) == self.nm_conn_states['Active']:
+                app.logger.warning("Wireless connection established!")
+                break
+        else:
+            app.logger.error('Wireless connection failed')
+            return jsonify({
+                'failure-message' : 'Connect AP Failed: Wireless connection failed',
+            }), 400
+
+
+        return jsonify({
+            'success-message' : 'Connection Successful',
+        })
+
+
+    def createHotspot(self, interface_name, ssid, band, psk, nosecurity=False):
+        bus = dbus.SystemBus()
+
+        try:
+            nm = bus.get_object(
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager")
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'Connect AP Failed: {0:s}'.format(str(e)),
+            }), 400
+
+
+        manager = dbus.Interface(
+            nm,
+            "org.freedesktop.NetworkManager")
+
+
+        nm_settings = bus.get_object(
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager/Settings")
+
+        settings_manager = dbus.Interface(
+            nm_settings,
+            "org.freedesktop.NetworkManager.Settings")
+
+
+        # ensure device exists
+        manager.GetDeviceByIpIface(interface_name)
+
+
+        connection_params = {
+            'connection' : {
+                'type' : '802-11-wireless',
+                'autoconnect' : True,
+                'autoconnect-priority' : -90,
+                'id' : ssid,
+                'interface-name' : interface_name,
+            },
+            '802-11-wireless': {
+                'mode' : 'ap',
+                'ssid' : dbus.ByteArray(ssid.encode('utf-8')),
+                'powersave': 2,  # disable power saving
+                'band' : band,
+            },
+            'ipv4' : {
+                # DNS not allowed for shared
+                'method' : 'shared',
+                'addresses' : [
+                    [
+                        dbus.UInt32(self.ip2int('10.42.0.1')),
+                        dbus.UInt32(24),
+                        dbus.UInt32(self.ip2int('0.0.0.0')),
+                    ],
+                ],
+            },
+            'ipv6' : {
+                'method' : 'link-local',
+            },
+        }
+
+
+        if not nosecurity:
+            connection_params['802-11-wireless']['security'] = '802-11-wireless-security'
+            connection_params['802-11-wireless-security'] = {
+                'key-mgmt': 'wpa-psk',
+                'psk': psk,
+                'proto' : ['rsn'],
+                'group' : ['ccmp'],
+                'pairwise' : ['ccmp'],
+            }
+
+
+        try:
+            # Create the connection.
+            settings_manager.AddConnection(connection_params)
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            return jsonify({
+                'failure-message' : 'D-Bus Exception: {0:s}'.format(str(e)),
+            }), 400
+
+
+        time.sleep(2.0)  # give some time for system to register
+
+        return jsonify({
+            'success-message' : 'Hotspot Created',
+        })
+
+
+    def ip2int(self, ip_str):
+        import struct
+        return struct.unpack('=I', socket.inet_aton(ip_str))[0]
+
+
+class DriveManagerView(TemplateView):
+    decorators = [login_required]
+    page_title = 'Drives'
+
+    def get_context(self):
+        context = super(DriveManagerView, self).get_context()
+
+
+        try:
+            # detect if udisks2 is available
+            bus = dbus.SystemBus()
+            bus.get_object(
+                "org.freedesktop.UDisks2",
+                "/org/freedesktop/UDisks2")
+            udisks2_installed = True
+        except dbus.exceptions.DBusException as e:
+            app.logger.error('D-Bus Exception: %s', str(e))
+            udisks2_installed = False
+
+
+        context['udisks2_installed'] = udisks2_installed
+
+        context['form_drives'] = IndiAllskyDriveManagerForm()
+
+        return context
+
+
+class AjaxDriveManagerView(BaseView):
+    methods = ['POST']
+    decorators = [login_required]
+
+
+    protected_filesystems = (
+        '/',
+        '/boot',
+        '/boot/firmware',
+        '/boot/efi',
+        '/var',
+        '/home',
+        '/tmp',
+        '/var/tmp',
+        '/run',
+        '/dev',
+        '/dev/shm',
+    )
+
+
+    def __init__(self, **kwargs):
+        super(AjaxDriveManagerView, self).__init__(**kwargs)
+
+
+    def dispatch_request(self):
+        if not current_user.is_admin:
+            json_data = {
+                'failure-message' : 'User does not have permission to access this resource',
+            }
+            return jsonify(json_data), 400
+
+
+        command = str(request.json['COMMAND'])
+
+
+        if command == 'getmetadata':
+            query_drive_id = str(request.json['DRIVE_ID'])
+            return self.getMetadata(query_drive_id)
+        if command == 'poweroff':
+            query_drive_id = str(request.json['DRIVE_ID'])
+            return self.powerOffDrive(query_drive_id)
+        if command == 'unmount':
+            query_device_id = str(request.json['DEVICE_ID'])
+            return self.unmountDevice(query_device_id)
+        if command == 'mount':
+            query_device_id = str(request.json['DEVICE_ID'])
+            return self.mountDevice(query_device_id)
+        else:
+            json_data = {
+                'failure-message' : 'Unknown command',
+            }
+            return jsonify(json_data), 400
+
+
+    def getMetadata(self, query_drive_id):
+        bus = dbus.SystemBus()
+
+
+        nm_udisks2 = bus.get_object(
+            "org.freedesktop.UDisks2",
+            "/org/freedesktop/UDisks2")
+
+        iface = dbus.Interface(
+            nm_udisks2,
+            'org.freedesktop.DBus.ObjectManager')
+
+
+        object_paths = iface.GetManagedObjects()
+
+        for object_path in object_paths:
+            if not object_path.startswith('/org/freedesktop/UDisks2/drives/'):
+                continue
+
+
+            settings = bus.get_object(
+                "org.freedesktop.UDisks2",
+                object_path)
+
+            settings_connection = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.DBus.Properties')
+
+            settings_dict = settings_connection.GetAll('org.freedesktop.UDisks2.Drive')
+
+
+            drive_id = str(settings_dict['Id'])
+            if query_drive_id != drive_id:
+                continue
+
+
+            TimeDetected = int(settings_dict['TimeDetected'])
+            drive_TimeDetected = datetime.fromtimestamp(TimeDetected / 1000 / 1000)
+
+            TimeMediaDetected = int(settings_dict['TimeMediaDetected'])
+            if TimeMediaDetected:
+                drive_TimeMediaDetected = datetime.fromtimestamp(TimeMediaDetected / 1000 / 1000)
+            else:
+                drive_TimeMediaDetected = ''
+
+
+            drive_data = [
+                [0, 'Id', drive_id],
+                [1, 'Vendor', str(settings_dict['Vendor'])],
+                [2, 'Model', str(settings_dict['Model'])],
+                [3, 'Size', '{0:0.1f} GB'.format(float(settings_dict['Size']) / 1024 / 1024 / 1024)],
+                [4, 'ConnectionBus', str(settings_dict['ConnectionBus'])],
+                [5, 'Serial', str(settings_dict['Serial'])],
+                [6, 'Media', str(settings_dict['Media'])],
+                [7, 'MediaCompatibility', ', '.join(str(x) for x in settings_dict['MediaCompatibility'])],
+                [8, 'CanPowerOff', bool(settings_dict['CanPowerOff'])],
+                [9, 'Removable', bool(settings_dict['Removable'])],
+                [10, 'Ejectable', bool(settings_dict['Ejectable'])],
+                [11, 'TimeDetected', drive_TimeDetected],
+                [12, 'TimeMediaDetected', drive_TimeMediaDetected],
+            ]
+
+
+            return_data = {
+                'success-message' : '',
+                'drive_data' : drive_data,
+            }
+
+            return jsonify(return_data)
+
+
+        # fail if drive not found
+        return jsonify({'failure-message' : 'Drive not found'}), 400
+
+
+    def powerOffDrive(self, query_drive_id):
+        bus = dbus.SystemBus()
+
+
+        nm_udisks2 = bus.get_object(
+            "org.freedesktop.UDisks2",
+            "/org/freedesktop/UDisks2")
+
+        iface = dbus.Interface(
+            nm_udisks2,
+            'org.freedesktop.DBus.ObjectManager')
+
+
+        object_paths = iface.GetManagedObjects()
+
+        for object_path in object_paths:
+            if not object_path.startswith('/org/freedesktop/UDisks2/drives/'):
+                continue
+
+
+            settings = bus.get_object(
+                "org.freedesktop.UDisks2",
+                object_path)
+
+            settings_connection = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.DBus.Properties')
+
+
+
+            settings_dict = settings_connection.GetAll('org.freedesktop.UDisks2.Drive')
+
+
+            drive_id = str(settings_dict['Id'])
+            if query_drive_id != drive_id:
+                continue
+
+
+            CanPowerOff = bool(settings_dict['CanPowerOff'])
+            if not CanPowerOff:
+                return jsonify({'failure-message' : 'Drive cannot be powered off'}), 400
+
+
+
+            drive_interface = dbus.Interface(
+                bus.get_object('org.freedesktop.UDisks2', object_path),
+                'org.freedesktop.UDisks2.Drive')
+
+
+            try:
+                drive_interface.PowerOff({})
+            except dbus.exceptions.DBusException as e:
+                app.logger.error('D-Bus Exception: %s', str(e))
+                return jsonify({'failure-message' : str(e)}), 400
+
+
+            return_data = {
+                'success-message' : 'Power Off Successful'
+            }
+            return jsonify(return_data)
+
+
+        # fail if drive not found
+        return jsonify({'failure-message' : 'Drive not found'}), 400
+
+
+    def unmountDevice(self, query_device_id):
+        bus = dbus.SystemBus()
+
+
+        nm_udisks2 = bus.get_object(
+            "org.freedesktop.UDisks2",
+            "/org/freedesktop/UDisks2")
+
+        iface = dbus.Interface(
+            nm_udisks2,
+            'org.freedesktop.DBus.ObjectManager')
+
+
+        objects = iface.GetManagedObjects()
+
+        for object_path, object_info in objects.items():
+            if not object_path.startswith('/org/freedesktop/UDisks2/block_devices/'):
+                continue
+
+
+            settings = bus.get_object(
+                "org.freedesktop.UDisks2",
+                object_path)
+
+            settings_connection = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.DBus.Properties')
+
+
+
+            settings_dict = settings_connection.GetAll('org.freedesktop.UDisks2.Block')
+
+
+            device_id = str(settings_dict['Id'])
+            if query_device_id != device_id:
+                continue
+
+
+            if len(object_info['org.freedesktop.UDisks2.Filesystem']['MountPoints']) == 0:
+                return jsonify({'failure-message' : 'Filesystem not mounted'}), 400
+
+
+            MountPoints0 = "".join(chr(i) for i in object_info['org.freedesktop.UDisks2.Filesystem']['MountPoints'][0][:-1])  # trim null char
+
+
+            app.logger.info('Unmount %s', MountPoints0)
+            if MountPoints0 in self.protected_filesystems:
+                return jsonify({'failure-message' : 'Not allowed to unmount protected filesystem: {0:s}'.format(MountPoints0)}), 400
+
+
+            fs_interface = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.UDisks2.Filesystem')
+
+
+            try:
+                fs_interface.Unmount({})
+            except dbus.exceptions.DBusException as e:
+                app.logger.error('D-Bus Exception: %s', str(e))
+                return jsonify({'failure-message' : str(e)}), 400
+
+
+            return_data = {
+                'success-message' : 'Unmount Successful'
+            }
+            return jsonify(return_data)
+
+
+        # fail if drive not found
+        return jsonify({'failure-message' : 'Device not found'}), 400
+
+
+    def mountDevice(self, query_device_id):
+        bus = dbus.SystemBus()
+
+
+        nm_udisks2 = bus.get_object(
+            "org.freedesktop.UDisks2",
+            "/org/freedesktop/UDisks2")
+
+        iface = dbus.Interface(
+            nm_udisks2,
+            'org.freedesktop.DBus.ObjectManager')
+
+
+        objects = iface.GetManagedObjects()
+
+        for object_path, object_info in objects.items():
+            if not object_path.startswith('/org/freedesktop/UDisks2/block_devices/'):
+                continue
+
+
+            settings = bus.get_object(
+                "org.freedesktop.UDisks2",
+                object_path)
+
+            settings_connection = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.DBus.Properties')
+
+
+
+            settings_dict = settings_connection.GetAll('org.freedesktop.UDisks2.Block')
+
+
+            device_id = str(settings_dict['Id'])
+            if query_device_id != device_id:
+                continue
+
+
+            if len(object_info['org.freedesktop.UDisks2.Filesystem']['MountPoints']) > 1:
+                return jsonify({'failure-message' : 'Filesystem already mounted'}), 400
+
+
+            fs_interface = dbus.Interface(
+                settings,
+                dbus_interface='org.freedesktop.UDisks2.Filesystem')
+
+
+            try:
+                fs_interface.Mount({})
+            except dbus.exceptions.DBusException as e:
+                app.logger.error('D-Bus Exception: %s', str(e))
+                return jsonify({'failure-message' : str(e)}), 400
+
+
+            return_data = {
+                'success-message' : 'Mount Successful'
+            }
+            return jsonify(return_data)
+
+
+        # fail if drive not found
+        return jsonify({'failure-message' : 'Device not found'}), 400
+
+
+class ImageCircleHelperView(TemplateView):
+    decorators = [login_required]
+
+    page_title = 'Image Circle Helper'
+    model = IndiAllSkyDbImageTable
+
+
+    def get_context(self):
+        context = super(ImageCircleHelperView, self).get_context()
+
+
+        form_data = {
+            'IMAGE_CIRCLE_DIAMETER' : self.camera.lensImageCircle,
+            'OFFSET_X' : self.indi_allsky_config.get('LENS_OFFSET_X', 0),
+            'OFFSET_Y' : self.indi_allsky_config.get('LENS_OFFSET_Y', 0),
+            'KEOGRAM_ANGLE' : self.indi_allsky_config.get('KEOGRAM_ANGLE', 90.0),
+        }
+
+        context['form_imagecircle'] = IndiAllskyImageCircleHelperForm(data=form_data)
+
+
+        # limit time period for performance
+        camera_now_minus_10days = self.camera_now - timedelta(days=10)
+
+        latest_image_q = self.model.query\
+            .join(self.model.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
+            .filter(self.model.createDate > camera_now_minus_10days)\
+
+
+        local = True  # default to local assets
+        if self.web_nonlocal_images:
+            if self.web_local_images_admin and self.verify_admin_network():
+                pass
+            else:
+                local = False
+
+                # Do not serve local assets
+                latest_image_q = latest_image_q\
+                    .filter(
+                        or_(
+                            self.model.remote_url != sa_null(),
+                            self.model.s3_key != sa_null(),
+                        )
+                    )
+
+
+        latest_image = latest_image_q\
+            .order_by(self.model.createDate.desc())\
+            .first()
+
+
+        if latest_image:
+            context['latest_image_url'] = latest_image.getUrl(s3_prefix=self.s3_prefix, local=local)
+
+
+        return context
+
+
+class AstroPanelView(TemplateView):
+    page_title = 'astropanel'
+
+    def get_context(self):
+        context = super(AstroPanelView, self).get_context()
+        return context
+
+
+class AjaxAstroPanelView(BaseView):
+    """
+    Copyright(c) 2019 Radek Kaczorek  <rkaczorek AT gmail DOT com>
+
+    Ported from https://github.com/rkaczorek/astropanel.git
+    """
+
+    methods = ['GET', 'POST']
+
+
+    def dispatch_request(self):
+        camera_id = int(request.args['camera_id'])
+
+        if request.method == 'GET':
+            return self.get(camera_id)
+        else:
+            return jsonify({}), 400
+
+
+    def get(self, camera_id):
+        camera = IndiAllSkyDbCameraTable.query\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .one()
+
+
+        satellites_visual = IndiAllSkyDbTleDataTable.query\
+            .filter(IndiAllSkyDbTleDataTable.group == constants.SATELLITE_VISUAL)\
+            .order_by(IndiAllSkyDbTleDataTable.title)\
+
+
+        # init observer
+        obs = ephem.Observer()
+
+        # set geo position
+        obs.lat = math.radians(camera.latitude)
+        obs.lon = math.radians(camera.longitude)
+        obs.elevation = camera.elevation
+
+        # disable atmospheric refraction calcs
+        obs.pressure = 0
+
+        # update time
+        utcnow = datetime.now(tz=timezone.utc)
+
+        obs.date = utcnow
+
+        sun = ephem.Sun()
+        mercury = ephem.Mercury()
+        venus = ephem.Venus()
+        moon = ephem.Moon()
+        mars = ephem.Mars()
+        jupiter = ephem.Jupiter()
+        saturn = ephem.Saturn()
+        uranus = ephem.Uranus()
+        neptune = ephem.Neptune()
+
+        polaris_data = self.astropanel_get_polaris_data(obs)
+
+        sun_position = self.astropanel_get_body_positions(obs, sun)
+        sun_twilights = self.astropanel_get_sun_twilights(obs, sun)
+        mercury_position = self.astropanel_get_body_positions(obs, mercury)
+        venus_position = self.astropanel_get_body_positions(obs, venus)
+        moon_position = self.astropanel_get_body_positions(obs, moon)
+        mars_position = self.astropanel_get_body_positions(obs, mars)
+        jupiter_position = self.astropanel_get_body_positions(obs, jupiter)
+        saturn_position = self.astropanel_get_body_positions(obs, saturn)
+        uranus_position = self.astropanel_get_body_positions(obs, uranus)
+        neptune_position = self.astropanel_get_body_positions(obs, neptune)
+
+
+        obs.date = utcnow
+        sun.compute(obs)
+        mercury.compute(obs)
+        venus.compute(obs)
+        moon.compute(obs)
+        mars.compute(obs)
+        jupiter.compute(obs)
+        saturn.compute(obs)
+        uranus.compute(obs)
+        neptune.compute(obs)
+
+
+        satellite_list = list()
+        for sat_entry in satellites_visual:
+            try:
+                sat = ephem.readtle(sat_entry.title, sat_entry.line1, sat_entry.line2)
+            except ValueError as e:
+                app.logger.error('Satellite TLE data error: %s', str(e))
+                continue
+
+            sat.compute(obs)
+
+            try:
+                # all next_pass() values can be None
+                next_pass = obs.next_pass(sat)
+            except ValueError as e:
+                app.logger.error('Next pass error: %s', str(e))
+                continue
+
+
+            sat_data = {
+                'name'      : str(sat_entry.title).upper(),
+                'az'        : round(math.degrees(sat.az), 2),
+                'alt'       : round(math.degrees(sat.alt), 2),
+                'elevation' : int(sat.elevation / 1000),
+                'eclipsed'  : sat.eclipsed,
+            }
+
+
+            if not isinstance(next_pass[0], type(None)) and not isinstance(next_pass[4], type(None)):
+                sat_data['rise'] = '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(next_pass[0])),
+                sat_data['duration'] = '{0:d}'.format((ephem.localtime(next_pass[4]) - ephem.localtime(next_pass[0])).seconds),
+            else:
+                sat_data['rise'] = 'None'
+                sat_data['duration'] = 'None'
+
+
+            if not isinstance(next_pass[2], type(None)):
+                sat_data['transit'] = '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(next_pass[2])),
+            else:
+                sat_data['transit'] = 'None'
+
+            if not isinstance(next_pass[4], type(None)):
+                sat_data['set'] = '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(next_pass[4])),
+            else:
+                sat_data['set'] = 'None'
+
+
+            satellite_list.append(sat_data)
+
+
+        # sort by altitude
+        satellite_list = sorted(satellite_list, key=lambda x: x['alt'], reverse=True)
+
+
+        data = {
+            'latitude'              : round(obs.lat, 2),
+            'longitude'             : round(obs.lon, 2),
+            'elevation'             : int(obs.elevation),
+            'polaris_hour_angle'    : round(polaris_data[0], 5),
+            'polaris_next_transit'  : '{0:s}'.format(polaris_data[1]),
+            'polaris_alt'           : round(math.degrees(polaris_data[2]), 2),
+            'moon_phase'            : self.astropanel_get_moon_phase(obs),
+            'moon_light'            : int(moon.phase),
+            'moon_rise'             : '{0:s}'.format(moon_position[0]),
+            'moon_transit'          : '{0:s}'.format(moon_position[1]),
+            'moon_set'              : '{0:s}'.format(moon_position[2]),
+            'moon_az'               : round(math.degrees(moon.az), 2),
+            'moon_alt'              : round(math.degrees(moon.alt), 2),
+            'moon_ra'               : '{0:s}'.format(str(moon.ra)),
+            'moon_dec'              : '{0:s}'.format(str(moon.dec)),
+            'moon_new'              : '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(ephem.next_new_moon(utcnow))),
+            'moon_full'             : '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(ephem.next_full_moon(utcnow))),
+            'sun_at_start'          : sun_twilights[2][0],
+            'sun_ct_start'          : sun_twilights[0][0],
+            'sun_rise'              : '{0:s}'.format(sun_position[0]),
+            'sun_transit'           : '{0:s}'.format(sun_position[1]),
+            'sun_set'               : '{0:s}'.format(sun_position[2]),
+            'sun_ct_end'            : sun_twilights[0][1],
+            'sun_at_end'            : sun_twilights[2][1],
+            'sun_az'                : round(math.degrees(sun.az), 2),
+            'sun_alt'               : round(math.degrees(sun.alt), 2),
+            'sun_ra'                : '{0:s}'.format(str(sun.ra)),
+            'sun_dec'               : '{0:s}'.format(str(sun.dec)),
+            'sun_equinox'           : '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(ephem.next_equinox(utcnow))),
+            'sun_solstice'          : '{0:%Y-%m-%d %H:%M:%S}'.format(ephem.localtime(ephem.next_solstice(utcnow))),
+            'mercury_rise'          : '{0:s}'.format(mercury_position[0]),
+            'mercury_transit'       : '{0:s}'.format(mercury_position[1]),
+            'mercury_set'           : '{0:s}'.format(mercury_position[2]),
+            'mercury_az'            : round(math.degrees(mercury.az), 2),
+            'mercury_alt'           : round(math.degrees(mercury.alt), 2),
+            'venus_rise'            : '{0:s}'.format(venus_position[0]),
+            'venus_transit'         : '{0:s}'.format(venus_position[1]),
+            'venus_set'             : '{0:s}'.format(venus_position[2]),
+            'venus_az'              : round(math.degrees(venus.az), 2),
+            'venus_alt'             : round(math.degrees(venus.alt), 2),
+            'mars_rise'             : '{0:s}'.format(mars_position[0]),
+            'mars_transit'          : '{0:s}'.format(mars_position[1]),
+            'mars_set'              : '{0:s}'.format(mars_position[2]),
+            'mars_az'               : round(math.degrees(mars.az), 2),
+            'mars_alt'              : round(math.degrees(mars.alt), 2),
+            'jupiter_rise'          : '{0:s}'.format(jupiter_position[0]),
+            'jupiter_transit'       : '{0:s}'.format(jupiter_position[1]),
+            'jupiter_set'           : '{0:s}'.format(jupiter_position[2]),
+            'jupiter_az'            : round(math.degrees(jupiter.az), 2),
+            'jupiter_alt'           : round(math.degrees(jupiter.alt), 2),
+            'saturn_rise'           : '{0:s}'.format(saturn_position[0]),
+            'saturn_transit'        : '{0:s}'.format(saturn_position[1]),
+            'saturn_set'            : '{0:s}'.format(saturn_position[2]),
+            'saturn_az'             : round(math.degrees(saturn.az), 2),
+            'saturn_alt'            : round(math.degrees(saturn.alt), 2),
+            'uranus_rise'           : '{0:s}'.format(uranus_position[0]),
+            'uranus_transit'        : '{0:s}'.format(uranus_position[1]),
+            'uranus_set'            : '{0:s}'.format(uranus_position[2]),
+            'uranus_az'             : round(math.degrees(uranus.az), 2),
+            'uranus_alt'            : round(math.degrees(uranus.alt), 2),
+            'neptune_rise'          : '{0:s}'.format(neptune_position[0]),
+            'neptune_transit'       : '{0:s}'.format(neptune_position[1]),
+            'neptune_set'           : '{0:s}'.format(neptune_position[2]),
+            'neptune_az'            : round(math.degrees(neptune.az), 2),
+            'neptune_alt'           : round(math.degrees(neptune.alt), 2),
+            'satellite_list'        : satellite_list,
+        }
+
+        return jsonify(data)
+
+
+    def astropanel_get_moon_phase(self, obs):
+        target_date_utc = obs.date
+        target_date_local = ephem.localtime(target_date_utc).date()
+        next_full = ephem.localtime(ephem.next_full_moon(target_date_utc)).date()
+        next_new = ephem.localtime(ephem.next_new_moon(target_date_utc)).date()
+        next_last_quarter = ephem.localtime(ephem.next_last_quarter_moon(target_date_utc)).date()
+        next_first_quarter = ephem.localtime(ephem.next_first_quarter_moon(target_date_utc)).date()
+        previous_full = ephem.localtime(ephem.previous_full_moon(target_date_utc)).date()
+        previous_new = ephem.localtime(ephem.previous_new_moon(target_date_utc)).date()
+        previous_last_quarter = ephem.localtime(ephem.previous_last_quarter_moon(target_date_utc)).date()
+        previous_first_quarter = ephem.localtime(ephem.previous_first_quarter_moon(target_date_utc)).date()
+
+        if target_date_local in (next_full, previous_full):
+            return 'Full'
+        elif target_date_local in (next_new, previous_new):
+            return 'New'
+        elif target_date_local in (next_first_quarter, previous_first_quarter):
+            return 'First Quarter'
+        elif target_date_local in (next_last_quarter, previous_last_quarter):
+            return 'Last Quarter'
+        elif previous_new < next_first_quarter < next_full < next_last_quarter < next_new:
+            return 'Waxing Crescent'
+        elif previous_first_quarter < next_full < next_last_quarter < next_new < next_first_quarter:
+            return 'Waxing Gibbous'
+        elif previous_full < next_last_quarter < next_new < next_first_quarter < next_full:
+            return 'Waning Gibbous'
+        elif previous_last_quarter < next_new < next_first_quarter < next_full < next_last_quarter:
+            return 'Waning Crescent'
+
+
+    def astropanel_get_body_positions(self, obs, body):
+        utcnow = datetime.now(tz=timezone.utc)
+
+        obs.date = utcnow
+        body.compute(obs)
+
+
+        positions = []
+
+        # test for always below horizon or always above horizon
+        try:
+            if ephem.localtime(obs.previous_rising(body)).date() == ephem.localtime(obs.date).date() and obs.previous_rising(body) < obs.previous_transit(body) < obs.previous_setting(body) < obs.date:
+                positions.append(obs.previous_rising(body))
+                positions.append(obs.previous_transit(body))
+                positions.append(obs.previous_setting(body))
+            elif ephem.localtime(obs.previous_rising(body)).date() == ephem.localtime(obs.date).date() and obs.previous_rising(body) < obs.previous_transit(body) < obs.date < obs.next_setting(body):
+                positions.append(obs.previous_rising(body))
+                positions.append(obs.previous_transit(body))
+                positions.append(obs.next_setting(body))
+            elif ephem.localtime(obs.previous_rising(body)).date() == ephem.localtime(obs.date).date() and obs.previous_rising(body) < obs.date < obs.next_transit(body) < obs.next_setting(body):
+                positions.append(obs.previous_rising(body))
+                positions.append(obs.next_transit(body))
+                positions.append(obs.next_setting(body))
+            elif ephem.localtime(obs.previous_rising(body)).date() == ephem.localtime(obs.date).date() and obs.date < obs.next_rising(body) < obs.next_transit(body) < obs.next_setting(body):
+                positions.append(obs.next_rising(body))
+                positions.append(obs.next_transit(body))
+                positions.append(obs.next_setting(body))
+            else:
+                positions.append(obs.next_rising(body))
+                positions.append(obs.next_transit(body))
+                positions.append(obs.next_setting(body))
+        except (ephem.NeverUpError, ephem.AlwaysUpError):
+            try:
+                if ephem.localtime(obs.previous_transit(body)).date() == ephem.localtime(obs.date).date() and obs.previous_transit(body) < obs.date:
+                    positions.append('-')
+                    positions.append(obs.previous_transit(body))
+                    positions.append('-')
+                elif ephem.localtime(obs.previous_transit(body)).date() == ephem.localtime(obs.date).date() and obs.next_transit(body) > obs.date:
+                    positions.append('-')
+                    positions.append(obs.next_transit(body))
+                    positions.append('-')
+                else:
+                    positions.append('-')
+                    positions.append('-')
+                    positions.append('-')
+            except (ephem.NeverUpError, ephem.AlwaysUpError):
+                positions.append('-')
+                positions.append('-')
+                positions.append('-')
+
+        if positions[0] != '-':
+            positions[0] = ephem.localtime(positions[0]).strftime("%H:%M:%S")
+        if positions[1] != '-':
+            positions[1] = ephem.localtime(positions[1]).strftime("%H:%M:%S")
+        if positions[2] != '-':
+            positions[2] = ephem.localtime(positions[2]).strftime("%H:%M:%S")
+
+        return positions
+
+
+    def astropanel_get_sun_twilights(self, obs, sun):
+        results = []
+
+        """
+        An observer at the North Pole would see the Sun circle the sky at 23.5° above the horizon all day.
+        An observer at 90° – 23.5° = 66.5° would see the Sun spend the whole day on the horizon, making a circle along its circumference.
+        An observer would have to be at 90° – 23.5° – 18° = 48.5° latitude or even further south in order for the Sun to dip low enough for them to observe the level of darkness defined as astronomical twilight.
+
+        civil twilight = -6
+        nautical twilight = -12
+        astronomical twilight = -18
+
+        get_sun_twilights(home)[0][0]    -	civil twilight end
+        get_sun_twilights(home)[0][1]    -	civil twilight start
+
+        get_sun_twilights(home)[1][0]    -	nautical twilight end
+        get_sun_twilights(home)[1][1]    -	nautical twilight start
+
+        get_sun_twilights(home)[2][0]    -	astronomical twilight end
+        get_sun_twilights(home)[2][1]    -	astronomical twilight start
+        """
+
+        # remember entry observer horizon
+        obs_horizon = obs.horizon
+
+        # Twilights, their horizons and whether to use the centre of the Sun or not
+        twilights = [('-6', True), ('-12', True), ('-18', True)]
+
+        for twi in twilights:
+            obs.horizon = twi[0]
+            try:
+                rising_setting = self.astropanel_get_body_positions(obs, sun)
+                results.append((rising_setting[0], rising_setting[2]))
+            except ephem.AlwaysUpError:
+                results.append(('n/a', 'n/a'))
+
+        # reset observer horizon to entry
+        obs.horizon = obs_horizon
+
+        return results
+
+
+    def astropanel_get_polaris_data(self, obs):
+        polaris_data = []
+
+        """
+        lst = 100.46 + 0.985647 * d + lon + 15 * ut [based on http://www.stargazing.net/kepler/altaz.html]
+        d - the days from J2000 (1200 hrs UT on Jan 1st 2000 AD), including the fraction of a day
+        lon - your longitude in decimal degrees, East positive
+        ut - the universal time in decimal hours
+        """
+
+        j2000 = ephem.Date('2000/01/01 12:00:00')
+        d = obs.date - j2000
+
+        lon = math.degrees(obs.lon)
+
+        ut_hms = obs.date.datetime().strftime("%H:%M:%S").split(':')
+        ut = float(ut_hms[0]) + (float(ut_hms[1]) / 60) + (float(ut_hms[2]) / 3600)
+
+
+        lst = 100.46 + 0.985647 * d + lon + 15 * ut
+        lst = lst - int(lst / 360) * 360
+
+        polaris = ephem.readdb("Polaris,f|M|F7,2:31:48.704,89:15:50.72,2.02,2000")
+        polaris.compute()
+        polaris_ra_deg = math.degrees(polaris.ra)
+
+        # Polaris Hour Angle = LST - RA Polaris [expressed in degrees or 15*(h+m/60+s/3600)]
+        pha = lst - polaris_ra_deg
+
+        # normalize
+        if pha < 0:
+            pha += 360
+        elif pha > 360:
+            pha -= 360
+
+        # append polaris hour angle
+        polaris_data.append(pha)
+
+        # append polaris next transit
+        try:
+            polaris_data.append(ephem.localtime(obs.next_transit(polaris)).strftime("%H:%M:%S"))
+        except (ephem.NeverUpError, ephem.AlwaysUpError):
+            polaris_data.append('-')
+
+        # append polaris alt
+        polaris_data.append(polaris.alt)
+
+        return polaris_data
+
+
+class ShellView(TemplateView):
+    page_title = 'Terminal'
+    decorators = [login_required]
+
+
+def set_winsize(fd, row, col, xpix=0, ypix=0):
+    import fcntl
+    import termios
+    import struct
+    winsize = struct.pack("HHHH", row, col, xpix, ypix)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+
+class WsShellView(BaseView):
+    decorators = [login_required]
+
+    def dispatch_request(self):
+        import pty
+        import subprocess
+        import threading
+        import select
+        import simple_websocket
+
+        if not current_user.is_authenticated:
+            return 'Unauthorized', 401
+
+        if not current_user.is_admin:
+            return 'Unauthorized', 401
+
+        ws = simple_websocket.Server.accept(request.environ)
+
+        # Create pseudo-terminal
+        master_fd, slave_fd = pty.openpty()
+
+        # Set TERM environment variable
+        env = os.environ.copy()
+        env['TERM'] = 'xterm-256color'
+
+        # Spawn bash
+        proc = subprocess.Popen(
+            ['/bin/bash', '-i'],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            preexec_fn=os.setsid
+        )
+
+        # Close slave fd in parent
+        os.close(slave_fd)
+
+        # Thread to read from PTY master and write to WebSocket
+        def read_thread():
+            try:
+                while True:
+                    # Wait for data using select to avoid blocking indefinitely
+                    r, _, _ = select.select([master_fd], [], [], 1.0)
+                    if master_fd in r:
+                        data = os.read(master_fd, 4096)
+                        if not data:
+                            break
+                        ws.send(json.dumps({
+                            'type': 'output',
+                            'data': data.decode('utf-8', errors='replace')
+                        }))
+            except (simple_websocket.ConnectionClosed, OSError):
+                pass
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=read_thread)
+        t.daemon = True
+        t.start()
+
+        # Read from WebSocket and write to PTY master
+        try:
+            while True:
+                message = ws.receive()
+                if message is None:
+                    break
+                try:
+                    msg = json.loads(message)
+                    msg_type = msg.get('type')
+                    if msg_type == 'input':
+                        input_data = msg.get('data', '')
+                        os.write(master_fd, input_data.encode('utf-8'))
+                    elif msg_type == 'resize':
+                        cols = msg.get('cols')
+                        rows = msg.get('rows')
+                        if cols and rows:
+                            set_winsize(master_fd, rows, cols)
+                except Exception as e:
+                    app.logger.error("Error processing websocket message: %s", e)
+        except simple_websocket.ConnectionClosed:
+            pass
+        finally:
+            # Cleanup
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        return ''
+
+
+class WsEventsView(BaseView):
+    """
+    WebSocket Read-Only Event Stream View (/ws/events).
+    Allows live event subscribers (Home Assistant, web dashboards) to receive push events
+    (exposure_complete, sensor_update, keogram_complete, timelapse_complete).
+    Read-only: Rejects command executions.
+    """
+    decorators = []
+
+    def dispatch_request(self):
+        import simple_websocket
+        from ..events import event_manager
+
+        api_key = request.args.get('api_key') or request.args.get('token') or request.headers.get('X-API-Key')
+        if not api_key and request.headers.get('Authorization'):
+            auth_h = request.headers.get('Authorization', '')
+            if auth_h.startswith('Bearer '):
+                api_key = auth_h[7:].strip()
+
+        auth_required = app.config.get('INDI_ALLSKY_AUTH_ALL_VIEWS', False)
+        if auth_required and not current_user.is_authenticated:
+            valid_keys = set()
+            db_ws_key = str(getattr(self, 'indi_allsky_config', {}).get('WEBSOCKET_API_KEY', '')).strip()
+            if db_ws_key:
+                valid_keys.add(db_ws_key)
+            flask_ws_key = str(app.config.get('WEBSOCKET_API_KEY', '')).strip()
+            if flask_ws_key:
+                valid_keys.add(flask_ws_key)
+            secret_key = str(app.config.get('SECRET_KEY', '')).strip()
+            if secret_key and secret_key != 'CHANGEME':
+                valid_keys.add(secret_key)
+
+            if not api_key or api_key.strip() not in valid_keys:
+                return 'Unauthorized', 401
+
+        ws = simple_websocket.Server.accept(request.environ)
+        event_manager.register(ws)
+
+        try:
+            ws.send(json.dumps({
+                "event": "connected",
+                "timestamp": time.time(),
+                "data": {
+                    "server": "indi-allsky",
+                    "version": str(__version__),
+                    "endpoint": "events",
+                    "mode": "read_only",
+                    "active_clients": event_manager.client_count
+                }
+            }, default=str))
+        except Exception as e:
+            app.logger.error("Failed sending WS connected handshake: %s", e)
+            event_manager.unregister(ws)
+            return ''
+
+        try:
+            while True:
+                message = ws.receive()
+                if message is None:
+                    break
+                try:
+                    msg = json.loads(message)
+                    msg_type = msg.get('type') or msg.get('action') or msg.get('event')
+                    if msg_type == 'ping':
+                        ws.send(json.dumps({
+                            "event": "pong",
+                            "timestamp": time.time(),
+                            "data": {}
+                        }, default=str))
+                    elif msg_type == 'get_status':
+                        ws.send(json.dumps({
+                            "event": "status_response",
+                            "timestamp": time.time(),
+                            "data": {
+                                "active_clients": event_manager.client_count,
+                                "server": "indi-allsky",
+                                "version": str(__version__)
+                            }
+                        }, default=str))
+                    elif msg_type in ('get_sensors', 'sensors'):
+                        from ..sensors_mapping import get_latest_sensors_payload
+                        sensor_payload = get_latest_sensors_payload(getattr(self, 'indi_allsky_config', {}))
+                        ws.send(json.dumps({
+                            "event": "sensor_update",
+                            "timestamp": time.time(),
+                            "data": sensor_payload
+                        }, default=str))
+                    elif msg_type in ('shutdown', 'reboot', 'pause', 'unpause', 'restart_service', 'generate_keogram', 'generate_timelapse', 'generate_startrail', 'trigger_darks'):
+                        ws.send(json.dumps({
+                            "event": "error",
+                            "timestamp": time.time(),
+                            "data": {
+                                "message": f"Action command '{msg_type}' disabled on read-only /ws/events endpoint. Use authenticated /ws/control endpoint."
+                            }
+                        }, default=str))
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    app.logger.error("Error handling WS event message: %s", e)
+        except simple_websocket.ConnectionClosed:
+            pass
+        finally:
+            event_manager.unregister(ws)
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        return ''
+
+
+class WsControlView(BaseView):
+    """
+    WebSocket Authenticated Command & Control View (/ws/control).
+    Allows authorized clients (Home Assistant control entities, admin clients)
+    to execute control commands and receive live event updates.
+    Requires API key or active admin authentication session.
+    """
+    decorators = []
+
+    def rebootSystemd(self):
+        import dbus
+        system_bus = dbus.SystemBus()
+        systemd1 = system_bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.login1.Manager')
+        return manager.Reboot(False)
+
+    def poweroffSystemd(self):
+        import dbus
+        system_bus = dbus.SystemBus()
+        systemd1 = system_bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1')
+        manager = dbus.Interface(systemd1, 'org.freedesktop.login1.Manager')
+        return manager.PowerOff(False)
+
+    def dispatch_request(self):
+        import simple_websocket
+        from ..events import event_manager
+
+        api_key = request.args.get('api_key') or request.args.get('token') or request.headers.get('X-API-Key')
+        if not api_key and request.headers.get('Authorization'):
+            auth_h = request.headers.get('Authorization', '')
+            if auth_h.startswith('Bearer '):
+                api_key = auth_h[7:].strip()
+
+        # Control endpoint ALWAYS requires authentication
+        valid_keys = set()
+        db_ws_key = str(getattr(self, 'indi_allsky_config', {}).get('WEBSOCKET_API_KEY', '')).strip()
+        if db_ws_key:
+            valid_keys.add(db_ws_key)
+        flask_ws_key = str(app.config.get('WEBSOCKET_API_KEY', '')).strip()
+        if flask_ws_key:
+            valid_keys.add(flask_ws_key)
+        secret_key = str(app.config.get('SECRET_KEY', '')).strip()
+        if secret_key and secret_key != 'CHANGEME':
+            valid_keys.add(secret_key)
+
+        if not current_user.is_authenticated and (not api_key or api_key.strip() not in valid_keys):
+            app.logger.warning("WS control auth failed for client %s (provided: '%s', valid_keys count: %d)", request.remote_addr, api_key, len(valid_keys))
+            return 'Unauthorized - API key or admin session required for /ws/control', 401
+
+        ws = simple_websocket.Server.accept(request.environ)
+        event_manager.register(ws)
+
+        try:
+            ws.send(json.dumps({
+                "event": "connected",
+                "timestamp": time.time(),
+                "data": {
+                    "server": "indi-allsky",
+                    "version": str(__version__),
+                    "endpoint": "control",
+                    "mode": "read_write",
+                    "active_clients": event_manager.client_count
+                }
+            }, default=str))
+        except Exception as e:
+            app.logger.error("Failed sending WS control connected handshake: %s", e)
+            event_manager.unregister(ws)
+            return ''
+
+        try:
+            while True:
+                message = ws.receive()
+                if message is None:
+                    break
+                try:
+                    msg = json.loads(message)
+                    msg_type = msg.get('type') or msg.get('action') or msg.get('event')
+                    if msg_type == 'ping':
+                        ws.send(json.dumps({
+                            "event": "pong",
+                            "timestamp": time.time(),
+                            "data": {}
+                        }, default=str))
+                    elif msg_type == 'get_status':
+                        ws.send(json.dumps({
+                            "event": "status_response",
+                            "timestamp": time.time(),
+                            "data": {
+                                "active_clients": event_manager.client_count,
+                                "server": "indi-allsky",
+                                "version": str(__version__)
+                            }
+                        }, default=str))
+                    elif msg_type in ('get_sensors', 'sensors'):
+                        from ..sensors_mapping import get_latest_sensors_payload
+                        sensor_payload = get_latest_sensors_payload(getattr(self, 'indi_allsky_config', {}))
+                        ws.send(json.dumps({
+                            "event": "sensor_update",
+                            "timestamp": time.time(),
+                            "data": sensor_payload
+                        }, default=str))
+                    elif msg_type in ('reboot', 'shutdown'):
+                        try:
+                            if msg_type == 'reboot':
+                                self.rebootSystemd()
+                            else:
+                                self.poweroffSystemd()
+                            ws.send(json.dumps({
+                                "event": "command_result",
+                                "timestamp": time.time(),
+                                "data": {"action": msg_type, "status": "executed"}
+                            }, default=str))
+                        except Exception as sys_err:
+                            app.logger.warning("DBus system operation failed (%s), queuing task in DB", sys_err)
+                            from .models import IndiAllSkyDbTaskQueueTable, TaskQueueQueue, TaskQueueState
+                            task = IndiAllSkyDbTaskQueueTable(
+                                queue=TaskQueueQueue.MAIN,
+                                state=TaskQueueState.MANUAL,
+                                priority=100,
+                                data={'action': msg_type},
+                            )
+                            db.session.add(task)
+                            db.session.commit()
+                            ws.send(json.dumps({
+                                "event": "command_result",
+                                "timestamp": time.time(),
+                                "data": {"action": msg_type, "status": "queued", "task_id": task.id}
+                            }, default=str))
+                    elif msg_type in ('pause', 'unpause', 'reload_config', 'reload', 'generate_keogram', 'generate_timelapse', 'generate_startrail', 'trigger_darks'):
+                        from .models import IndiAllSkyDbTaskQueueTable, TaskQueueQueue, TaskQueueState
+
+                        task_name_map = {
+                            'pause': 'pause',
+                            'unpause': 'unpause',
+                            'reload_config': 'reload',
+                            'reload': 'reload',
+                            'generate_keogram': 'keogram',
+                            'generate_timelapse': 'video',
+                            'generate_startrail': 'startrail',
+                            'trigger_darks': 'darks',
+                        }
+
+                        target_action = task_name_map.get(msg_type, msg_type)
+                        task = IndiAllSkyDbTaskQueueTable(
+                            queue=TaskQueueQueue.MAIN,
+                            state=TaskQueueState.MANUAL,
+                            priority=100,
+                            data={'action': target_action},
+                        )
+                        db.session.add(task)
+                        db.session.commit()
+                        ws.send(json.dumps({
+                            "event": "command_result",
+                            "timestamp": time.time(),
+                            "data": {"action": msg_type, "status": "queued", "task_id": task.id}
+                        }, default=str))
+                    elif msg_type in ('restart_service', 'start_service', 'stop_service'):
+                        service_name = msg.get('service', 'indi-allsky')
+                        unit_map = {
+                            'indiserver': app.config.get('INDISERVER_SERVICE_NAME', 'indiserver.service'),
+                            'indi-allsky': app.config.get('ALLSKY_SERVICE_NAME', 'indi-allsky.service'),
+                            'allsky': app.config.get('ALLSKY_SERVICE_NAME', 'indi-allsky.service'),
+                            'gunicorn': app.config.get('GUNICORN_SERVICE_NAME', 'gunicorn-indi-allsky.service'),
+                        }
+                        unit_name = unit_map.get(service_name, service_name)
+                        try:
+                            if msg_type == 'stop_service':
+                                self.stopSystemdUnit(unit_name)
+                            elif msg_type == 'start_service':
+                                self.startSystemdUnit(unit_name)
+                            else:
+                                self.restartSystemdUnit(unit_name)
+                            ws.send(json.dumps({
+                                "event": "command_result",
+                                "timestamp": time.time(),
+                                "data": {"action": msg_type, "service": service_name, "status": "executed"}
+                            }, default=str))
+                        except Exception as sys_err:
+                            app.logger.warning("DBus service operation failed (%s), queuing task in DB", sys_err)
+                            from .models import IndiAllSkyDbTaskQueueTable, TaskQueueQueue, TaskQueueState
+                            task_action_prefix = "restart" if msg_type == "restart_service" else ("start" if msg_type == "start_service" else "stop")
+                            task = IndiAllSkyDbTaskQueueTable(
+                                queue=TaskQueueQueue.MAIN,
+                                state=TaskQueueState.MANUAL,
+                                priority=100,
+                                data={'action': f'{task_action_prefix}_{service_name}'},
+                            )
+                            db.session.add(task)
+                            db.session.commit()
+                            ws.send(json.dumps({
+                                "event": "command_result",
+                                "timestamp": time.time(),
+                                "data": {"action": msg_type, "service": service_name, "status": "queued", "task_id": task.id}
+                            }, default=str))
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    app.logger.error("Error handling WS control message: %s", e)
+        except simple_websocket.ConnectionClosed:
+            pass
+        finally:
+            event_manager.unregister(ws)
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        return ''
+
+
+
+class ESP32ImageView(BaseView):
+    decorators = []
+
+    VALID_SIZES = (240, 280, 320, 720, 800)
+    DEFAULT_SIZE = 240
+
+
+    def dispatch_request(self):
+        import cv2
+
+        try:
+            camera_id = int(request.args.get('camera_id', 0))
+        except (ValueError, TypeError):
+            camera_id = 0
+
+        try:
+            size = int(request.args.get('size', self.DEFAULT_SIZE))
+        except (ValueError, TypeError):
+            size = self.DEFAULT_SIZE
+
+        if size not in self.VALID_SIZES:
+            size = self.DEFAULT_SIZE
+
+        if not camera_id:
+            camera = self.getLatestCamera()
+            camera_id = camera.id
+
+        self.cameraSetup(camera_id=camera_id)
+
+        image_data = None
+
+        if self.indi_allsky_config.get('CIRCULAR_DISPLAY', {}).get('ENABLE', False):
+            image_dir = Path(self.indi_allsky_config['IMAGE_FOLDER']).absolute()
+            circular_image_p = image_dir.joinpath('circular_display.{0:s}'.format(self.indi_allsky_config['IMAGE_FILE_TYPE']))
+
+            if circular_image_p.exists():
+                image_data = self._readImage(circular_image_p)
+
+        if image_data is None:
+            image_entry = self._getLatestImage(camera_id)
+            if not image_entry:
+                return 'No image available', 404
+
+            image_p = image_entry.getFilesystemPath()
+
+            if not image_p.exists():
+                app.logger.error('ESP32: image file not found: %s', image_p)
+                return 'Image file not found', 404
+
+            image_data = self._readImage(image_p)
+            if image_data is None:
+                return 'Unable to read image', 500
+
+        image_resized = cv2.resize(image_data, (size, size), interpolation=cv2.INTER_AREA)
+
+        jpg_quality = self.indi_allsky_config.get('IMAGE_FILE_COMPRESSION', {}).get('jpg', 90)
+        _, image_bytes = cv2.imencode('.jpg', image_resized, [cv2.IMWRITE_JPEG_QUALITY, jpg_quality])
+        image_buffer = io.BytesIO(image_bytes.tobytes())
+
+        return Response(image_buffer.getvalue(), mimetype='image/jpeg')
+
+
+    def _getLatestImage(self, camera_id):
+        return IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera_id)\
+            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
+            .first()
+
+
+    def _readImage(self, image_p):
+        import cv2
+
+        if image_p.suffix in ('.jpg', '.jpeg'):
+            import simplejpeg
+            try:
+                with io.open(str(image_p), 'rb') as f:
+                    return simplejpeg.decode_jpeg(f.read(), colorspace='BGR')
+            except ValueError:
+                app.logger.error('Unable to read %s', image_p)
+                return None
+
+        elif image_p.suffix in ('.png',):
+            data = cv2.imread(str(image_p), cv2.IMREAD_COLOR)
+            if isinstance(data, type(None)):
+                app.logger.error('Unable to read %s', image_p)
+                return None
+            return data
+
+        elif image_p.suffix in ('.fit', '.fits'):
+            import numpy
+            from astropy.io import fits
+            try:
+                hdulist = fits.open(image_p)
+            except OSError:
+                app.logger.error('Unable to read %s', image_p)
+                return None
+            image_data = numpy.swapaxes(hdulist[0].data, 0, 2)
+            image_data = numpy.swapaxes(image_data, 0, 1)
+            return cv2.cvtColor(image_data, cv2.COLOR_RGB2BGR)
+
+        else:
+            import numpy
+            import PIL
+            from PIL import Image
+            try:
+                with Image.open(str(image_p)) as img_pil:
+                    return cv2.cvtColor(numpy.array(img_pil), cv2.COLOR_RGB2BGR)
+            except PIL.UnidentifiedImageError:
+                app.logger.error('Unable to read %s', image_p)
+                return None
+
+
+# images are normally served directly by the web server, this is a backup method
+@bp_allsky.route('/images/<path:path>')  # noqa: E302
+def images_folder(path):
+    app.logger.warning('Serving image file: %s', path)
+    return send_from_directory(app.config['INDI_ALLSKY_IMAGE_FOLDER'], path)
+
+
+bp_allsky.add_url_rule('/ajax/status_update', view_func=AjaxStatusUpdateView.as_view('ajax_status_update_view'))
+
+bp_allsky.add_url_rule('/js/sensor_panel', view_func=JsonSensorPanelView.as_view('js_sensor_panel_view'))
+bp_allsky.add_url_rule('/sensor_panel', view_func=SensorPanelView.as_view('sensor_panel_view', template_name='sensor_panel.html'))
+
+bp_allsky.add_url_rule('/', view_func=IndexImgView.as_view('index_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/index_canvas', view_func=IndexCanvasView.as_view('index_canvas_view', template_name='index_canvas.html'))
+bp_allsky.add_url_rule('/index_img', view_func=IndexImgView.as_view('index_img_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/js/latest', view_func=JsonLatestImageView.as_view('js_latest_image_view'))
+bp_allsky.add_url_rule('/panorama', view_func=LatestPanoramaImgView.as_view('latest_panorama_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/panorama_canvas', view_func=LatestPanoramaCanvasView.as_view('latest_panorama_canvas_view', template_name='index_canvas.html'))
+bp_allsky.add_url_rule('/panorama_img', view_func=LatestPanoramaImgView.as_view('latest_panorama_img_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/js/latest_panorama', view_func=JsonLatestPanoramaView.as_view('js_latest_panorama_view'))
+bp_allsky.add_url_rule('/raw', view_func=LatestRawImageImgView.as_view('latest_rawimage_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/raw_canvas', view_func=LatestRawImageCanvasView.as_view('latest_rawimage_canvas_view', template_name='index_canvas.html'))
+bp_allsky.add_url_rule('/raw_img', view_func=LatestRawImageImgView.as_view('latest_rawimage_img_view', template_name='index_img.html'))
+bp_allsky.add_url_rule('/js/latest_rawimage', view_func=JsonLatestRawImageView.as_view('js_latest_rawimage_view'))
+bp_allsky.add_url_rule('/realtime_keogram', view_func=RealtimeKeogramView.as_view('realtime_keogram_view', template_name='realtime_keogram.html'))
+
+bp_allsky.add_url_rule('/loop', view_func=ImageLoopImgView.as_view('image_loop_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/loop_canvas', view_func=ImageLoopCanvasView.as_view('image_loop_canvas_view', template_name='loop_canvas.html'))
+bp_allsky.add_url_rule('/loop_img', view_func=ImageLoopImgView.as_view('image_loop_img_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/js/loop', view_func=JsonImageLoopView.as_view('js_image_loop_view'))
+bp_allsky.add_url_rule('/looppanorama', view_func=PanoramaLoopImgView.as_view('panorama_loop_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/looppanorama_canvas', view_func=PanoramaLoopCanvasView.as_view('panorama_loop_canvas_view', template_name='loop_canvas.html'))
+bp_allsky.add_url_rule('/looppanorama_img', view_func=PanoramaLoopImgView.as_view('panorama_loop_img_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/js/looppanorama', view_func=JsonPanoramaLoopView.as_view('js_panorama_loop_view'))
+bp_allsky.add_url_rule('/loopraw', view_func=RawImageLoopImgView.as_view('rawimage_loop_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/loopraw_canvas', view_func=RawImageLoopCanvasView.as_view('rawimage_loop_canvas_view', template_name='loop_canvas.html'))
+bp_allsky.add_url_rule('/loopraw_img', view_func=RawImageLoopImgView.as_view('rawimage_loop_img_view', template_name='loop_img.html'))
+bp_allsky.add_url_rule('/js/loopraw', view_func=JsonRawImageLoopView.as_view('js_rawimage_loop_view'))
+
+bp_allsky.add_url_rule('/sqm', view_func=SqmView.as_view('sqm_view', template_name='sqm.html'))
+
+bp_allsky.add_url_rule('/charts', view_func=ChartView.as_view('chart_view', template_name='chart.html'))
+bp_allsky.add_url_rule('/js/charts', view_func=JsonChartView.as_view('js_chart_view'))
+
+bp_allsky.add_url_rule('/imageviewer', view_func=ImageViewerView.as_view('imageviewer_view', template_name='imageviewer.html'))
+bp_allsky.add_url_rule('/ajax/imageviewer', view_func=AjaxImageViewerView.as_view('ajax_imageviewer_view'))
+bp_allsky.add_url_rule('/ajax/exclude', view_func=AjaxImageExcludeView.as_view('ajax_image_exclude_view'))
+
+bp_allsky.add_url_rule('/fitsimageviewer', view_func=FitsImageViewerView.as_view('fitsimageviewer_view', template_name='fitsimageviewer.html'))
+bp_allsky.add_url_rule('/ajax/fitsimageviewer', view_func=AjaxFitsImageViewerView.as_view('ajax_fitsimageviewer_view'))
+bp_allsky.add_url_rule('/fits2jpeg', view_func=Fits2JpegView.as_view('fits2jpeg_view'))
+
+bp_allsky.add_url_rule('/gallery', view_func=GalleryViewerView.as_view('gallery_view', template_name='gallery.html'))
+bp_allsky.add_url_rule('/ajax/gallery', view_func=AjaxGalleryViewerView.as_view('ajax_gallery_view'))
+
+bp_allsky.add_url_rule('/videoviewer', view_func=VideoViewerView.as_view('videoviewer_view', template_name='videoviewer.html'))
+bp_allsky.add_url_rule('/ajax/videoviewer', view_func=AjaxVideoViewerView.as_view('ajax_videoviewer_view'))
+
+bp_allsky.add_url_rule('/minivideoviewer', view_func=MiniVideoViewerView.as_view('mini_videoviewer_view', template_name='minivideoviewer.html'))
+bp_allsky.add_url_rule('/ajax/minivideoviewer', view_func=AjaxMiniVideoViewerView.as_view('ajax_mini_videoviewer_view'))
+bp_allsky.add_url_rule('/ajax/minivideoviewer/delete', view_func=AjaxMiniVideoDeleteView.as_view('ajax_mini_videodelete_view'))
+
+bp_allsky.add_url_rule('/view_image', view_func=TimelapseImageView.as_view('timelapse_image_view', template_name='view_image.html'))
+bp_allsky.add_url_rule('/view_panorama', view_func=PanoramaImageView.as_view('panorama_image_view', template_name='view_image.html'))
+bp_allsky.add_url_rule('/view_startrail', view_func=StartrailImageView.as_view('startrail_image_view', template_name='view_image.html'))
+bp_allsky.add_url_rule('/view_keogram', view_func=KeogramImageView.as_view('keogram_image_view', template_name='view_image.html'))
+bp_allsky.add_url_rule('/view_raw', view_func=RawImageView.as_view('raw_image_view', template_name='view_image.html'))
+
+bp_allsky.add_url_rule('/watch_timelapse', view_func=TimelapseVideoView.as_view('timelapse_video_view', template_name='watch_video.html'))
+bp_allsky.add_url_rule('/watch_mini_timelapse', view_func=MiniTimelapseVideoView.as_view('mini_timelapse_video_view', template_name='watch_video.html'))
+bp_allsky.add_url_rule('/watch_startrail', view_func=StartrailVideoView.as_view('startrail_video_view', template_name='watch_video.html'))
+bp_allsky.add_url_rule('/watch_panorama', view_func=PanoramaVideoView.as_view('panorama_video_view', template_name='watch_video.html'))
+
+bp_allsky.add_url_rule('/generate', view_func=TimelapseGeneratorView.as_view('generate_view', template_name='generate.html'))
+bp_allsky.add_url_rule('/ajax/generate', view_func=AjaxTimelapseGeneratorView.as_view('ajax_generate_view'))
+
+bp_allsky.add_url_rule('/minigenerate', view_func=MiniTimelapseGeneratorView.as_view('mini_generate_view', template_name='mini_generate.html'))
+bp_allsky.add_url_rule('/ajax/minigenerate', view_func=AjaxMiniTimelapseGeneratorView.as_view('ajax_mini_generate_view'))
+
+bp_allsky.add_url_rule('/config', view_func=ConfigView.as_view('config_view', template_name='config.html'))
+bp_allsky.add_url_rule('/ajax/config', view_func=AjaxConfigView.as_view('ajax_config_view'))
+bp_allsky.add_url_rule('/config/list', view_func=ConfigListView.as_view('config_list_view', template_name='config_list.html'))
+bp_allsky.add_url_rule('/config/download', view_func=ConfigDownloadView.as_view('config_download_view'))
+bp_allsky.add_url_rule('/config/restore', view_func=ConfigRestoreView.as_view('config_restore_view', template_name='config_restore.html'))
+bp_allsky.add_url_rule('/ajax/config/restore', view_func=AjaxConfigRestoreView.as_view('ajax_config_restore_view'))
+bp_allsky.add_url_rule('/ajax/allskymap/request_key', view_func=AjaxAllskyMapRequestKeyView.as_view('ajax_allskymap_request_key_view'))
+
+bp_allsky.add_url_rule('/system', view_func=SystemInfoView.as_view('system_view', template_name='system.html'))
+bp_allsky.add_url_rule('/ajax/system', view_func=AjaxSystemInfoView.as_view('ajax_system_view'))
+bp_allsky.add_url_rule('/ajax/system/stats', view_func=AjaxSystemStatsView.as_view('ajax_system_stats_view'))
+bp_allsky.add_url_rule('/ajax/settime', view_func=AjaxSetTimeView.as_view('ajax_settime_view'))
+bp_allsky.add_url_rule('/ajax/settimezone', view_func=AjaxSetTimezoneView.as_view('ajax_settimezone_view'))
+bp_allsky.add_url_rule('/ajax/indiserver', view_func=AjaxIndiServerChangeView.as_view('ajax_indiserver_change_view'))
+
+bp_allsky.add_url_rule('/focus', view_func=FocusView.as_view('focus_view', template_name='focus.html'))
+bp_allsky.add_url_rule('/js/focus', view_func=JsonFocusView.as_view('js_focus_view'))
+bp_allsky.add_url_rule('/ajax/focuscontroller', view_func=AjaxFocusControllerView.as_view('focus_controller_view'))
+
+bp_allsky.add_url_rule('/manual_gpio', view_func=ManualGpioView.as_view('manual_gpio_view', template_name='manual_gpio.html'))
+bp_allsky.add_url_rule('/ajax/manual_gpio', view_func=AjaxManualGpioView.as_view('ajax_manual_gpio_view'))
+
+bp_allsky.add_url_rule('/log', view_func=LogView.as_view('log_view', template_name='log.html'))
+bp_allsky.add_url_rule('/log/indiserver', view_func=LogIndiserverLogView.as_view('log_indiserver_view', template_name='log.html'))
+bp_allsky.add_url_rule('/stream/log', view_func=StreamLogView.as_view('stream_log_view'))
+bp_allsky.add_url_rule('/stream/indiserver_log', view_func=StreamIndiserverLogView.as_view('stream_indiserver_log_view'))
+bp_allsky.add_url_rule('/log/download', view_func=LogDownloadView.as_view('log_download_view'))
+bp_allsky.add_url_rule('/log/webapp_download', view_func=LogWebappDownloadView.as_view('log_webapp_download_view'))
+bp_allsky.add_url_rule('/log/syslog_download', view_func=LogSyslogDownloadView.as_view('log_syslog_download_view'))
+bp_allsky.add_url_rule('/log/kern_download', view_func=LogKernDownloadView.as_view('log_kern_download_view'))
+bp_allsky.add_url_rule('/log/indiserver_download', view_func=LogIndiserverDownloadView.as_view('log_indiserver_download_view'))
+bp_allsky.add_url_rule('/log/upgrade_download', view_func=LogUpgradeDownloadView.as_view('log_upgrade_download_view'))
+
+bp_allsky.add_url_rule('/support', view_func=SupportInfoView.as_view('support_info_view', template_name='support_info.html'))
+bp_allsky.add_url_rule('/js/support', view_func=JsonSupportInfoView.as_view('js_support_info_view'))
+
+bp_allsky.add_url_rule('/user', view_func=UserInfoView.as_view('user_view', template_name='user.html'))
+bp_allsky.add_url_rule('/ajax/user', view_func=AjaxUserInfoView.as_view('ajax_user_view'))
+bp_allsky.add_url_rule('/ajax/custom_css', view_func=AjaxCustomCssView.as_view('ajax_custom_css_view'))
+
+bp_allsky.add_url_rule('/astropanel', view_func=AstroPanelView.as_view('astropanel_view', template_name='astropanel.html'))
+bp_allsky.add_url_rule('/ajax/astropanel', view_func=AjaxAstroPanelView.as_view('ajax_astropanel_view'))
+
+bp_allsky.add_url_rule('/processing', view_func=ImageProcessingView.as_view('image_processing_view', template_name='imageprocessing.html'))
+bp_allsky.add_url_rule('/js/processing', view_func=JsonImageProcessingView.as_view('js_image_processing_view'))
+
+# Keep every calibration endpoint in one route block; each view independently
+# applies the same login, Config-save, master-switch, and camera gate.
+bp_allsky.add_url_rule('/asi676mc/calibration', view_func=Asi676mcCalibrationView.as_view('asi676mc_calibration_view', template_name='asi676mc_calibration.html'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/session', view_func=AjaxAsi676mcCalibrationSessionView.as_view('ajax_asi676mc_calibration_session_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/upload/<session_id>', view_func=AjaxAsi676mcCalibrationUploadView.as_view('ajax_asi676mc_calibration_upload_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/database', view_func=AjaxAsi676mcCalibrationDatabaseView.as_view('ajax_asi676mc_calibration_database_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/cancel/<session_id>', view_func=AjaxAsi676mcCalibrationCancelView.as_view('ajax_asi676mc_calibration_cancel_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/start/<session_id>', view_func=AjaxAsi676mcCalibrationStartView.as_view('ajax_asi676mc_calibration_start_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/status/<session_id>', view_func=AjaxAsi676mcCalibrationStatusView.as_view('ajax_asi676mc_calibration_status_view'))
+bp_allsky.add_url_rule('/asi676mc/calibration/report/<session_id>', view_func=Asi676mcCalibrationReportView.as_view('asi676mc_calibration_report_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/discard/<session_id>', view_func=AjaxAsi676mcCalibrationDiscardView.as_view('ajax_asi676mc_calibration_discard_view'))
+bp_allsky.add_url_rule('/ajax/asi676mc/calibration/apply/<session_id>', view_func=AjaxAsi676mcCalibrationApplyView.as_view('ajax_asi676mc_calibration_apply_view'))
+
+bp_allsky.add_url_rule('/longtermkeogram', view_func=LongTermKeogramView.as_view('longterm_keogram_view', template_name='longterm_keogram.html'))
+bp_allsky.add_url_rule('/js/longtermkeogram', view_func=JsonLongTermKeogramView.as_view('js_longterm_keogram_view'))
+
+bp_allsky.add_url_rule('/camera', view_func=CameraLensView.as_view('camera_lens_view', template_name='cameraLens.html'))
+bp_allsky.add_url_rule('/lag', view_func=ImageLagView.as_view('image_lag_view', template_name='lag.html'))
+bp_allsky.add_url_rule('/adu', view_func=RollingAduView.as_view('rolling_adu_view', template_name='adu.html'))
+bp_allsky.add_url_rule('/darks', view_func=DarkFramesView.as_view('darks_view', template_name='darks.html'))
+bp_allsky.add_url_rule('/mask', view_func=MaskView.as_view('mask_view', template_name='mask.html'))
+bp_allsky.add_url_rule('/camerasimulator', view_func=CameraSimulatorView.as_view('camera_simulator_view', template_name='camera_simulator.html'))
+bp_allsky.add_url_rule('/imagecirclehelper', view_func=ImageCircleHelperView.as_view('image_circle_helper_view', template_name='imagecirclehelper.html'))
+bp_allsky.add_url_rule('/filespaceusage', view_func=FileSpaceUsageView.as_view('filespaceusage_view', template_name='filespaceusage.html'))
+
+bp_allsky.add_url_rule('/public', view_func=PublicIndexView.as_view('public_index_view'))  # redirect
+
+bp_allsky.add_url_rule('/network', view_func=NetworkManagerView.as_view('network_manager_view', template_name='network.html'))
+bp_allsky.add_url_rule('/ajax/network', view_func=AjaxNetworkManagerView.as_view('ajax_network_manager_view'))
+bp_allsky.add_url_rule('/shell', view_func=ShellView.as_view('shell_view', template_name='shell.html'))
+bp_allsky.add_url_rule('/ws/shell', view_func=WsShellView.as_view('ws_shell_view'), websocket=True)
+bp_allsky.add_url_rule('/ws/events', view_func=WsEventsView.as_view('ws_events_view'), websocket=True)
+bp_allsky.add_url_rule('/ws/control', view_func=WsControlView.as_view('ws_control_view'), websocket=True)
+
+bp_allsky.add_url_rule('/drives', view_func=DriveManagerView.as_view('drive_manager_view', template_name='drive_manager.html'))
+bp_allsky.add_url_rule('/ajax/drives', view_func=AjaxDriveManagerView.as_view('ajax_drive_manager_view'))
+
+bp_allsky.add_url_rule('/virtualsky', view_func=VirtualSkyView.as_view('virtualsky_view', template_name='virtualsky.html'))
+bp_allsky.add_url_rule('/ajax/lens_solver', view_func=AjaxLensSolverView.as_view('ajax_lens_solver_view'))
+
+bp_allsky.add_url_rule('/ajax/notification', view_func=AjaxNotificationView.as_view('ajax_notification_view'))
+bp_allsky.add_url_rule('/ajax/selectcamera', view_func=AjaxSelectCameraView.as_view('ajax_select_camera_view'))
+bp_allsky.add_url_rule('/ajax/uploadyoutube', view_func=AjaxUploadYoutubeView.as_view('ajax_upload_youtube_view'))
+
+# youtube
+bp_allsky.add_url_rule('/youtube/authorize', view_func=YoutubeAuthorizeView.as_view('youtube_authorize_view'))
+bp_allsky.add_url_rule('/youtube/oauth2callback', view_func=YoutubeCallbackView.as_view('youtube_oauth2callback_view'))
+bp_allsky.add_url_rule('/youtube/oauth2refresh', view_func=YoutubeRefreshAuthView.as_view('youtube_oauth2refresh_view'))
+bp_allsky.add_url_rule('/youtube/oauth2revoke', view_func=YoutubeRevokeAuthView.as_view('youtube_oauth2revoke_view'))
+
+# redirects
+bp_allsky.add_url_rule('/latestimage', view_func=LatestImageRedirect.as_view('latest_image_redirect_view'))
+bp_allsky.add_url_rule('/latestkeogram', view_func=LatestKeogramRedirect.as_view('latest_keogram_redirect_view'))
+bp_allsky.add_url_rule('/lateststartrail', view_func=LatestStartrailRedirect.as_view('latest_startrail_redirect_view'))
+bp_allsky.add_url_rule('/latestpanorama', view_func=LatestPanoramaImageRedirect.as_view('latest_panorama_image_redirect_view'))
+bp_allsky.add_url_rule('/latestraw', view_func=LatestRawImageRedirect.as_view('latest_raw_image_redirect_view'))
+bp_allsky.add_url_rule('/latestthumbnail', view_func=LatestThumbnailRedirect.as_view('latest_thumbnail_redirect_view'))
+bp_allsky.add_url_rule('/latesttimelapse', view_func=LatestTimelapseVideoRedirect.as_view('latest_timelapse_video_redirect_view'))
+bp_allsky.add_url_rule('/lateststartrailvideo', view_func=LatestStartrailVideoRedirect.as_view('latest_startrail_video_redirect_view'))
+bp_allsky.add_url_rule('/latestpanoramavideo', view_func=LatestPanoramaVideoRedirect.as_view('latest_panorama_video_redirect_view'))
+
+bp_allsky.add_url_rule('/latestimageview', view_func=LatestImageViewRedirect.as_view('latest_image_view_redirect_view'))
+bp_allsky.add_url_rule('/latestkeogramview', view_func=LatestKeogramViewRedirect.as_view('latest_keogram_view_redirect_view'))
+bp_allsky.add_url_rule('/lateststartrailview', view_func=LatestStartrailViewRedirect.as_view('latest_startrail_view_redirect_view'))
+bp_allsky.add_url_rule('/latestpanoramaview', view_func=LatestPanoramaImageViewRedirect.as_view('latest_panorama_image_view_redirect_view'))
+bp_allsky.add_url_rule('/latestrawview', view_func=LatestRawImageViewRedirect.as_view('latest_raw_image_view_redirect_view'))
+bp_allsky.add_url_rule('/latesttimelapsewatch', view_func=LatestTimelapseVideoWatchRedirect.as_view('latest_timelapse_video_watch_redirect_view'))
+bp_allsky.add_url_rule('/lateststartrailvideowatch', view_func=LatestStartrailVideoWatchRedirect.as_view('latest_startrail_video_watch_redirect_view'))
+bp_allsky.add_url_rule('/latestpanoramavideowatch', view_func=LatestPanoramaVideoWatchRedirect.as_view('latest_panorama_video_watch_redirect_view'))
+
+bp_allsky.add_url_rule('/allsky_esp32', view_func=ESP32ImageView.as_view('esp32_image_view'))
+
+# hidden
+bp_allsky.add_url_rule('/cameras', view_func=CamerasView.as_view('cameras_view', template_name='cameras.html'))
+bp_allsky.add_url_rule('/tasks', view_func=TaskQueueView.as_view('taskqueue_view', template_name='taskqueue.html'))
+bp_allsky.add_url_rule('/notifications', view_func=NotificationsView.as_view('notifications_view', template_name='notifications.html'))
+bp_allsky.add_url_rule('/users', view_func=UsersView.as_view('users_view', template_name='users.html'))
+
+
+@bp_allsky.route('/sw.js')
+def service_worker():
+    response = send_from_directory(
+        os.path.join(app.root_path, 'static', 'js'),
+        'sw.js',
+        mimetype='application/javascript'
+    )
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+
+@bp_allsky.route('/manifest.json')
+def manifest():
+    manifest_data = {
+        "name": "indi-allsky",
+        "short_name": "Allsky",
+        "description": "INDI Allsky Camera Portal",
+        "start_url": url_for('indi_allsky.index_view'),
+        "scope": url_for('indi_allsky.index_view'),
+        "display": "standalone",
+        "background_color": "#0f172a",
+        "theme_color": "#0f172a",
+        "icons": [
+            {
+                "src": url_for('indi_allsky.static', filename='images/icon-192.png'),
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": url_for('indi_allsky.static', filename='images/icon-512.png'),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": url_for('indi_allsky.static', filename='images/icon-512.png'),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable"
+            }
+        ],
+        "screenshots": [
+            {
+                "src": url_for('indi_allsky.static', filename='images/screenshot-desktop.png'),
+                "sizes": "1280x720",
+                "type": "image/png",
+                "form_factor": "wide",
+                "label": "indi-allsky Desktop Dashboard"
+            },
+            {
+                "src": url_for('indi_allsky.static', filename='images/screenshot-mobile.png'),
+                "sizes": "540x960",
+                "type": "image/png",
+                "form_factor": "narrow",
+                "label": "indi-allsky Mobile View"
+            }
+        ]
+    }
+    response = jsonify(manifest_data)
+    response.headers['Content-Type'] = 'application/manifest+json'
+    return response
+
