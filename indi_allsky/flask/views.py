@@ -2120,6 +2120,10 @@ class JsonChartView(JsonView):
         if self.indi_allsky_config['IMAGE_SCALE'] and self.indi_allsky_config['IMAGE_SCALE'] != 100:
             _img_processor.scale_image()
 
+        # match _load_detection_mask(): it applies add_border() as its final
+        # transform, so the image must too or mask/image sizes will not match.
+        _img_processor.add_border()
+
         image_data = _img_processor.image
 
 
@@ -15002,4 +15006,3 @@ def manifest():
     response = jsonify(manifest_data)
     response.headers['Content-Type'] = 'application/manifest+json'
     return response
-
